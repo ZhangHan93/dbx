@@ -1,0 +1,33 @@
+name: Build RabbitMQ Win7 agent
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "agents/drivers/rabbitmq/**"
+      - ".github/workflows/build-rabbitmq-win7.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-rabbitmq-win7:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.20.14"
+      - name: Build Windows 7-compatible RabbitMQ agent
+        working-directory: agents/drivers/rabbitmq
+        run: |
+          output="dbx-agent-rabbitmq-windows-x64.exe"
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o "$output" .
+          go version -m "$output" | tee /tmp/build-info.txt
+          grep -q ': go1\.20\.14$' /tmp/build-info.txt
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbx-agent-rabbitmq-windows-x64
+          path: agents/drivers/rabbitmq/dbx-agent-rabbitmq-windows-x64.exe
