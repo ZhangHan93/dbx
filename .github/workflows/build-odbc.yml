@@ -1,0 +1,78 @@
+name: Build DBX with ODBC
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - my-agents
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64 (DBX + ODBC agent)
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Verify environment
+        shell: pwsh
+        run: |
+          Write-Output "node: $(node --version)"
+          Write-Output "pnpm: $(pnpm --version)"
+          Write-Output "cargo: $(cargo --version)"
+          Write-Output "rustc: $(rustc --version)"
+          Write-Output "dotnet: $(dotnet --version)"
+          Write-Output "perl: $((perl --version | Select-Object -First 2) -join ' ')"
+
+      - name: Install frontend dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build ODBC agent (64-bit)
+        working-directory: agents/drivers/odbc
+        shell: pwsh
+        run: |
+          dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
+          Rename-Item publish/dbx-agent-odbc.exe agent.exe
+
+      - name: Build ODBC agent (32-bit)
+        working-directory: agents/drivers/odbc
+        shell: pwsh
+        run: |
+          dotnet publish -c Release -r win-x86 --self-contained true -p:PublishSingleFile=true -o publish-x86
+          Rename-Item publish-x86/dbx-agent-odbc.exe agent.exe
+
+      - name: Build Tauri (dbx.exe)
+        run: pnpm tauri build --no-bundle
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbx-odbc-windows-x64
+          retention-days: 14
+          path: |
+            src-tauri/target/release/dbx.exe
+            agents/drivers/odbc/publish/agent.exe
+            agents/drivers/odbc/publish-x86/agent.exe
