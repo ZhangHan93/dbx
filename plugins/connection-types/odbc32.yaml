@@ -1,0 +1,35 @@
+schemaVersion: 1
+order: 772
+dbType: odbc32
+rustVariant: Odbc32
+label: ODBC (32-bit)
+runtimeMode: agent
+mcpMode: bridge
+agentKey: odbc32
+driverStoreVisible: false
+singleConnectionPool: true
+metadataConnectionScoped: false
+skipTcpProbe: true
+formKind: odbc
+traits:
+  schemaAware: true
+  treeSchema: true
+  databaseObjectTree: true
+supportLevel: browse
+capabilities:
+  queryExecution: true
+  metadataBrowse: true
+  objectBrowser: true
+  objectSource: false
+  schemaSearch: false
+  diagram: false
+  tableDataEdit: false
+  tableStructureEdit: false
+  tableImport: false
+  dataTransfer: false
+  sqlFileExecution: true
+  databaseCreate: false
+  fieldLineage: false
+  sqlExplain: false
+  userAdmin: false
+  driverManagement: false

@@ -15,7 +15,7 @@ const checkOnly = process.argv.includes("--check");
 const runtimeModes = new Set(["native", "file", "agent", "external"]);
 const mcpModes = new Set(["direct", "bridge", "unsupported"]);
 const supportLevels = new Set(["connect", "browse", "understand", "operate"]);
-const formKinds = new Set(["standard", "jdbc", "mq", "mqtt", "nacos"]);
+const formKinds = new Set(["standard", "jdbc", "mq", "mqtt", "nacos", "odbc"]);
 const profileCategories = new Set(["sql", "analytics", "domestic", "lightweight", "document", "graph_ai", "timeseries", "mq", "registry_config"]);
 const descriptorKeys = new Set([
   "schemaVersion",

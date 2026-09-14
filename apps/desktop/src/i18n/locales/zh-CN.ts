@@ -1300,6 +1300,8 @@ export default withEnglishFallback({
     phoenixDocs: "查看 Phoenix 文档",
     jdbcUrl: "JDBC URL",
     jdbcUrlPlaceholder: "jdbc:postgresql://localhost:5432/database",
+    odbcConnectionString: "ODBC 连接字符串",
+    odbcConnectionStringPlaceholder: "DSN=MyDSN 或 DRIVER={SQL Server};SERVER=localhost;DATABASE=mydb",
     jdbcDriverClass: "驱动类（可选）",
     jdbcDriverClassPlaceholder: "多数驱动可自动识别；需要时填写 com.vendor.jdbc.Driver",
     jdbcDriverPaths: "驱动 JAR",

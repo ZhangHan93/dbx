@@ -79,6 +79,8 @@ export const DATABASE_TYPES = [
   "influxdb3",
   "victoriametrics",
   "jdbc",
+  "odbc",
+  "odbc32",
   "spark",
   "plugin",
 ] as const;

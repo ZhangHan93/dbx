@@ -3,7 +3,7 @@ import driverManifest from "../../../../../crates/dbx-core/assets/database-drive
 
 export type DatabaseSupportLevel = "connect" | "browse" | "understand" | "operate";
 export type DatabaseRuntimeMode = "native" | "file" | "agent" | "external";
-export type ConnectionFormKind = "standard" | "jdbc" | "mq" | "mqtt" | "nacos";
+export type ConnectionFormKind = "standard" | "jdbc" | "mq" | "mqtt" | "nacos" | "odbc";
 
 export const DATABASE_PRODUCT_CAPABILITY_KEYS = [
   "queryExecution",

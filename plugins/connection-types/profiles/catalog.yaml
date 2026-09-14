@@ -594,6 +594,20 @@ profiles:
     icon: jdbc
     port: 0
     user: ""
+  - id: odbc
+    dbType: odbc
+    label: ODBC
+    icon: odbc
+    port: 0
+    user: ""
+    category: sql
+  - id: odbc32
+    dbType: odbc32
+    label: ODBC (32-bit)
+    icon: odbc
+    port: 0
+    user: ""
+    category: sql
   - id: tdengine
     dbType: tdengine
     label: TDengine
