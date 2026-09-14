@@ -73,6 +73,6 @@ jobs:
           name: dbx-odbc-windows-x64
           retention-days: 14
           path: |
-            src-tauri/target/release/dbx.exe
+            target/release/dbx.exe
             agents/drivers/odbc/publish/agent.exe
             agents/drivers/odbc/publish-x86/agent.exe
