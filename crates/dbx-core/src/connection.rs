@@ -316,6 +316,8 @@ macro_rules! agent_connection_pool_database_type {
             | DatabaseType::ZooKeeper
             | DatabaseType::Iris
             | DatabaseType::Access
+            | DatabaseType::Odbc
+            | DatabaseType::Odbc32
     };
 }
 

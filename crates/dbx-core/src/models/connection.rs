@@ -1198,6 +1198,7 @@ impl ConnectionConfig {
                 format!("{scheme}://{host}:{port}")
             }
             DatabaseType::Jdbc => "jdbc:<redacted>".to_string(),
+            DatabaseType::Odbc | DatabaseType::Odbc32 => "odbc:<redacted>".to_string(),
             DatabaseType::Plugin => format!(
                 "plugin://{}/{}",
                 self.plugin_id.as_deref().unwrap_or("unknown"),
@@ -1480,6 +1481,9 @@ impl ConnectionConfig {
             }
             DatabaseType::Jdbc => {
                 self.connection_string.as_deref().filter(|value| !value.is_empty()).unwrap_or("jdbc:").to_string()
+            }
+            DatabaseType::Odbc | DatabaseType::Odbc32 => {
+                self.connection_string.as_deref().filter(|value| !value.is_empty()).unwrap_or("odbc:").to_string()
             }
             DatabaseType::Plugin => format!(
                 "plugin://{}/{}",
