@@ -406,6 +406,7 @@ export const setAiGlobalCustomInstructions = forward("setAiGlobalCustomInstructi
 // System
 export const listSystemFonts = forward("listSystemFonts");
 export const listSshConfigHosts = forward("listSshConfigHosts");
+export const listOdbcDsns = forward("listOdbcDsns");
 
 // SQL File Execution
 export const previewSqlFile = forward("previewSqlFile");

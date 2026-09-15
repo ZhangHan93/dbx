@@ -129,6 +129,11 @@ pub fn agent_connect_params_with_role(
         "sysdba": oracle_uses_sysdba(config),
         "url_params": config.url_params.as_deref().unwrap_or(""),
         "connection_string": connection_string,
+        // ODBC 专用：裸 DSN 名。agent 侧 `BuildConnectionString` 以它为主路径
+        // （拼成 `DSN=<dsn>;UID=<u>;PWD=<p>;`），非空时忽略上面的
+        // `connection_string`（后者留给 MCP / 脚本直传连接串的兜底路径）。
+        // 其它数据库类型恒为 null，agent 不会读。
+        "dsn": config.dsn,
         "ssl": config.ssl,
         "ca_cert_path": config.ca_cert_path,
         "client_cert_path": config.client_cert_path,
@@ -747,6 +752,7 @@ mod tests {
             sysdba: false,
             oracle_connection_type: None,
             connection_string: None,
+            dsn: None,
             redis_connection_mode: None,
             redis_sentinel_master: String::new(),
             redis_sentinel_nodes: String::new(),

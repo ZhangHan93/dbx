@@ -159,6 +159,13 @@ pub struct ConnectionConfig {
     pub oracle_connection_type: Option<String>,
     #[serde(default)]
     pub connection_string: Option<String>,
+    /// ODBC 数据源名称（**裸名称**，如 `interface`，不带 `DSN=` 前缀）。
+    ///
+    /// 只对 `DatabaseType::Odbc` / `Odbc32` 有意义。agent 侧 `BuildConnectionString`
+    /// 以它为主路径，拼成 `DSN=<dsn>;UID=<u>;PWD=<p>;`；本字段非空时忽略
+    /// `connection_string`（后者仅保留给 MCP / 脚本等直传连接串的调用方兜底）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsn: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redis_connection_mode: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -612,6 +619,9 @@ struct ConnectionConfigData {
     pub oracle_connection_type: Option<String>,
     #[serde(default)]
     pub connection_string: Option<String>,
+    /// ODBC 数据源名称（裸名称）。见 [`ConnectionConfig::dsn`]。
+    #[serde(default)]
+    pub dsn: Option<String>,
     #[serde(default)]
     pub redis_connection_mode: Option<String>,
     #[serde(default)]
@@ -707,6 +717,7 @@ impl From<ConnectionConfigData> for ConnectionConfig {
             sysdba: data.sysdba,
             oracle_connection_type: data.oracle_connection_type,
             connection_string: data.connection_string,
+            dsn: data.dsn,
             redis_connection_mode: data.redis_connection_mode,
             redis_sentinel_master: data.redis_sentinel_master,
             redis_sentinel_nodes: data.redis_sentinel_nodes,
@@ -2776,6 +2787,7 @@ mod tests {
             sysdba: false,
             oracle_connection_type: None,
             connection_string: None,
+            dsn: None,
             redis_connection_mode: None,
             redis_sentinel_master: String::new(),
             redis_sentinel_nodes: String::new(),

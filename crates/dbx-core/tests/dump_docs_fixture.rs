@@ -55,6 +55,7 @@ fn live_postgres_config(
         sysdba: false,
         oracle_connection_type: None,
         connection_string: None,
+        dsn: None,
         redis_connection_mode: None,
         redis_sentinel_master: String::new(),
         redis_sentinel_nodes: String::new(),

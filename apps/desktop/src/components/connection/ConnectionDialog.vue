@@ -14,6 +14,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { HelpTooltip, Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Switch } from "@/components/ui/switch";
+import { SearchableSelect } from "@/components/ui/searchable-select";
 import type {
   ConnectionConfig,
   ConnectionTestResult,
@@ -25,6 +26,7 @@ import type {
   JdbcDriverInfo,
   JdbcLocalBundleInfo,
   JdbcMavenBundleInfo,
+  OdbcDsnEntry,
   PluginConnectionAction,
   PluginFormField,
   PluginFormFieldValue,
@@ -400,6 +402,7 @@ const defaultForm = (): ConnectionForm => ({
   sysdba: false,
   oracle_connection_type: "service_name",
   connection_string: undefined,
+  dsn: undefined,
   jdbc_driver_class: undefined,
   jdbc_driver_paths: [],
   redis_connection_mode: "standalone",
@@ -3130,6 +3133,42 @@ const isH2FileMode = computed(() => form.value.db_type === "h2" && h2ConnectionM
 const isH2CustomDriver = computed(() => form.value.db_type === "h2" && form.value.driver_profile === "h2-custom");
 const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_type) && (form.value.db_type !== "h2" || isH2FileMode.value));
 
+// ODBC DSN enumeration.
+// DSN lives in the registry (not a connection parameter) and is bitness-scoped:
+// system DSNs are strictly WOW64-redirected, user DSNs are not. The command
+// returns both the x64 and x86 views; we only filter by connection type here so
+// a wrong mapping could ever only hide entries, never show wrong ones - which
+// also rules out IM014 (architecture mismatch) by construction.
+const odbcDsns = ref<OdbcDsnEntry[]>([]);
+const odbcDsnsLoading = ref(false);
+const odbcDsnView = computed(() => (form.value.db_type === "odbc32" ? "x86" : "x64"));
+const odbcDsnOptions = computed(() => odbcDsns.value.filter((entry) => entry.view === odbcDsnView.value).map((entry) => entry.name));
+const odbcDsnHiddenCount = computed(() => {
+  const visible = new Set(odbcDsnOptions.value);
+  return odbcDsns.value.filter((entry) => entry.view !== odbcDsnView.value && !visible.has(entry.name)).length;
+});
+
+// DSN 名规范化：只保留裸名称（trim + 剥掉误输的 `DSN=` 前缀）。
+// 与 agent 侧 `NormalizeDsn()` 规则一致，但职责不同：这里是 UX（框里不留脏值），
+// agent 那层才是权威兜底（dbx-mcp.exe / 脚本会绕过前端直传参数）。
+// 注意：不能套用 `Escape()` 的花括号转义 —— 实测 `DSN={interface}` 必报 IM002，
+// 花括号转义只对 `UID` / `PWD` 的值有效。
+function normalizeOdbcDsnName(raw: string): string {
+  return raw.trim().replace(/^DSN=/i, "").trim();
+}
+
+const odbcDsnValue = computed({
+  get: () => form.value.dsn ?? "",
+  set: (value: string) => {
+    form.value.dsn = value || undefined;
+    resetTestState();
+  },
+});
+
+// 名称含 ; { } 时无任何转义手段（; 会截断值，花括号对 DSN 关键字无效），
+// agent 会直接抛错，所以前端先拦住。
+const odbcDsnInvalid = computed(() => /[;{}]/.test(odbcDsnValue.value));
+
 const connectionUrlPlaceholder = computed(() => getUrlPlaceholder(form.value.db_type, form.value.driver_profile));
 const jdbcUsernamePlaceholder = computed(() => (form.value.driver_profile === "dremio" || isJdbcProductConnection.value ? "" : "sa"));
 const filePathPlaceholder = computed(() => {
@@ -3670,8 +3709,14 @@ const hasRequiredConnectionTarget = computed(() => {
     return !!mqAdminUrl.value.trim();
   }
   if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || connectionUrlInput.value.trim());
-  // ODBC has no host/port: the DSN or DSN-less connection string *is* the target.
-  if (isOdbcConnection.value) return !!form.value.connection_string?.trim();
+  // ODBC has no host/port: the DSN name itself is the target. The agent assembles
+  // `DSN=<dsn>;UID=<u>;PWD=<p>;` from it. Names containing ; { } cannot be escaped
+  // ({} is not honoured for the DSN keyword), so treat them as invalid and keep the
+  // button disabled rather than round-tripping a guaranteed IM002.
+  if (isOdbcConnection.value) {
+    const dsn = form.value.dsn?.trim() ?? "";
+    return !!dsn && !/[;{}]/.test(dsn);
+  }
   if (form.value.db_type === "mqtt") return !!mqttHost.value.trim() && mqttPort.value > 0;
   if (form.value.db_type === "nacos") return !!nacosServerAddr.value.trim();
   if (form.value.db_type === "consul") return !!consulServerAddr.value.trim();
@@ -4103,6 +4148,13 @@ function connectionConfigForSubmit(id: string, generatedName = "", validatePlugi
     if (!config.username || !config.password) {
       throw new Error(t("connection.dynamodbCredentialsRequired"));
     }
+  }
+  if (isOdbcConnection.value) {
+    // DSN 只存裸名称（去误输的 DSN= 前缀 + trim），规则与 agent 的 NormalizeDsn 一致。
+    // 三字段方案下不再读写 connection_string（agent 的兜底分支留给 MCP / 脚本直传）。
+    // password 不要 trim：空格是密码的一部分。
+    config.dsn = normalizeOdbcDsnName(config.dsn ?? "") || undefined;
+    config.connection_string = undefined;
   }
   if (config.db_type === "gaussdb") {
     const serialized = serializeGaussdbHosts(gaussdbHostEntries.value);
@@ -5414,6 +5466,7 @@ watch(
       void loadJdbcDrivers();
       void loadAgentDrivers();
       void loadSshConfigHosts();
+      void loadOdbcDsns();
     }
     void loadInstalledPlugins().then(() => {
       if (!open.value) return;
@@ -6097,6 +6150,21 @@ async function loadSshConfigHosts() {
   }
 }
 
+/**
+ * 枚举本机 ODBC DSN。浏览器端没有本机注册表 → 接口返回空数组 ⇒ 表单自然退化成
+ * 「手输 DSN 名」，不需要单独分支。失败同样吞掉：枚举是增强能力，不该阻塞表单。
+ */
+async function loadOdbcDsns() {
+  odbcDsnsLoading.value = true;
+  try {
+    odbcDsns.value = await api.listOdbcDsns();
+  } catch {
+    odbcDsns.value = [];
+  } finally {
+    odbcDsnsLoading.value = false;
+  }
+}
+
 async function loadAgentDrivers() {
   try {
     agentDrivers.value = await api.listInstalledAgentsLocal();
@@ -6630,11 +6698,29 @@ function openExternalUrl(url: string) {
                     </div>
                   </template>
 
-                  <!-- ODBC: generic DSN / DSN-less connection string -->
+                  <!-- ODBC: DSN 名称 + 凭据（连接串由 agent 拼，前端不参与） -->
                   <template v-else-if="isOdbcConnection">
-                    <div class="grid grid-cols-4 items-center gap-4">
-                      <Label :class="connectionLabelClass">{{ t("connection.odbcConnectionString") }}</Label>
-                      <Input v-model="form.connection_string" class="col-span-3" :placeholder="t('connection.odbcConnectionStringPlaceholder')" />
+                    <div class="grid grid-cols-4 items-start gap-4">
+                      <Label :class="connectionLabelTopClass">{{ t("connection.odbcDsn") }}</Label>
+                      <div class="col-span-3 space-y-1">
+                        <SearchableSelect
+                          v-model="odbcDsnValue"
+                          :options="odbcDsnOptions"
+                          :placeholder="t('connection.odbcDsnPlaceholder')"
+                          :search-placeholder="t('connection.odbcDsnSearchPlaceholder')"
+                          :empty-text="t('connection.odbcDsnEmpty')"
+                          :loading-text="t('common.loading')"
+                          :loading="odbcDsnsLoading"
+                          allow-custom
+                          clearable
+                          :normalize-custom="normalizeOdbcDsnName"
+                          data-odbc-dsn-select
+                        />
+                        <p v-if="odbcDsnInvalid" class="text-xs text-destructive">{{ t("connection.odbcDsnInvalidChars") }}</p>
+                        <p v-else-if="odbcDsnHiddenCount > 0" class="text-xs text-muted-foreground">
+                          {{ t("connection.odbcDsnHiddenByBitness", { count: odbcDsnHiddenCount }) }}
+                        </p>
+                      </div>
                     </div>
                     <div class="grid grid-cols-4 items-center gap-4">
                       <Label :class="connectionLabelClass">{{ t("connection.user") }}</Label>

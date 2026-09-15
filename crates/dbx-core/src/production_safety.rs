@@ -792,6 +792,7 @@ mod tests {
             sysdba: false,
             oracle_connection_type: None,
             connection_string: None,
+            dsn: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: vec![],
             redis_connection_mode: None,
