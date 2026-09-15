@@ -258,9 +258,9 @@ mod tests {
             sysdba: false,
             oracle_connection_type: None,
             connection_string: Some(
-            dsn: None,
                 "mongodb://mongouser:secret@172.22.4.42:27017/RestCloud_V45PUB_Gateway?authSource=admin".to_string(),
             ),
+            dsn: None,
             redis_connection_mode: None,
             redis_sentinel_master: String::new(),
             redis_sentinel_nodes: String::new(),
