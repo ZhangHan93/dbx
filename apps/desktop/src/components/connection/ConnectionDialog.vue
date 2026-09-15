@@ -3670,6 +3670,8 @@ const hasRequiredConnectionTarget = computed(() => {
     return !!mqAdminUrl.value.trim();
   }
   if (form.value.db_type === "zookeeper") return !!(form.value.host || form.value.connection_string || connectionUrlInput.value.trim());
+  // ODBC has no host/port: the DSN or DSN-less connection string *is* the target.
+  if (isOdbcConnection.value) return !!form.value.connection_string?.trim();
   if (form.value.db_type === "mqtt") return !!mqttHost.value.trim() && mqttPort.value > 0;
   if (form.value.db_type === "nacos") return !!nacosServerAddr.value.trim();
   if (form.value.db_type === "consul") return !!consulServerAddr.value.trim();

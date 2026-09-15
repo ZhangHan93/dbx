@@ -1383,7 +1383,7 @@ export default {
     jdbcUrl: "JDBC URL",
     jdbcUrlPlaceholder: "jdbc:postgresql://localhost:5432/database",
     odbcConnectionString: "ODBC Connection String",
-    odbcConnectionStringPlaceholder: "DSN=MyDSN or DRIVER={SQL Server};SERVER=localhost;DATABASE=mydb",
+    odbcConnectionStringPlaceholder: "DSN=MyDSN or DRIVER={'{'}SQL Server{'}'};SERVER=localhost;DATABASE=mydb",
     jdbcDriverClass: "Driver Class (optional)",
     jdbcDriverClassPlaceholder: "Most drivers auto-register; use com.vendor.jdbc.Driver if needed",
     jdbcDriverPaths: "Driver JARs",
