@@ -46,6 +46,7 @@ import type {
   SavedSqlFolder,
   SavedSqlLibrary,
   SshConfigHostEntry,
+  OdbcDsnEntry,
   TunnelProfile,
 } from "@/types/database";
 import type { DetachedTabHandoff } from "@/lib/app/detachedTabHandoff";
@@ -529,6 +530,14 @@ export async function listSystemFonts(): Promise<string[]> {
 
 export async function listSshConfigHosts(): Promise<SshConfigHostEntry[]> {
   return get("/api/ssh/config-hosts");
+}
+
+/**
+ * ODBC DSN 枚举是**桌面端本机能力**（读客户端注册表）。浏览器端拿不到本机 DSN，
+ * 返回空列表：表单会退化为「手输 DSN 名」，不影响使用。
+ */
+export async function listOdbcDsns(): Promise<OdbcDsnEntry[]> {
+  return [];
 }
 
 export async function listPlugins(): Promise<InstalledPlugin[]> {

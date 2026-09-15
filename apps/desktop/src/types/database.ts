@@ -112,6 +112,13 @@ export interface ConnectionConfig {
   sysdba?: boolean;
   oracle_connection_type?: "service_name" | "sid" | "tns";
   connection_string?: string;
+  /**
+   * ODBC 数据源名称（**裸名称**，如 `interface`，不带 `DSN=` 前缀）。
+   *
+   * 只对 `db_type` 为 `odbc` / `odbc32` 的连接有效：agent 侧以 DSN 优先，
+   * 由后端拼成 `DSN=<dsn>;UID=<u>;PWD=<p>;`，前端不参与拼接。
+   */
+  dsn?: string;
   jdbc_driver_class?: string;
   jdbc_driver_paths?: string[];
   redis_connection_mode?: "standalone" | "sentinel" | "cluster";
@@ -224,6 +231,24 @@ export interface SshConfigHostEntry {
   port?: number;
   user?: string;
   identity_file?: string;
+}
+
+/**
+ * 本机已配置的一条 ODBC DSN（由后端直接读注册表得到）。
+ *
+ * 位宽语义：系统 DSN（HKLM）按位宽重定向，用户 DSN（HKCU）两个位宽共享同一份。
+ * 后端一次性返回 `x64` / `x86` 两个视图的全部条目，前端按连接类型过滤：
+ * `odbc` → `x64`，`odbc32` → `x86`。这样即使位宽映射将来变也只会少显示、不会显示错。
+ */
+export interface OdbcDsnEntry {
+  /** DSN 名称（裸名，不含 `DSN=` 前缀） */
+  name: string;
+  /** 驱动注册名，如 `SQL Server` */
+  driver: string;
+  /** 该 DSN 对哪个位宽可见 */
+  view: "x64" | "x86";
+  /** 作用域：用户 DSN / 系统 DSN */
+  scope: "user" | "system";
 }
 
 export interface ProxyTunnelConfig {

@@ -2552,6 +2552,7 @@ pub fn run() {
             commands::agents::import_agent_driver_cmd,
             commands::agents::import_agent_jar_cmd,
             commands::system_fonts::list_system_fonts,
+            commands::odbc_env::list_odbc_dsns,
             commands::ssh_config::list_ssh_config_hosts,
             commands::ssh_prompt::ssh_prompt_ready,
             commands::ssh_prompt::ssh_prompt_not_ready,

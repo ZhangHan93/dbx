@@ -67,6 +67,7 @@ import type {
   JdbcLocalBundleInfo,
   JdbcMavenBundleInfo,
   JdbcPluginStatus,
+  OdbcDsnEntry,
   SavedSqlFile,
   SavedSqlFolder,
   SavedSqlLibrary,
@@ -980,6 +981,16 @@ export async function listSystemFonts(): Promise<string[]> {
 
 export async function listSshConfigHosts(): Promise<SshConfigHostEntry[]> {
   return invoke("list_ssh_config_hosts");
+}
+
+/**
+ * 列出本机已配置的 ODBC DSN（含 x64 / x86 两个位宽视图）。
+ *
+ * 由 Rust 侧直接读注册表 `SOFTWARE\ODBC\ODBC.INI\ODBC Data Sources`，
+ * 不经过 agent —— DSN 与「连上某个数据库」无关，且 agent 是懒启动的。
+ */
+export async function listOdbcDsns(): Promise<OdbcDsnEntry[]> {
+  return invoke("list_odbc_dsns");
 }
 
 export async function pendingOpenSqlFiles(): Promise<string[]> {

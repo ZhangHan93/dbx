@@ -36,6 +36,7 @@ pub mod mq_cmd;
 #[cfg(feature = "mq-admin")]
 pub mod mqtt_cmd;
 pub mod nacos_cmd;
+pub mod odbc_env;
 pub mod plugins;
 pub mod prompt_template;
 pub mod query;

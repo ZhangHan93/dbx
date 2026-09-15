@@ -394,22 +394,84 @@ internal sealed class OdbcSession
 
     static internal string BuildConnectionString(JsonElement p)
     {
-        string? cs = OdbcRuntimeServer.Str(p, "connection_string");
-        if (!string.IsNullOrWhiteSpace(cs)) return cs!;
-
         string? dsn = OdbcRuntimeServer.Str(p, "dsn");
+        string? cs = OdbcRuntimeServer.Str(p, "connection_string");
         string? user = OdbcRuntimeServer.Str(p, "username");
         string? pass = OdbcRuntimeServer.Str(p, "password");
 
+        // ① 主路径：裸 DSN 名 + 表单凭据。UI 只提交裸名称（如 "interface"），
+        //    "DSN=" 前缀与凭据全部在这里拼——agent 是唯一的拼接/规范化点。
         if (!string.IsNullOrWhiteSpace(dsn))
-        {
-            var sb = new OdbcConnectionStringBuilder { Dsn = dsn };
-            if (!string.IsNullOrWhiteSpace(user)) sb["UID"] = user;
-            if (!string.IsNullOrWhiteSpace(pass)) sb["PWD"] = pass;
-            return sb.ConnectionString;
-        }
+            return AppendCredentials("DSN=" + NormalizeDsn(dsn!), user, pass);
 
-        throw new Exception("connection_string or dsn is required");
+        // ② 兜底路径：调用方直接传整条连接串（dbx-mcp.exe / 脚本；UI 三字段不产生此形态）。
+        //    仍追加表单凭据，避免"在 UI 改了密码却不生效"。
+        if (!string.IsNullOrWhiteSpace(cs))
+            return AppendCredentials(cs!.Trim().TrimEnd(';'), user, pass);
+
+        throw new Exception("dsn or connection_string is required");
+    }
+
+    /// <summary>
+    /// 串尾追加凭据。依据实测：
+    ///   重复键「后者覆盖前者」→ 追加即覆盖，无需解析重组；
+    ///   合并语义「逐字段独立」→ 某字段为空则不追加，该字段沿用串内已有值。
+    /// </summary>
+    static string AppendCredentials(string head, string? user, string? pass)
+    {
+        var sb = new StringBuilder(head);
+
+        // 用户名：首尾空格无意义，可 trim
+        if (!string.IsNullOrWhiteSpace(user))
+            sb.Append(";UID=").Append(Escape(user!.Trim()));
+
+        // 密码：⚠️ 空格是密码的一部分（驱动与 SQL Server 都不 trim），
+        //       故此处【故意】用 IsNullOrEmpty 而非 IsNullOrWhiteSpace，
+        //       否则 PWD=" " 这种纯空格密码会被静默丢弃，变成"密码明明是对的"。
+        //       同样【故意】不 Trim()。review 时请不要顺手统一成上面的写法。
+        if (!string.IsNullOrEmpty(pass))
+            sb.Append(";PWD=").Append(Escape(pass!));
+
+        return sb.Append(';').ToString();
+    }
+
+    /// <summary>
+    /// 规范化 DSN 名。**不能复用 Escape()**：实测 `DSN={interface}` 报 IM002
+    /// —— `{}` 转义对 DSN 关键字无效（只对 UID/PWD 的值有效）。
+    /// </summary>
+    static string NormalizeDsn(string raw)
+    {
+        // 驱动不 trim DSN 名：`DSN=interface ` 直接 IM002，所以这里必须 trim
+        var name = raw.Trim();
+
+        // 用户常顺手把前缀一起写进来（占位符写了"只填名称"也仍会有人写 DSN=x）。
+        // 必须剥离，否则拼成 `DSN=DSN=x`，报的却是"未找到数据源名称"——
+        // 会把排查方向带偏到注册表，而真因在拼串。
+        if (name.StartsWith("DSN=", StringComparison.OrdinalIgnoreCase))
+            name = name.Substring(4).Trim();
+
+        // 名称含 ; { } 时无任何转义手段（{} 对 DSN 无效，; 会截断值）
+        // → 明确报错，绝不静默拼出一条必然失败的连接串
+        if (name.IndexOfAny(new[] { ';', '{', '}' }) >= 0)
+            throw new Exception("DSN name must not contain ';', '{' or '}'");
+
+        if (name.Length == 0)
+            throw new Exception("dsn is empty");
+
+        return name;
+    }
+
+    /// <summary>
+    /// ODBC 值转义：含 ; { } = 或首尾空白时用 {} 包裹，内部 } 双写。
+    /// </summary>
+    /// <remarks>
+    /// 仅用于 UID / PWD 的值，**不可用于 DSN 名**（DSN 关键字不认 {} 包裹，见 NormalizeDsn）。
+    /// </remarks>
+    static string Escape(string v)
+    {
+        if (v.IndexOfAny(new[] { ';', '{', '}', '=' }) >= 0 || v != v.Trim())
+            return "{" + v.Replace("}", "}}") + "}";
+        return v;
     }
 
     void Disconnect()
