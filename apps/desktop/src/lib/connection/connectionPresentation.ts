@@ -4,7 +4,9 @@ import { isLocalFileDatabaseType } from "@/lib/database/databaseDriverManifest";
 import { parseGaussdbHosts, serializeGaussdbHosts } from "@/lib/connection/gaussdbHosts";
 import { spannerDisplayDatabase } from "@/lib/connection/spannerResourcePath";
 
-type ConnectionPresentationConfig = Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "host" | "port" | "database">;
+type ConnectionPresentationConfig = Pick<ConnectionConfig, "db_type" | "driver_profile" | "driver_label" | "host" | "port" | "database"> &
+  // `dsn` 只对 odbc / odbc32 有意义，用 Partial 包一层，避免其它调用点被强制多传该字段。
+  Partial<Pick<ConnectionConfig, "dsn">>;
 type ConnectionNamePresentationConfig = ConnectionPresentationConfig & Pick<ConnectionConfig, "name">;
 
 const REDACTED_HOST_SEGMENT = "***";
@@ -20,6 +22,9 @@ export function connectionDriverLabel(connection?: Pick<ConnectionConfig, "db_ty
 
 export function connectionEndpointLabel(connection?: ConnectionPresentationConfig): string {
   if (!connection) return "";
+  // ODBC 连接的"端点"就是 DSN 名（宿主在 `config.dsn`），host / port / database 全为空。
+  // 少了这个分支就会落到末尾的空串兜底，侧栏只显示一个光秃秃的 "ODBC"，多个 DSN 无法区分。
+  if (connection.db_type === "odbc" || connection.db_type === "odbc32") return connection.dsn || "";
   if (connection.db_type === "cloudflare-d1") return [connection.host, connection.database].filter(Boolean).join("/");
   // Cloud Spanner stores the whole resource path in `database`; only the trailing
   // database ID is short enough for a subtitle, and the host is empty on Google Cloud.
@@ -83,6 +88,8 @@ function redactSingleHost(host: string): string {
 
 export function connectionRedactedEndpointLabel(connection?: ConnectionPresentationConfig): string {
   if (!connection) return "";
+  // DSN 名本身不含凭据（用户名/密码在 agent 侧拼接），无需打码。
+  if (connection.db_type === "odbc" || connection.db_type === "odbc32") return connection.dsn || "";
   if (connection.db_type === "cloudflare-d1") return `${REDACTED_HOST_SEGMENT}/${REDACTED_HOST_SEGMENT}`;
   // The Spanner endpoint label already drops project and instance, so it carries
   // no more than any other database name; without this branch the fallback below
