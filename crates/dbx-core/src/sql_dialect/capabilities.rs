@@ -101,6 +101,19 @@ pub fn uses_single_row_insert_statements(database_type: DatabaseType) -> bool {
 pub fn pagination_strategy(database_type: Option<DatabaseType>, context: PaginationContext) -> TablePaginationStrategy {
     match database_type {
         Some(DatabaseType::Jdbc) => TablePaginationStrategy::AgentMaxRows,
+        // Generic ODBC sits in front of an unknown backend (SQL Server / MySQL /
+        // Oracle / PostgreSQL all share one driver), so dbx-core must never inject a
+        // dialect-specific LIMIT/TOP/FETCH clause — SQL Server's ODBC driver rejects
+        // `LIMIT 100` with "syntax error near '100'". The native ODBC agent executes
+        // the plain SELECT and pages the result set through its own cursor
+        // (start_table_read -> fetch_query_page), so AgentMaxRows is correct for every
+        // backend and every pagination context.
+        //
+        // `Odbc32` is the same driver/trait set reached through a 32-bit DSN; it shares
+        // this arm deliberately. Without it the variant falls through to the
+        // `LimitOffset` catch-all and 32-bit DSN connections hit the identical
+        // `LIMIT 100` syntax error.
+        Some(DatabaseType::Odbc | DatabaseType::Odbc32) => TablePaginationStrategy::AgentMaxRows,
         Some(DatabaseType::Oracle) if matches!(context, PaginationContext::TablePreview) => {
             TablePaginationStrategy::Rownum
         }

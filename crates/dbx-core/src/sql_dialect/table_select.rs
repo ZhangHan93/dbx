@@ -1070,4 +1070,17 @@ mod tests {
 
         assert_eq!(build_table_data_select_sql(options), "SELECT [id], [name] FROM [users] ORDER BY [id] ASC");
     }
+
+    #[test]
+    fn odbc_table_preview_omits_dialect_specific_limit() {
+        // Generic ODBC fronts an unknown backend, so the generated SQL must be a plain
+        // SELECT the agent pages through its cursor — never a MySQL/Postgres `LIMIT`
+        // that SQL Server's ODBC driver rejects with "syntax error near '100'".
+        // `Odbc32` is the same driver reached through a 32-bit DSN and must match.
+        for database_type in [DatabaseType::Odbc, DatabaseType::Odbc32] {
+            let sql = build_table_data_select_sql(opts(database_type, None, None, "register"));
+            assert!(!sql.to_uppercase().contains("LIMIT"), "{database_type:?} sql must not contain LIMIT: {sql}");
+            assert_eq!(sql, "SELECT * FROM register;", "{database_type:?} sql changed shape");
+        }
+    }
 }

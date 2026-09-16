@@ -537,17 +537,27 @@ internal sealed class OdbcSession
     {
         EnsureConn();
         string? schema = OdbcRuntimeServer.Str(p, "schema");
-        var rows = SafeSchema("Tables").Rows.Cast<DataRow>()
-            .Where(r => MatchSchema(r, schema))
+        var table = SafeSchema("Tables");
+        var matchSchema = SchemaFilter(table, schema);
+        var rows = table.Rows.Cast<DataRow>()
+            .Where(matchSchema)
             .OrderBy(r => Str(r, "TABLE_NAME") ?? "", StringComparer.OrdinalIgnoreCase);
 
         var list = new List<object>();
         foreach (DataRow r in rows)
         {
+            // 同时输出 table_type 与 object_type：
+            // 后端 list_tables 的反序列化目标 TableInfo 用 table_type；
+            // list_objects（侧栏 TABLE/VIEW 分组节点展开时调用）的反序列化目标
+            // ObjectInfo 用 object_type。二者都从同一个 agent 方法 ListTables 返回，
+            // 任一字段缺失都会让该路径报 "missing field" 而渲染为空 —— 正是
+            // 「双击 ODBC 库节点，分组里不出表」的根因（2026-09-16 真机 CDP 复现）。
+            string tableType = Str(r, "TABLE_TYPE") ?? "TABLE";
             list.Add(new
             {
                 name = Str(r, "TABLE_NAME") ?? "",
-                table_type = Str(r, "TABLE_TYPE") ?? "TABLE",
+                table_type = tableType,
+                object_type = tableType,
                 comment = (string?)null
             });
         }
@@ -562,8 +572,10 @@ internal sealed class OdbcSession
         var pkCols = PrimaryKeyColumns(schema, table);
 
         var list = new List<object>();
-        var rows = SafeSchema("Columns").Rows.Cast<DataRow>()
-            .Where(r => MatchSchema(r, schema) && MatchName(r, "TABLE_NAME", table))
+        var columnTable = SafeSchema("Columns");
+        var matchSchema = SchemaFilter(columnTable, schema);
+        var rows = columnTable.Rows.Cast<DataRow>()
+            .Where(r => matchSchema(r) && MatchName(r, "TABLE_NAME", table))
             .OrderBy(r => IntFrom(r, "ORDINAL_POSITION"))
             .ToList();
 
@@ -602,9 +614,11 @@ internal sealed class OdbcSession
         string? table = OdbcRuntimeServer.Str(p, "table");
 
         var indexes = new Dictionary<string, (bool primary, bool unique, List<string> cols)>(StringComparer.OrdinalIgnoreCase);
-        foreach (DataRow r in SafeSchema("Indexes").Rows)
+        var indexTable = SafeSchema("Indexes");
+        var matchSchema = SchemaFilter(indexTable, schema);
+        foreach (DataRow r in indexTable.Rows)
         {
-            if (!MatchSchema(r, schema) || !MatchName(r, "TABLE_NAME", table)) continue;
+            if (!matchSchema(r) || !MatchName(r, "TABLE_NAME", table)) continue;
             string name = Str(r, "INDEX_NAME") ?? "";
             if (string.IsNullOrWhiteSpace(name)) continue;
             if (!indexes.TryGetValue(name, out var e))
@@ -948,20 +962,47 @@ internal sealed class OdbcSession
     HashSet<string> PrimaryKeyColumns(string? schema, string? table)
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (DataRow r in SafeSchema("Indexes").Rows)
+        var indexTable = SafeSchema("Indexes");
+        var matchSchema = SchemaFilter(indexTable, schema);
+        foreach (DataRow r in indexTable.Rows)
         {
             if (!BoolFrom(r, "PRIMARY_KEY")) continue;
-            if (!MatchSchema(r, schema) || !MatchName(r, "TABLE_NAME", table)) continue;
+            if (!matchSchema(r) || !MatchName(r, "TABLE_NAME", table)) continue;
             string? col = Str(r, "COLUMN_NAME");
             if (!string.IsNullOrWhiteSpace(col)) set.Add(col);
         }
         return set;
     }
 
-    static bool MatchSchema(DataRow r, string? schema)
+    /// <summary>
+    /// 把 list_* 请求里的 <c>schema</c> 入参解析成行过滤器。ODBC 是通用桥接，
+    /// 「schema 位」在不同调用方下含义不同，故按「先解析一次，再按行过滤」处理：
+    ///
+    /// 1. 入参为空 → 不过滤（侧栏分组走的就是空 schema；
+    ///    <c>connectionObjectTreeQuerySchema</c> 在对象树模式下返回 ""）。
+    /// 2. 入参在本集合里确实是某个 TABLE_SCHEM → 按 schema 过滤（用户显式选了 schema）。
+    /// 3. 入参在本集合里是 TABLE_CAT（库/目录名）→ 按 catalog 过滤。
+    ///    这是修复点：odbc/odbc32 的 traits 含 <c>databaseObjectTree</c>，前端在
+    ///    对象树模式下会把**库名**塞进 schema 位（<c>ObjectBrowser.loadObjects</c>
+    ///    的 <c>needsSchema ? ... : props.database</c>）。此时真实 TABLE_SCHEM 是
+    ///    <c>dbo</c> 一类，永远匹配不上 → 主面板「没有找到对象」。侧栏分组因为走
+    ///    空 schema 所以一直正常，这也是「树里有表、主面板空白」这个割裂现象的来源。
+    /// 4. 两者都不是（入参既不是本集合的 schema 也不是 catalog）→ 返回空，保持既有行为。
+    ///
+    /// 注意：先判 schema 再判 catalog，顺序不可颠倒 —— 否则「库名恰好与某个 schema
+    /// 同名」时会把整个库都放出来。集合内任一 TABLE_CAT/TABLE_SCHEM 为空（Oracle、
+    /// SQLite 等无 catalog 概念的驱动）时，相应分支自然退化，行为不变。
+    /// </summary>
+    static Func<DataRow, bool> SchemaFilter(DataTable table, string? schema)
     {
-        if (string.IsNullOrWhiteSpace(schema)) return true;
-        return string.Equals(Str(r, "TABLE_SCHEM"), schema, StringComparison.OrdinalIgnoreCase);
+        if (string.IsNullOrWhiteSpace(schema)) return static _ => true;
+
+        bool Eq(string col, DataRow r) => string.Equals(Str(r, col), schema, StringComparison.OrdinalIgnoreCase);
+        var rows = table.Rows.Cast<DataRow>();
+
+        if (rows.Any(r => Eq("TABLE_SCHEM", r))) return r => Eq("TABLE_SCHEM", r);
+        if (rows.Any(r => Eq("TABLE_CAT", r))) return r => Eq("TABLE_CAT", r);
+        return static _ => false;
     }
 
     static bool MatchName(DataRow r, string col, string? name)
