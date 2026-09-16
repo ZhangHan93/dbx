@@ -50,6 +50,14 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --no-frozen-lockfile
 
+      # 为什么必须有这一步：`pnpm tauri build` 的 beforeBuildCommand 是 `pnpm build`（纯 vite build，
+      # esbuild 直接剥类型），**不做类型检查**。于是「按 DatabaseType 穷举的映射表漏了某个 db_type」
+      # 这类错误（如 DATABASE_NAMESPACE_CREATION_MATRIX 缺 odbc/odbc32）在编译期毫无征兆，
+      # 只在运行时 `Entry[db_type].field` 抛 TypeError —— 症状是右键连接菜单直接不弹。
+      # vue-tsc 会把 satisfies Record<DatabaseType, ...> 的缺键报成 TS2740。
+      - name: Typecheck frontend
+        run: pnpm typecheck
+
       - name: Build ODBC agent (64-bit)
         working-directory: agents/drivers/odbc
         shell: pwsh

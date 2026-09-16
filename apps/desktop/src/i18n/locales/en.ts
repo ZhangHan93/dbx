@@ -1382,8 +1382,6 @@ export default {
     phoenixDocs: "View Phoenix docs",
     jdbcUrl: "JDBC URL",
     jdbcUrlPlaceholder: "jdbc:postgresql://localhost:5432/database",
-    odbcConnectionString: "ODBC Connection String",
-    odbcConnectionStringPlaceholder: "DSN=MyDSN or DRIVER={'{'}SQL Server{'}'};SERVER=localhost;DATABASE=mydb",
     odbcDsn: "DSN name",
     odbcDsnPlaceholder: "Select or enter a DSN name",
     odbcDsnSearchPlaceholder: "Search DSN",

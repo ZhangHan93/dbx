@@ -6703,6 +6703,10 @@ function openExternalUrl(url: string) {
                     <div class="grid grid-cols-4 items-start gap-4">
                       <Label :class="connectionLabelTopClass">{{ t("connection.odbcDsn") }}</Label>
                       <div class="col-span-3 space-y-1">
+                        <!-- 这里刻意不传 :normalize-custom：SearchableSelect 内部 filteredOptions 用「原始串」
+                             过滤、canSelectCustom 用「归一化值」判断，两者口径不一致时，粘贴 `DSN=xxx` 会
+                             匹配不到任何选项、自定义项又被 options.includes 抑制掉 → 什么都选不中。
+                             前缀剥离改由提交时的 connectionConfigForSubmit + agent 侧兜底各剥一次。 -->
                         <SearchableSelect
                           v-model="odbcDsnValue"
                           :options="odbcDsnOptions"
@@ -6713,7 +6717,6 @@ function openExternalUrl(url: string) {
                           :loading="odbcDsnsLoading"
                           allow-custom
                           clearable
-                          :normalize-custom="normalizeOdbcDsnName"
                           data-odbc-dsn-select
                         />
                         <p v-if="odbcDsnInvalid" class="text-xs text-destructive">{{ t("connection.odbcDsnInvalidChars") }}</p>

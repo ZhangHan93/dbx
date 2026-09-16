@@ -1300,8 +1300,6 @@ export default withEnglishFallback({
     phoenixDocs: "查看 Phoenix 文档",
     jdbcUrl: "JDBC URL",
     jdbcUrlPlaceholder: "jdbc:postgresql://localhost:5432/database",
-    odbcConnectionString: "ODBC 连接字符串",
-    odbcConnectionStringPlaceholder: "DSN=MyDSN 或 DRIVER={'{'}SQL Server{'}'};SERVER=localhost;DATABASE=mydb",
     odbcDsn: "DSN 名称",
     odbcDsnPlaceholder: "选择或输入 DSN 名称",
     odbcDsnSearchPlaceholder: "搜索 DSN",
