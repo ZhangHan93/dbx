@@ -13,6 +13,7 @@ import { createContentSurfaceEventForwarders } from "@/lib/tabs/contentSurfaceEv
 import { isPreviewTab } from "@/lib/tabs/tabPresentation";
 import { resolveExecutableSql } from "@/lib/sql/sqlExecutionTarget";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { usesOracleStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
 import { GROUP_TAB_BAR_PORTAL } from "./groupTabBarPortal";
 import type { ContentAreaSurfaceEmits, ContentAreaSurfaceProps, QueryEditorSurfaceHandle, StatementRange } from "./querySurfaces";
 import type { QueryTab } from "@/types/database";
@@ -30,6 +31,8 @@ const props = defineProps<
     tabBarCollapsed?: boolean;
     canDetachTabs?: boolean;
     detachedDropTarget?: boolean;
+    /** Collapse the group to its tab strip while a plugin workbench tab owns the layout. */
+    contentSuppressed?: boolean;
   }
 >();
 
@@ -41,7 +44,7 @@ const emit = defineEmits<
     "activate-tab": [tabId: string];
     "locate-tab": [tab: QueryTab];
     "toggle-zen-mode": [];
-    "start-resize": [event: MouseEvent];
+    "start-resize": [event: PointerEvent];
     "toggle-collapse": [];
     "detach-tab": [tab: QueryTab];
   }
@@ -67,7 +70,7 @@ const surfaceBindings = computed(() => ({ ...surfaceProps.value, ...contentEmits
 const activeSurfaceRef = ref<QueryEditorSurfaceHandle | null>(null);
 
 defineExpose({
-  focusSearch: () => activeSurfaceRef.value?.focusSearch() ?? false,
+  focusSearch: (target: Element | null = null) => activeSurfaceRef.value?.focusSearch(target) ?? false,
   openGoToColumn: () => activeSurfaceRef.value?.openGoToColumn() ?? false,
   refreshData: () => activeSurfaceRef.value?.refreshData() ?? false,
   toggleResultsPane: () => activeSurfaceRef.value?.toggleResultsPane() ?? false,
@@ -86,6 +89,7 @@ defineExpose({
   executeRedisCommand: (command: string) => activeSurfaceRef.value?.executeRedisCommand(command) ?? Promise.resolve(false),
   previewStatementRange: (tabId: string, range: StatementRange | null) => (activeTab.value?.id === tabId ? (activeSurfaceRef.value?.previewStatementRange(range) ?? false) : false),
   focusStatementRange: (tabId: string, range: StatementRange | null) => (activeTab.value?.id === tabId ? (activeSurfaceRef.value?.focusStatementRange(range) ?? false) : false),
+  focusErrorPosition: (tabId: string, offset: number) => (activeTab.value?.id === tabId ? (activeSurfaceRef.value?.focusErrorPosition(offset) ?? false) : false),
 });
 
 const { t } = useI18n();
@@ -98,6 +102,7 @@ const tabBarTarget = computed(() => {
   if (!tabBarPortal?.active.value) return undefined;
   return tabBarPortal.targets.get(props.groupId);
 });
+
 const groupTabs = computed(() => {
   const byId = new Map(queryStore.tabs.map((tab) => [tab.id, tab]));
   return props.tabIds.map((id) => byId.get(id)).filter((tab): tab is QueryTab => !!tab);
@@ -105,7 +110,7 @@ const groupTabs = computed(() => {
 const activeTab = computed(() => groupTabs.value.find((tab) => tab.id === props.activeTabId) ?? groupTabs.value[0] ?? null);
 const activeConnection = computed(() => (activeTab.value ? connectionStore.getConfig(activeTab.value.connectionId) : undefined));
 const showGroupToolbar = computed(() => activeTab.value?.mode === "query" && !isPreviewTab(activeTab.value));
-const isGroupOracleManualTransaction = computed(() => effectiveDatabaseTypeForConnection(activeConnection.value) === "oracle" && (activeTab.value?.autoCommit ?? true) === false);
+const isGroupOracleManualTransaction = computed(() => usesOracleStickyTransactionState(effectiveDatabaseTypeForConnection(activeConnection.value)) && (activeTab.value?.autoCommit ?? true) === false);
 // Each group previews the executable SQL of its own active tab (selection
 // stored on the tab), not the focused tab's global selection.
 // tabPlacement drives each pane's own bar position: the strip sits above,
@@ -138,7 +143,7 @@ const groupExecutableSql = computed(() => {
 </script>
 
 <template>
-  <div class="editor-group flex h-full min-h-0 min-w-0 overflow-hidden" :class="[groupClass, groupLayoutClass]" :data-group-id="groupId" @pointerdown.capture="$emit('focus-group', groupId)" @focusin="$emit('focus-group', groupId)">
+  <div class="editor-group flex min-h-0 min-w-0 overflow-hidden" :class="[contentSuppressed ? '' : 'h-full', groupClass, groupLayoutClass]" :data-group-id="groupId" @pointerdown.capture="$emit('focus-group', groupId)" @focusin="$emit('focus-group', groupId)">
     <Teleport defer v-if="showTabNavigation !== false" :to="tabBarTarget" :disabled="!tabBarPortal?.active.value || !tabBarTarget">
       <EditorGroupTabBar
         :group-id="groupId"
@@ -157,15 +162,17 @@ const groupExecutableSql = computed(() => {
         @detach-tab="$emit('detach-tab', $event)"
         @activate-settings="toolbar.activateSettingsPage()"
         @close-settings="toolbar.closeSettingsPage()"
-        @activate-driver-store="toolbar.activateDriverStore()"
-        @close-driver-store="toolbar.closeDriverStore()"
         @activate-plugin-center="toolbar.activatePluginCenter()"
         @close-plugin-center="toolbar.closePluginCenter()"
+        @activate-driver-store="toolbar.activateDriverStore()"
+        @close-driver-store="toolbar.closeDriverStore()"
       />
     </Teleport>
     <!-- The toolbar stays at the top of the pane's content column in every
-         placement; only the tab bar moves around it. -->
-    <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+         placement; only the tab bar moves around it. While contentSuppressed
+         (plugin workbench tab active) the whole column yields to the
+         always-mounted plugin layer and the group collapses to its strip. -->
+    <div v-show="!contentSuppressed" class="flex min-h-0 min-w-0 flex-1 flex-col">
       <EditorToolbar
         v-if="activeTab && showGroupToolbar"
         :active-tab="activeTab"

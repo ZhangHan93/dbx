@@ -29,7 +29,10 @@ use crate::models::connection::{
 use crate::mongo_oidc::MongoOidcBrowserOpener;
 use crate::nacos::config::{NACOS_CONSOLE_SESSION_PASSWORD, NACOS_PRIMARY_SESSION_PASSWORD};
 use crate::path_utils::expand_tilde;
-use crate::plugins::{PluginConnectionHandle, PluginDriverSession, PluginHost, PluginRegistry, PluginRuntimeEnv};
+use crate::plugins::{
+    PluginConnectionActionResult, PluginConnectionHandle, PluginDriverSession, PluginHost, PluginRegistry,
+    PluginRuntimeEnv,
+};
 use crate::query_cancel::RunningQueries;
 use crate::session_credentials::SessionCredentialStore;
 use crate::storage::{normalize_duckdb_worker_max_processes, Storage, DUCKDB_WORKER_MAX_PROCESSES_DEFAULT};
@@ -1348,8 +1351,10 @@ impl AppState {
         agent_dir: PathBuf,
         app_version: impl Into<String>,
     ) -> Self {
-        let data_dir = storage.data_dir().to_path_buf();
         let app_version = app_version.into();
+        let data_dir = storage.data_dir().to_path_buf();
+        let plugins = PluginRegistry::new_with_app_version(plugin_dir, app_version.clone());
+        let plugin_host = PluginHost::new(plugins.clone());
         Self {
             connections: Arc::new(RwLock::new(ConnectionPoolRegistry::new())),
             task_supervisor: TaskSupervisor::new(),
@@ -1362,8 +1367,8 @@ impl AppState {
             proxy_tunnels: ProxyTunnelManager::new(),
             http_tunnels: HttpTunnelManager::new(),
             storage,
-            plugins: PluginRegistry::new_with_app_version(plugin_dir.clone(), app_version.clone()),
-            plugin_host: PluginHost::new(PluginRegistry::new_with_app_version(plugin_dir, app_version.clone())),
+            plugins,
+            plugin_host,
             agent_manager: crate::agent_manager::AgentManager::new_with_base_dir_and_app_version(
                 agent_dir,
                 app_version,
@@ -2035,6 +2040,7 @@ impl AppState {
                 self.proxy_tunnels.stop_all_tunnels(),
                 self.http_tunnels.stop_all_tunnels(),
                 self.agent_manager.stop_daemons(),
+                self.plugin_host.stop_all(),
             );
         };
         if tokio::time::timeout(deadline, shutdown).await.is_err() {
@@ -2206,7 +2212,9 @@ impl AppState {
             self.reset_connection_transport_for_config(connection_id, &db_config).await;
             return Err(err);
         }
-        probe_connection_endpoint(&db_config, &host, port).await?;
+        if db_config.db_type != DatabaseType::Plugin {
+            probe_connection_endpoint(&db_config, &host, port).await?;
+        }
         if let Err(err) = self.ensure_current_connection_attempt(connection_id, connection_attempt).await {
             self.reset_connection_transport_for_config(connection_id, &db_config).await;
             return Err(err);
@@ -2470,7 +2478,10 @@ impl AppState {
                     db_config.url_params.as_deref(),
                     db_config.external_config.as_ref(),
                     connect_timeout,
-                );
+                    Some(db_config.ca_cert_path.as_str()),
+                    Some(db_config.client_cert_path.as_str()),
+                    Some(db_config.client_key_path.as_str()),
+                )?;
                 db::elasticsearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Elasticsearch(client)
             }
@@ -2483,7 +2494,10 @@ impl AppState {
                     db_config.url_params.as_deref(),
                     db_config.external_config.as_ref(),
                     connect_timeout,
-                );
+                    Some(db_config.ca_cert_path.as_str()),
+                    Some(db_config.client_cert_path.as_str()),
+                    Some(db_config.client_key_path.as_str()),
+                )?;
                 db::easysearch_driver::test_connection(&mut client, connect_timeout).await?;
                 PoolKind::Easysearch(client)
             }
@@ -2783,7 +2797,9 @@ impl AppState {
                 }
                 self.external_driver_pool("jdbc", &jdbc_config).await?
             }
-            DatabaseType::Plugin => return Err("Plugin-owned connections use the plugin host".to_string()),
+            DatabaseType::Plugin => {
+                PoolKind::PluginConnection(self.plugin_host.connect_connection(&db_config, &host, port).await?)
+            }
             #[cfg(feature = "mq-admin")]
             DatabaseType::MessageQueue => {
                 // MQ admin connections don't hold a data query pool. We just test
@@ -3050,6 +3066,28 @@ impl AppState {
         .await?;
 
         Ok(("127.0.0.1".to_string(), local_port))
+    }
+
+    pub async fn invoke_plugin_connection_action(
+        &self,
+        config: ConnectionConfig,
+        action_id: &str,
+    ) -> Result<PluginConnectionActionResult, String> {
+        if config.db_type != DatabaseType::Plugin {
+            return Err("Connection is not owned by a plugin".to_string());
+        }
+        let config = config.canonicalized();
+        let transport_id = format!("{}:plugin-action:{action_id}", config.id);
+        let has_transport_layers = config.has_effective_transport_layers();
+        let connection_id = if has_transport_layers { transport_id.as_str() } else { config.id.as_str() };
+        let result = match self.connection_host_port(connection_id, &config).await {
+            Ok((host, port)) => self.plugin_host.invoke_connection_action(&config, action_id, &host, port).await,
+            Err(error) => Err(error),
+        };
+        if has_transport_layers {
+            self.reset_connection_transport_for_config(&transport_id, &config).await;
+        }
+        result
     }
 
     pub async fn connect_redis_sentinel(
@@ -3834,13 +3872,13 @@ impl AppState {
                         }
                     }
                 }
+                PoolKind::PluginConnection(handle) => !handle.is_running(),
                 PoolKind::Sqlite(_)
                 | PoolKind::DuckDbWorker(_)
                 | PoolKind::ExternalDriver { .. }
                 | PoolKind::MessageQueue
                 | PoolKind::Nacos
                 | PoolKind::Consul(_) => false,
-                PoolKind::PluginConnection(handle) => !handle.is_running(),
                 #[cfg(feature = "mq-admin")]
                 PoolKind::Mqtt(_) => false,
             }
@@ -4998,15 +5036,6 @@ impl AppState {
         self.pool_routing_control().close_removed(removed).await;
     }
 
-    pub async fn invoke_plugin_connection_action(
-        &self,
-        config: ConnectionConfig,
-        action_id: &str,
-    ) -> Result<crate::plugins::PluginConnectionActionResult, String> {
-        let (host, port) = self.connection_host_port(&config.id, &config).await?;
-        self.plugin_host.invoke_connection_action(&config, action_id, &host, port).await
-    }
-
     async fn drain_connection_pools(&self, connection_id: &str) -> Vec<(String, PoolKind)> {
         let pool_prefix = format!("{connection_id}:");
         let keys_to_remove: Vec<String> = self
@@ -5767,7 +5796,14 @@ async fn close_pool_kind(pool: PoolKind) -> Result<(), String> {
             session.shutdown().await;
         }
         PoolKind::PluginConnection(handle) => {
-            handle.disconnect().await?;
+            if let Err(error) = handle.disconnect().await {
+                log::warn!(
+                    "Failed to disconnect plugin connection '{}' ({}/{}): {error}",
+                    handle.connection_id,
+                    handle.plugin_id,
+                    handle.provider_id
+                );
+            }
         }
         PoolKind::MessageQueue => {}
         PoolKind::Nacos => {}

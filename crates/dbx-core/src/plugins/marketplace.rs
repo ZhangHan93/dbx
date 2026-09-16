@@ -15,8 +15,8 @@ use sha2::{Digest, Sha256};
 use super::installer::{validate_key_id, PluginPackageExpectation};
 use super::manifest::{parse_host_network_permission, MAX_PLUGIN_NETWORK_ORIGINS};
 use super::{
-    current_plugin_target, PluginInstallResult, PluginPackageInstaller, PluginTrustStore, MAX_PLUGIN_PACKAGE_BYTES,
-    SUPPORTED_PLUGIN_PERMISSIONS,
+    current_plugin_target, PluginInstallPolicy, PluginInstallResult, PluginPackageInstaller, PluginTrustStore,
+    MAX_PLUGIN_PACKAGE_BYTES, SUPPORTED_PLUGIN_PERMISSIONS,
 };
 
 pub const SUPPORTED_PLUGIN_CATALOG_VERSION: u32 = 1;
@@ -407,6 +407,49 @@ impl PluginMarketplace {
             .install_marketplace_bytes(&package, &expectation)
     }
 
+    /// Downloads a .dbxp package from a direct http(s) URL and installs it with
+    /// the same policy semantics as a local package install, except that
+    /// signatures may also verify against the built-in official DBX Marketplace
+    /// keys, so store-signed packages install from their direct artifact URLs
+    /// as well. No marketplace catalog expectation is applied.
+    pub async fn install_url_package<F>(
+        &self,
+        url: &str,
+        policy: PluginInstallPolicy,
+        mut on_progress: F,
+    ) -> Result<PluginInstallResult, String>
+    where
+        F: FnMut(u64, Option<u64>),
+    {
+        let url = parse_http_url(url.trim(), "Plugin package URL")?;
+        let response = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|error| format!("Failed to download Plugin package from {url}: {error}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Failed to download Plugin package from {url}: HTTP {}", response.status()));
+        }
+        if response.content_length().is_some_and(|length| length > MAX_PLUGIN_PACKAGE_BYTES as u64) {
+            return Err(format!("Plugin package exceeds {MAX_PLUGIN_PACKAGE_BYTES} bytes"));
+        }
+        let total = response.content_length();
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| format!("Failed to read Plugin package from {url}: {error}"))?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_PLUGIN_PACKAGE_BYTES {
+                return Err(format!("Plugin package exceeds {MAX_PLUGIN_PACKAGE_BYTES} bytes"));
+            }
+            bytes.extend_from_slice(&chunk);
+            on_progress(bytes.len() as u64, total);
+        }
+        let trust_store = url_install_trust_store(&self.root_dir)?;
+        PluginPackageInstaller::with_trust_store(self.root_dir.clone(), self.app_version.clone(), trust_store)
+            .install_bytes(&bytes, policy)
+    }
+
     async fn download_limited(&self, url: Url, max_bytes: usize, label: &str) -> Result<Vec<u8>, String> {
         let response = self
             .client
@@ -648,10 +691,7 @@ fn verify_artifact_bytes(artifact: &PluginMarketplaceArtifact, bytes: &[u8]) -> 
     Ok(())
 }
 
-fn marketplace_trust_store(root_dir: &Path, kind: PluginRepositoryKind) -> Result<PluginTrustStore, String> {
-    if kind != PluginRepositoryKind::Official {
-        return PluginTrustStore::load(root_dir);
-    }
+fn builtin_official_trusted_keys() -> Result<BTreeMap<String, String>, String> {
     let mut keys = BUILTIN_OFFICIAL_TRUSTED_KEYS
         .iter()
         .map(|(key_id, public_key)| ((*key_id).to_string(), (*public_key).to_string()))
@@ -665,11 +705,41 @@ fn marketplace_trust_store(root_dir: &Path, kind: PluginRepositoryKind) -> Resul
             }
         }
     }
-    let store = PluginTrustStore::from_base64_keys(keys)?;
+    Ok(keys)
+}
+
+fn marketplace_trust_store(root_dir: &Path, kind: PluginRepositoryKind) -> Result<PluginTrustStore, String> {
+    if kind != PluginRepositoryKind::Official {
+        return PluginTrustStore::load(root_dir);
+    }
+    let store = PluginTrustStore::from_base64_keys(builtin_official_trusted_keys()?)?;
     if store.is_empty() {
         return Err("Official DBX Marketplace signing keys are empty".to_string());
     }
     Ok(store)
+}
+
+/// Trust store for direct URL installs: the user's trusted keys plus the
+/// built-in official DBX Marketplace keys. A user-saved key that collides with
+/// a builtin key id but carries a different public key is a rotation conflict
+/// and fails the install instead of silently overriding the builtin key.
+pub fn url_install_trust_store(root_dir: &Path) -> Result<PluginTrustStore, String> {
+    let mut keys = PluginTrustStore::list_base64_keys(root_dir)?
+        .into_iter()
+        .map(|key| (key.key_id, key.public_key))
+        .collect::<BTreeMap<_, _>>();
+    for (key_id, public_key) in builtin_official_trusted_keys()? {
+        if let Some(existing) = keys.get(&key_id) {
+            if existing.trim() != public_key {
+                return Err(format!(
+                    "Trusted plugin key '{key_id}' already exists with a different public key; remove it before installing official store packages from a URL"
+                ));
+            }
+            continue;
+        }
+        keys.insert(key_id, public_key);
+    }
+    PluginTrustStore::from_base64_keys(keys)
 }
 
 fn parse_http_url(raw: &str, label: &str) -> Result<Url, String> {
@@ -1075,10 +1145,21 @@ mod tests {
     }
 
     fn signed_package(signing_key: &SigningKey, key_id: &str) -> Vec<u8> {
+        let (files, checksums) = plugin_package_files("marketplace.install", "Marketplace Install");
+        let signature = serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "ed25519",
+            "key_id": key_id,
+            "signature": base64::engine::general_purpose::STANDARD.encode(signing_key.sign(&checksums).to_bytes())
+        }))
+        .unwrap();
+        zip_package_files(&files, &checksums, Some(&signature))
+    }
+
+    fn plugin_package_files(id: &str, name: &str) -> (BTreeMap<String, Vec<u8>>, Vec<u8>) {
         let manifest = serde_json::to_vec_pretty(&serde_json::json!({
             "manifest_version": 1,
-            "id": "marketplace.install",
-            "name": "Marketplace Install",
+            "id": id,
+            "name": name,
             "version": "1.0.0",
             "publisher": "example",
             "engines": { "dbx": ">=0.5.0", "host_api": "^1.0" },
@@ -1101,12 +1182,10 @@ mod tests {
                 .collect::<BTreeMap<_, _>>()
         }))
         .unwrap();
-        let signature = serde_json::to_vec_pretty(&serde_json::json!({
-            "algorithm": "ed25519",
-            "key_id": key_id,
-            "signature": base64::engine::general_purpose::STANDARD.encode(signing_key.sign(&checksums).to_bytes())
-        }))
-        .unwrap();
+        (files, checksums)
+    }
+
+    fn zip_package_files(files: &BTreeMap<String, Vec<u8>>, checksums: &[u8], signature: Option<&[u8]>) -> Vec<u8> {
         let mut output = Cursor::new(Vec::new());
         {
             let mut archive = zip::ZipWriter::new(&mut output);
@@ -1117,14 +1196,151 @@ mod tests {
                     SimpleFileOptions::default().unix_permissions(0o644)
                 };
                 archive.start_file(path, options).unwrap();
-                archive.write_all(&bytes).unwrap();
+                archive.write_all(bytes).unwrap();
             }
             archive.start_file(PLUGIN_CHECKSUMS_FILE, SimpleFileOptions::default()).unwrap();
-            archive.write_all(&checksums).unwrap();
-            archive.start_file(PLUGIN_SIGNATURE_FILE, SimpleFileOptions::default()).unwrap();
-            archive.write_all(&signature).unwrap();
+            archive.write_all(checksums).unwrap();
+            if let Some(signature) = signature {
+                archive.start_file(PLUGIN_SIGNATURE_FILE, SimpleFileOptions::default()).unwrap();
+                archive.write_all(signature).unwrap();
+            }
             archive.finish().unwrap();
         }
         output.into_inner()
+    }
+
+    fn serve_package_once(listener: tokio::net::TcpListener, body: Vec<u8>) -> tokio::task::JoinHandle<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&body).await.unwrap();
+        })
+    }
+
+    #[tokio::test]
+    async fn installs_a_signed_package_from_a_direct_url() {
+        let root = tempfile::tempdir().unwrap();
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let key_id = "direct-url-release";
+        PluginTrustStore::save_base64_key(
+            root.path(),
+            key_id,
+            &base64::engine::general_purpose::STANDARD.encode(signing_key.verifying_key().as_bytes()),
+        )
+        .unwrap();
+        let package = signed_package(&signing_key, key_id);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_package_once(listener, package.clone());
+        let marketplace = PluginMarketplace::new(root.path().to_path_buf(), "0.5.68").unwrap();
+        let mut last_progress = (0u64, None);
+        let result = marketplace
+            .install_url_package(
+                &format!("http://{address}/plugin.dbxp"),
+                PluginInstallPolicy::LocalSigned,
+                |downloaded, total| last_progress = (downloaded, total),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(result.plugin.manifest.id, "marketplace.install");
+        assert_eq!(result.plugin.manifest.version, "1.0.0");
+        assert_eq!(result.signature, crate::plugins::PluginSignatureStatus::Trusted { key_id: key_id.to_string() });
+        assert_eq!(last_progress, (package.len() as u64, Some(package.len() as u64)));
+    }
+
+    #[tokio::test]
+    async fn rejects_url_package_signed_by_an_untrusted_key() {
+        let root = tempfile::tempdir().unwrap();
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let package = signed_package(&signing_key, "unknown-release");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_package_once(listener, package);
+        let marketplace = PluginMarketplace::new(root.path().to_path_buf(), "0.5.68").unwrap();
+        let error = marketplace
+            .install_url_package(&format!("http://{address}/plugin.dbxp"), PluginInstallPolicy::LocalSigned, |_, _| {})
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        assert!(error.contains("untrusted key"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn trusts_builtin_official_store_keys_for_url_installs() {
+        let root = tempfile::tempdir().unwrap();
+        let (files, checksums) = plugin_package_files("marketplace.install", "Marketplace Install");
+        let forged_key = SigningKey::from_bytes(&[11u8; 32]);
+        let signature = serde_json::to_vec_pretty(&serde_json::json!({
+            "algorithm": "ed25519",
+            "key_id": "dbx-store-release-2026",
+            "signature": base64::engine::general_purpose::STANDARD.encode(forged_key.sign(&checksums).to_bytes())
+        }))
+        .unwrap();
+        let package = zip_package_files(&files, &checksums, Some(&signature));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_package_once(listener, package);
+        let marketplace = PluginMarketplace::new(root.path().to_path_buf(), "0.5.68").unwrap();
+        let error = marketplace
+            .install_url_package(&format!("http://{address}/plugin.dbxp"), PluginInstallPolicy::LocalSigned, |_, _| {})
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+
+        // The builtin official key id must resolve in the merged trust store,
+        // so verification reaches the signature check instead of key trust.
+        assert!(!error.contains("untrusted key"), "unexpected error: {error}");
+        assert!(error.contains("signature verification failed"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn installs_an_unsigned_url_package_in_development_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let (files, checksums) = plugin_package_files("marketplace.install", "Marketplace Install");
+        let package = zip_package_files(&files, &checksums, None);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = serve_package_once(listener, package);
+        let marketplace = PluginMarketplace::new(root.path().to_path_buf(), "0.5.68").unwrap();
+        let result = marketplace
+            .install_url_package(
+                &format!("http://{address}/plugin.dbxp"),
+                PluginInstallPolicy::LocalDevelopment,
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_eq!(result.plugin.manifest.id, "marketplace.install");
+        assert_eq!(result.signature, crate::plugins::PluginSignatureStatus::Unsigned);
+    }
+
+    #[tokio::test]
+    async fn rejects_url_packages_without_an_http_scheme() {
+        let root = tempfile::tempdir().unwrap();
+        let marketplace = PluginMarketplace::new(root.path().to_path_buf(), "0.5.68").unwrap();
+        let error = marketplace
+            .install_url_package("ftp://example.com/plugin.dbxp", PluginInstallPolicy::LocalSigned, |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("HTTP or HTTPS"), "unexpected error: {error}");
+        let error = marketplace
+            .install_url_package("not a url", PluginInstallPolicy::LocalSigned, |_, _| {})
+            .await
+            .unwrap_err();
+        assert!(error.contains("Invalid Plugin package URL"), "unexpected error: {error}");
     }
 }

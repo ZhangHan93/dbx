@@ -2067,18 +2067,11 @@ function openSidebarObjectSource(node: TreeNode, initialEditing: boolean) {
   // connections list user-defined types without a CREATE TYPE getter this cycle.
   if ((node.type === "type" || node.type === "type-body") && !supportsTypeObjectSource(store.getConfig(node.connectionId)?.db_type)) return;
   const target = createSidebarActionTarget(node);
-  const requestGeneration = beginSidebarAction();
-  void store
-    .ensureConnected(target.connectionId!)
-    .then(() => {
-      if (requestGeneration !== sidebarActionGeneration) return;
-      store.activeConnectionId = target.connectionId!;
-      sidebarObjectSourceTarget.value = { node: target, initialEditing };
-      sidebarObjectSourceOpen.value = true;
-    })
-    .catch((error: any) => {
-      if (requestGeneration === sidebarActionGeneration) toast(error?.message || String(error), 5000);
-    });
+  beginSidebarAction();
+  // issue #9035：弹窗立即挂载。此前先 await ensureConnected 再开弹窗，这段时间
+  // 界面上没有任何反馈；现在连接与取源都在弹窗自身的加载态之内完成。
+  sidebarObjectSourceTarget.value = { node: target, initialEditing };
+  sidebarObjectSourceOpen.value = true;
 }
 
 function openSidebarSettings(initialTab: string) {
@@ -2299,7 +2292,16 @@ watch(
   { flush: "post" },
 );
 
-function focusSearch(): boolean {
+function focusSearch(target: Element | null = null): boolean {
+  const tableSearchControl = target?.closest<HTMLElement>("[data-sidebar-table-search-control]");
+  if (tableSearchControl) {
+    const input = tableSearchControl.querySelector<HTMLInputElement>("[data-sidebar-table-search-parent-id]");
+    if (input) {
+      input.focus();
+      input.select();
+      return true;
+    }
+  }
   const input = searchInputRef.value;
   if (!input) return false;
   input.focus();

@@ -68,23 +68,43 @@ pub enum PoolErrorAction {
 #[derive(Debug, Clone)]
 pub enum QueryExecutionError {
     Agent(AgentCallError),
-    DuckDb { code: String, message: String },
-    Canceled { stage: AgentErrorStage, operation_outcome: AgentOperationOutcome },
+    DuckDb {
+        code: String,
+        message: String,
+    },
+    Canceled {
+        stage: AgentErrorStage,
+        operation_outcome: AgentOperationOutcome,
+    },
     Timeout(String),
     Sql(String),
+    /// Native PostgreSQL SQL failure whose driver-reported cursor position was
+    /// resolved against the executed statement text. Kept distinct from
+    /// [`Self::Sql`] so the position survives `classify_query_error` and reaches
+    /// [`Self::into_backend_error`] as a typed field instead of being parsed back
+    /// out of a string.
+    SqlWithPosition {
+        message: String,
+        position: crate::sql_error_position::SqlErrorPosition,
+    },
     Legacy(String),
 }
 
 impl QueryExecutionError {
     pub fn into_legacy_string(self) -> String {
-        match self {
+        let mut message = match self {
             Self::Agent(error) => error.into_legacy_string(),
             Self::DuckDb { message, .. } => message,
             Self::Canceled { .. } => canceled_error(),
             Self::Timeout(error) => error,
             Self::Sql(error) => error,
+            Self::SqlWithPosition { message, .. } => message,
             Self::Legacy(error) => error,
-        }
+        };
+        // Defensive: any remaining transport marker (e.g. from a driver error
+        // that never passed through the resolve step) must not reach clients.
+        while crate::sql_error_position::take_marker(&mut message).is_some() {}
+        message
     }
 
     pub fn into_backend_error(self) -> crate::backend_error::BackendError {
@@ -98,6 +118,9 @@ impl QueryExecutionError {
             }
             Self::Timeout(error) => crate::backend_error::BackendError::from_timeout_detail(&error),
             Self::Sql(error) => crate::backend_error::BackendError::from_sql_detail(&error),
+            Self::SqlWithPosition { message, position } => {
+                crate::backend_error::BackendError::from_sql_detail_with_position(&message, position)
+            }
             Self::Legacy(error) => crate::backend_error::BackendError::from_legacy_string(&error),
         }
     }
@@ -111,6 +134,9 @@ impl QueryExecutionError {
             canceled @ Self::Canceled { .. } => canceled,
             Self::Timeout(error) => Self::Timeout(query_error_with_omitted_sql_context(&error, sql)),
             Self::Sql(error) => Self::Sql(append_typed_sql_error_context(&error, sql)),
+            Self::SqlWithPosition { message, position } => {
+                Self::SqlWithPosition { message: append_typed_sql_error_context(&message, sql), position }
+            }
             Self::Legacy(error) => Self::Legacy(query_error_with_omitted_sql_context(&error, sql)),
         }
     }
@@ -122,6 +148,9 @@ impl QueryExecutionError {
             canceled @ Self::Canceled { .. } => canceled,
             Self::Timeout(error) => Self::Timeout(format!("{error}; {context}")),
             Self::Sql(error) => Self::Sql(format!("{error}; {context}")),
+            Self::SqlWithPosition { message, position } => {
+                Self::SqlWithPosition { message: format!("{message}; {context}"), position }
+            }
             Self::Legacy(error) => Self::Legacy(format!("{error}; {context}")),
         }
     }
@@ -129,7 +158,12 @@ impl QueryExecutionError {
     fn as_agent_error(&self) -> Option<&AgentCallError> {
         match self {
             Self::Agent(error) => Some(error),
-            Self::DuckDb { .. } | Self::Canceled { .. } | Self::Timeout(_) | Self::Sql(_) | Self::Legacy(_) => None,
+            Self::DuckDb { .. }
+            | Self::Canceled { .. }
+            | Self::Timeout(_)
+            | Self::Sql(_)
+            | Self::SqlWithPosition { .. }
+            | Self::Legacy(_) => None,
         }
     }
 }
@@ -142,6 +176,7 @@ impl std::fmt::Display for QueryExecutionError {
             Self::Canceled { .. } => formatter.write_str(QUERY_CANCELED),
             Self::Timeout(error) => formatter.write_str(error),
             Self::Sql(error) => formatter.write_str(error),
+            Self::SqlWithPosition { message, .. } => formatter.write_str(message),
             Self::Legacy(error) => formatter.write_str(error),
         }
     }
@@ -1200,11 +1235,6 @@ pub fn truncate_result_with_max_rows(mut result: db::QueryResult, max_rows: Opti
     result
 }
 
-fn normalize_query_result_for_js(mut result: db::QueryResult) -> db::QueryResult {
-    result.rows = result.rows.into_iter().map(|row| row.into_iter().map(db::json_value_for_js).collect()).collect();
-    result
-}
-
 pub fn agent_execute_query_params(
     sql: &str,
     database: Option<&str>,
@@ -1478,6 +1508,54 @@ fn query_pool_error_action(db_type: Option<DatabaseType>, sql: &str, err: &str) 
     }
 }
 
+fn native_postgres_compatibility_type(db_type: Option<DatabaseType>) -> bool {
+    matches!(
+        db_type,
+        Some(
+            DatabaseType::Postgres
+                | DatabaseType::Gaussdb
+                | DatabaseType::OpenGauss
+                | DatabaseType::Kwdb
+                | DatabaseType::Questdb
+        )
+    )
+}
+
+fn postgres_create_table_relation(sql: &str) -> Option<(Option<String>, String)> {
+    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql).ok()?;
+    let [Statement::CreateTable(table)] = statements.as_slice() else {
+        return None;
+    };
+    if table.temporary {
+        return None;
+    }
+    // PostgreSQL stores unquoted identifiers lower-cased, so the existence
+    // probe must compare the folded spelling; quoted names keep their case.
+    let mut parts = table.name.0.iter().filter_map(|part| {
+        part.as_ident().map(|ident| match ident.quote_style {
+            Some(_) => ident.value.clone(),
+            None => ident.value.to_lowercase(),
+        })
+    });
+    let table_name = parts.next_back()?;
+    Some((parts.next_back(), table_name))
+}
+
+fn should_verify_postgres_create_table_after_connection_error(
+    db_type: Option<DatabaseType>,
+    sql: &str,
+    error: &str,
+) -> bool {
+    native_postgres_compatibility_type(db_type)
+        && is_connection_error(error)
+        && postgres_create_table_relation(sql).is_some()
+}
+
+fn is_postgres_duplicate_relation_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("already exists") && (lower.contains("relation") || lower.contains("table"))
+}
+
 fn query_execution_error_action(
     db_type: Option<DatabaseType>,
     sql: &str,
@@ -1495,6 +1573,7 @@ fn query_execution_error_action(
         QueryExecutionError::DuckDb { message, .. } => query_pool_error_action(db_type, sql, message),
         QueryExecutionError::Timeout(message)
         | QueryExecutionError::Sql(message)
+        | QueryExecutionError::SqlWithPosition { message, .. }
         | QueryExecutionError::Legacy(message) => query_pool_error_action(db_type, sql, message),
         QueryExecutionError::Agent(_) => unreachable!("Agent errors return above"),
     }
@@ -2345,13 +2424,28 @@ async fn do_execute_typed(
         PoolKind::Consul(_) => Err("SQL execution is not supported for Consul connections".to_string()),
     };
     result
-        .map(normalize_query_result_for_js)
         .map_err(|error| {
             #[cfg(feature = "duckdb-sidecar")]
             if let Some(duckdb_error) = typed_duckdb_error {
                 return QueryExecutionError::DuckDb { code: duckdb_error.code, message: duckdb_error.message };
             }
-            typed_agent_error.map_or_else(|| QueryExecutionError::Legacy(error), QueryExecutionError::Agent)
+            if let Some(agent_error) = typed_agent_error {
+                return QueryExecutionError::Agent(agent_error);
+            }
+            // PostgreSQL reports a cursor position as a marker suffix on the
+            // driver message. Resolve it here, while the executed statement text
+            // is still available, into a typed field. The marker is stripped even
+            // when it cannot be resolved, so it can never reach a user-facing
+            // message. The PostgreSQL driver also backs Redshift/GaussDB/Kwdb/
+            // QuestDB/openGauss, so this is not gated on `DatabaseType::Postgres`.
+            if error.contains(crate::sql_error_position::SQL_ERROR_POSITION_MARKER) {
+                let (message, position) = crate::sql_error_position::take_message_position(&error, sql);
+                return match position {
+                    Some(position) => QueryExecutionError::SqlWithPosition { message, position },
+                    None => QueryExecutionError::Legacy(message),
+                };
+            }
+            QueryExecutionError::Legacy(error)
         })
         .map_err(|error| classify_query_error(pool_db_type, error))
 }
@@ -2775,6 +2869,112 @@ pub async fn execute_sql_statement_with_options_typed(
     cancel_token: Option<CancellationToken>,
     options: QueryExecutionOptions,
 ) -> Result<db::QueryResult, QueryExecutionError> {
+    let db_type = connection_database_type(state, connection_id).await;
+    let invalidate = crate::object_cache::sql_may_change_object_metadata(sql, db_type);
+    let result = execute_sql_statement_with_options_typed_inner(
+        state,
+        connection_id,
+        database,
+        sql,
+        schema,
+        cancel_token,
+        options,
+    )
+    .await;
+    if invalidate {
+        crate::object_cache::invalidate_connection_object_cache(&state.storage, connection_id).await;
+    }
+    result
+}
+
+async fn recover_postgres_create_table_after_connection_error(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: Option<&str>,
+    sql: &str,
+    cancel_token: Option<CancellationToken>,
+    options: &QueryExecutionOptions,
+    db_type: Option<DatabaseType>,
+    initial_error: &QueryExecutionError,
+) -> Option<Result<db::QueryResult, QueryExecutionError>> {
+    if is_canceled(&cancel_token)
+        || !should_verify_postgres_create_table_after_connection_error(db_type, sql, &initial_error.to_string())
+    {
+        return None;
+    }
+
+    let pool_database = query_pool_database(database, options.catalog.as_deref());
+    let new_key = state
+        .reconnect_pool_for_session(connection_id, pool_database, options.client_session_id.as_deref())
+        .await
+        .ok()?;
+    let mysql_dialect = connection_mysql_query_dialect(state, connection_id).await;
+
+    // A compatible PostgreSQL server may close the session after committing a
+    // CREATE TABLE. Retry once on a fresh session: this covers a disconnect
+    // before execution, while a duplicate relation below confirms that the
+    // original request already took effect.
+    let retry_error = match do_execute_typed(
+        state,
+        &new_key,
+        mysql_dialect,
+        Some(database),
+        sql,
+        schema,
+        cancel_token.clone(),
+        options.clone(),
+    )
+    .await
+    {
+        Ok(result) => return Some(Ok(result)),
+        Err(error) => error,
+    };
+    if !is_postgres_duplicate_relation_error(&retry_error.to_string()) {
+        return None;
+    }
+
+    let (qualified_schema, table_name) = postgres_create_table_relation(sql)?;
+    let schema_predicate = qualified_schema
+        .or_else(|| schema.map(str::to_owned))
+        .map(|schema_name| format!("n.nspname = {}", db::postgres::pg_quote_literal(&schema_name)))
+        .unwrap_or_else(|| "n.nspname = current_schema()".to_string());
+    let verify_sql = format!(
+        "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace WHERE {} AND c.relname = {}) AS dbx_create_table_applied",
+        schema_predicate,
+        db::postgres::pg_quote_literal(&table_name),
+    );
+    let verify_options = QueryExecutionOptions {
+        max_rows: Some(1),
+        client_session_id: options.client_session_id.clone(),
+        ..Default::default()
+    };
+    let verified = do_execute_typed(
+        state,
+        &new_key,
+        mysql_dialect,
+        Some(database),
+        &verify_sql,
+        None,
+        cancel_token,
+        verify_options,
+    )
+    .await
+    .ok()
+    .and_then(|result| result.rows.first().and_then(|row| row.first()).and_then(|value| value.as_bool()))
+    .unwrap_or(false);
+    verified.then(|| Ok(empty_query_result(0)))
+}
+
+async fn execute_sql_statement_with_options_typed_inner(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    sql: &str,
+    schema: Option<&str>,
+    cancel_token: Option<CancellationToken>,
+    options: QueryExecutionOptions,
+) -> Result<db::QueryResult, QueryExecutionError> {
     // MongoDB connections use shell-style commands dispatched through the
     // frontend parser. Queries that fall through to the generic SQL executor
     // (e.g. typos) must be rejected before any pool/key creation so that
@@ -2830,6 +3030,23 @@ pub async fn execute_sql_statement_with_options_typed(
     };
 
     let action = result.as_ref().err().map(|error| query_execution_error_action(db_type, sql, error));
+    if let Some(initial_error) = result.as_ref().err() {
+        if let Some(recovered) = recover_postgres_create_table_after_connection_error(
+            state,
+            connection_id,
+            database,
+            schema,
+            sql,
+            cancel_token.clone(),
+            &options,
+            db_type,
+            initial_error,
+        )
+        .await
+        {
+            return with_sql_context(recovered);
+        }
+    }
     match action {
         Some(PoolErrorAction::ReconnectAndRetry) if !is_canceled(&cancel_token) => {
             let pool_database = query_pool_database(database, options.catalog.as_deref());
@@ -3085,6 +3302,35 @@ pub async fn execute_multi_core_with_options_for_client_and_progress(
 
 /// Executes a SQL batch without erasing structured query errors at transport boundaries.
 pub async fn execute_multi_core_with_options_for_client_and_progress_typed(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    sql: &str,
+    schema: Option<&str>,
+    cancel_token: Option<CancellationToken>,
+    options: QueryExecutionOptions,
+    progress: Option<ExecuteMultiProgressCallback>,
+) -> Result<Vec<ExecuteMultiResult>, QueryExecutionError> {
+    let db_type = connection_database_type(state, connection_id).await;
+    let invalidate = crate::object_cache::sql_may_change_object_metadata(sql, db_type);
+    let result = execute_multi_core_with_options_for_client_and_progress_typed_inner(
+        state,
+        connection_id,
+        database,
+        sql,
+        schema,
+        cancel_token,
+        options,
+        progress,
+    )
+    .await;
+    if invalidate {
+        crate::object_cache::invalidate_connection_object_cache(&state.storage, connection_id).await;
+    }
+    result
+}
+
+async fn execute_multi_core_with_options_for_client_and_progress_typed_inner(
     state: &AppState,
     connection_id: &str,
     database: &str,
@@ -3932,6 +4178,23 @@ pub async fn execute_statements(
     schema: Option<&str>,
     timeout_secs: Option<u64>,
 ) -> Result<db::QueryResult, String> {
+    let db_type = connection_database_type(state, connection_id).await;
+    let invalidate = statements.iter().any(|sql| crate::object_cache::sql_may_change_object_metadata(sql, db_type));
+    let result = execute_statements_inner(state, connection_id, database, statements, schema, timeout_secs).await;
+    if invalidate {
+        crate::object_cache::invalidate_connection_object_cache(&state.storage, connection_id).await;
+    }
+    result
+}
+
+async fn execute_statements_inner(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    statements: &[String],
+    schema: Option<&str>,
+    timeout_secs: Option<u64>,
+) -> Result<db::QueryResult, String> {
     let sql_ctx = statements.first().map(|s| s.as_str()).unwrap_or("");
     let pool_key = if database.is_empty() {
         connection_id.to_string()
@@ -4181,6 +4444,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         PoolKind::MessageQueue
         | PoolKind::Nacos
         | PoolKind::Consul(_)
+        | PoolKind::PluginConnection(_)
         | PoolKind::HBase(_)
         | PoolKind::DuckDbWorker(_)
         | PoolKind::Redis(_)
@@ -4193,8 +4457,7 @@ fn pool_kind_has_transactional_path(pool: &PoolKind) -> bool {
         | PoolKind::InfluxDb(_)
         | PoolKind::InfluxDb3(_)
         | PoolKind::VictoriaMetrics(_)
-        | PoolKind::ExternalDriver { .. }
-        | PoolKind::PluginConnection(_) => false,
+        | PoolKind::ExternalDriver { .. } => false,
         #[cfg(feature = "mq-admin")]
         PoolKind::Mqtt(_) => false,
     }
@@ -4575,9 +4838,11 @@ fn batch_transaction_path(pool: &PoolKind) -> BatchTransactionPath {
         PoolKind::Sqlite(pool) => BatchTransactionPath::Sqlite(pool.clone()),
         PoolKind::SqlServer(_) => BatchTransactionPath::Explicit,
         PoolKind::Agent(client) => BatchTransactionPath::Agent(client.clone()),
-        PoolKind::MessageQueue | PoolKind::Nacos | PoolKind::Consul(_) | PoolKind::HBase(_) => {
-            BatchTransactionPath::Unsupported
-        }
+        PoolKind::MessageQueue
+        | PoolKind::Nacos
+        | PoolKind::PluginConnection(_)
+        | PoolKind::Consul(_)
+        | PoolKind::HBase(_) => BatchTransactionPath::Unsupported,
         #[cfg(feature = "mq-admin")]
         PoolKind::Mqtt(_) => BatchTransactionPath::Unsupported,
         PoolKind::DuckDbWorker(_)
@@ -4595,8 +4860,7 @@ fn batch_transaction_path(pool: &PoolKind) -> BatchTransactionPath {
         | PoolKind::InfluxDb(_)
         | PoolKind::InfluxDb3(_)
         | PoolKind::VictoriaMetrics(_)
-        | PoolKind::ExternalDriver { .. }
-        | PoolKind::PluginConnection(_) => BatchTransactionPath::Unsupported,
+        | PoolKind::ExternalDriver { .. } => BatchTransactionPath::Unsupported,
     }
 }
 
@@ -5432,7 +5696,7 @@ pub async fn execute_in_manual_transaction_with_options(
             empty_query_result(0),
             options.table_data_preview,
         );
-        if db_type == Some(DatabaseType::Oracle) {
+        if matches!(db_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle)) {
             result = result.with_manual_transaction_no_statement();
         }
         return Ok(vec![result]);
@@ -5494,11 +5758,12 @@ pub async fn execute_in_manual_transaction_with_options(
     // same non-zero count and every paired user statement is proven read-only;
     // any mismatch is fail-closed (no marker). This is deliberately a
     // trust-boundary count/position pairing, not a SQL-equivalence parser.
-    let classification: Vec<bool> = if db_type == Some(DatabaseType::Oracle) {
+    let classification: Vec<bool> = if let Some(dialect) =
+        db_type.filter(|db_type| matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+    {
         match options.classification_sql.as_deref() {
             Some(classification_sql) => {
-                let user_statements =
-                    crate::sql::split_sql_statements_for_database(classification_sql, DatabaseType::Oracle);
+                let user_statements = crate::sql::split_sql_statements_for_database(classification_sql, dialect);
                 let paired = user_statements.len() == statements.len() && !user_statements.is_empty();
                 if paired {
                     user_statements.iter().map(|statement| is_oracle_proven_read_only_statement(statement)).collect()
@@ -7486,6 +7751,136 @@ for line in sys.stdin:
         }
     }
 
+    #[tokio::test]
+    async fn ddl_schema_cache_invalidates_persisted_object_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new(storage);
+        let connection_id = "schema-cache";
+        let sqlite =
+            db::sqlite::connect_path_create_if_missing(dir.path().join("query.db").to_str().unwrap()).await.unwrap();
+        state
+            .update_connection_pools(|pools| {
+                pools.insert(connection_id.to_string(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
+        state.configs.write().await.insert(connection_id.to_string(), test_connection_config(DatabaseType::Sqlite));
+        let keys = [
+            "object-meta:v1:schema-cache:db:public:users::TABLE:columns:",
+            "object-meta:v1:schema-cache:db:public:users::backend-columns:",
+            "object-ddl:v1:schema-cache:db:public:users::TABLE:",
+        ];
+        for key in keys {
+            state.storage.save_schema_cache(key, &serde_json::json!({"old": true})).await.unwrap();
+        }
+        let unrelated = "object-meta:v1:schema-cache-other:db:public:users::backend-columns:";
+        state.storage.save_schema_cache(unrelated, &serde_json::json!([])).await.unwrap();
+        execute_sql_statement(&state, connection_id, "", "SELECT 1", None, None).await.unwrap();
+        for key in keys {
+            assert!(state.storage.load_schema_cache(key).await.unwrap().is_some());
+        }
+        execute_sql_statement(&state, connection_id, "", "CREATE TABLE users (id INTEGER)", None, None).await.unwrap();
+        for key in keys {
+            assert!(state.storage.load_schema_cache(key).await.unwrap().is_none(), "stale cache: {key}");
+        }
+        assert!(state.storage.load_schema_cache(unrelated).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn ddl_schema_cache_batch_outcomes_and_transaction_completion() {
+        for (sql, use_transaction, expected_error, expected_column) in [
+            ("ALTER TABLE users ADD COLUMN added INTEGER; SELECT 1", false, false, true),
+            ("ALTER TABLE users ADD COLUMN added INTEGER; SELECT * FROM missing_table", false, true, true),
+            ("ALTER TABLE users ADD COLUMN added INTEGER; SELECT 1", true, false, true),
+            ("ALTER TABLE users ADD COLUMN added INTEGER; SELECT * FROM missing_table", true, true, false),
+            ("BEGIN; ALTER TABLE users ADD COLUMN added INTEGER; COMMIT", false, false, true),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Storage::open(&dir.path().join("storage.db")).await.unwrap();
+            let state = AppState::new(storage);
+            let sqlite = db::sqlite::connect_path_create_if_missing(dir.path().join("query.db").to_str().unwrap())
+                .await
+                .unwrap();
+            state
+                .update_connection_pools(|pools| {
+                    pools.insert("cache".into(), PoolKind::Sqlite(sqlite));
+                })
+                .await;
+            state.configs.write().await.insert("cache".into(), test_connection_config(DatabaseType::Sqlite));
+            execute_sql_statement(&state, "cache", "", "CREATE TABLE users (id INTEGER)", None, None).await.unwrap();
+            let key = "object-meta:v1:cache:db:public:users::backend-columns:";
+            state.storage.save_schema_cache(key, &serde_json::json!([])).await.unwrap();
+            let result = execute_multi_core_with_options(
+                &state,
+                "cache",
+                "",
+                sql,
+                None,
+                None,
+                QueryExecutionOptions { use_transaction: Some(use_transaction), ..Default::default() },
+            )
+            .await;
+            let failed = match &result {
+                Err(_) => true,
+                Ok(results) => results.iter().any(|r| r.columns == vec!["Error"]),
+            };
+            assert_eq!(failed, expected_error, "{sql}");
+            assert!(state.storage.load_schema_cache(key).await.unwrap().is_none(), "{sql}");
+            let columns =
+                execute_sql_statement(&state, "cache", "", "PRAGMA table_info(users)", None, None).await.unwrap();
+            assert_eq!(columns.rows.iter().any(|row| row[1] == "added"), expected_column, "{sql}");
+            // A failed DDL still keeps its execution error while clearing cache.
+            state.storage.save_schema_cache(key, &serde_json::json!([])).await.unwrap();
+            let error = execute_sql_statement(
+                &state,
+                "cache",
+                "",
+                "ALTER TABLE missing_table ADD COLUMN x INTEGER",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.contains("missing_table"));
+            assert!(state.storage.load_schema_cache(key).await.unwrap().is_none());
+            for sql in ["BEGIN", "COMMIT", "BEGIN", "ROLLBACK"] {
+                state.storage.save_schema_cache(key, &serde_json::json!([])).await.unwrap();
+                execute_sql_statement(&state, "cache", "", sql, None, None).await.unwrap();
+                assert_eq!(state.storage.load_schema_cache(key).await.unwrap().is_some(), sql == "BEGIN");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ddl_schema_cache_storage_failure_preserves_sql_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage_path = dir.path().join("storage.db");
+        let state = AppState::new(Storage::open(&storage_path).await.unwrap());
+        let sqlite =
+            db::sqlite::connect_path_create_if_missing(dir.path().join("query.db").to_str().unwrap()).await.unwrap();
+        state
+            .update_connection_pools(|pools| {
+                pools.insert("cache".into(), PoolKind::Sqlite(sqlite));
+            })
+            .await;
+        state.configs.write().await.insert("cache".into(), test_connection_config(DatabaseType::Sqlite));
+        let key = "object-meta:v1:cache:db:public:users::backend-columns:";
+        state.storage.save_schema_cache(key, &serde_json::json!([])).await.unwrap();
+        // Fail only deletion; SQL execution and cache reads remain available.
+        let fault = rusqlite::Connection::open(&storage_path).unwrap();
+        fault.execute_batch("CREATE TRIGGER reject_cache_delete BEFORE DELETE ON schema_cache BEGIN SELECT RAISE(FAIL, 'injected cache delete failure'); END;").unwrap();
+        execute_sql_statement(&state, "cache", "", "CREATE TABLE users (id INTEGER)", None, None).await.unwrap();
+        assert!(state.storage.load_schema_cache(key).await.unwrap().is_some());
+        let result = execute_sql_statement(&state, "cache", "", "SELECT id FROM users", None, None).await.unwrap();
+        assert_eq!(result.columns, vec!["id"]);
+        let error =
+            execute_sql_statement(&state, "cache", "", "ALTER TABLE missing_table ADD COLUMN x INTEGER", None, None)
+                .await
+                .unwrap_err();
+        assert!(error.contains("missing_table"));
+        assert!(!error.contains("injected cache delete failure"));
+    }
+
     async fn assert_sqlite_batch_error_behavior(failure_first: bool, continue_on_error: bool) {
         let dir = std::env::temp_dir().join(format!("dbx-query-batch-error-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -8552,6 +8947,46 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn postgres_sql_error_with_position_survives_classification_and_legacy_rendering() {
+        let sql = "SELECT *\nFROM no_such_table";
+        let cursor = sql.find("no_such_table").unwrap() as u32 + 1;
+        let raw = format!(
+            "ERROR: relation \"no_such_table\" does not exist{}",
+            crate::sql_error_position::encode_marker(cursor)
+        );
+        let (message, position) = crate::sql_error_position::take_message_position(&raw, sql);
+        let error = QueryExecutionError::SqlWithPosition { message, position: position.unwrap() };
+
+        // The transport marker must never reach the user-facing message.
+        let legacy = error.clone().into_legacy_string();
+        assert!(!legacy.contains(crate::sql_error_position::SQL_ERROR_POSITION_MARKER));
+        assert_eq!(legacy, "ERROR: relation \"no_such_table\" does not exist");
+
+        // Classification must not downgrade the typed variant.
+        let classified = classify_query_error(Some(DatabaseType::Postgres), error.clone());
+        assert!(matches!(classified, QueryExecutionError::SqlWithPosition { .. }));
+
+        let backend_error = classified.into_backend_error();
+        assert_eq!(backend_error.code(), "DBX-JDBC-4001");
+        let position = backend_error.error_position().expect("position must survive into the envelope");
+        assert_eq!((position.line, position.column), (2, 6));
+    }
+
+    #[test]
+    fn legacy_rendering_strips_a_leftover_transport_marker() {
+        // Guards the driver-error path that never went through the resolve step
+        // (e.g. a PostgreSQL-family driver error shown as a legacy string).
+        let error = QueryExecutionError::Legacy(format!(
+            "ERROR: boom{}{}",
+            crate::sql_error_position::encode_marker(9),
+            crate::sql_error_position::encode_marker(2)
+        ));
+        let rendered = error.into_legacy_string();
+        assert_eq!(rendered, "ERROR: boom");
+        assert!(!rendered.contains(crate::sql_error_position::SQL_ERROR_POSITION_MARKER));
+    }
+
+    #[test]
     fn duckdb_worker_error_preserves_catalog_identity_and_detail() {
         let error = QueryExecutionError::DuckDb {
             code: "duckdb_execute_failed".to_string(),
@@ -8810,7 +9245,7 @@ for line in sys.stdin:
         std::fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')\n  case \"$line\" in\n    *'\"method\":\"executeQueryPage\"'*)\n      echo executeQueryPage >> '{}'\n      case \"$line\" in\n        *'left('*) printf '{{\"id\":%s,\"error\":{{\"message\":\"ERROR: invalid byte sequence for encoding \\\"UTF8\\\": 0xe2\"}}}}\\n' \"$id\" ;;\n        *) printf '{{\"id\":%s,\"result\":{{\"columns\":[\"id\",\"description\",\"__DBX_LARGE_VALUE_BYTES_T_1\"],\"column_types\":[\"integer\",\"text\",\"text\"],\"rows\":[[1,\"abcdef\",\"T:3\"]],\"affected_rows\":0,\"execution_time_ms\":1,\"truncated\":false}}}}\\n' \"$id\" ;;\n      esac\n      ;;\n    *'\"method\":\"executeQuery\"'*)\n      echo executeQuery >> '{}'\n      case \"$line\" in\n        *'left('*) printf '{{\"id\":%s,\"error\":{{\"message\":\"ERROR: invalid byte sequence for encoding \\\"UTF8\\\": 0xe2\"}}}}\\n' \"$id\" ;;\n        *) printf '{{\"id\":%s,\"result\":{{\"columns\":[\"id\",\"description\",\"__DBX_LARGE_VALUE_BYTES_T_1\"],\"column_types\":[\"integer\",\"text\",\"text\"],\"rows\":[[1,\"abcdef\",\"T:3\"]],\"affected_rows\":0,\"execution_time_ms\":1,\"truncated\":false}}}}\\n' \"$id\" ;;\n      esac\n      ;;\n  esac\ndone\n",
+                "#!/bin/sh\nwhile IFS= read -r line; do\n  id=$(printf '%s' \"$line\" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')\n  case \"$line\" in\n    *'\"method\":\"executeQueryPage\"'*)\n      echo executeQueryPage >> '{}'\n      case \"$line\" in\n        *'left('*) printf '{{\"id\":%s,\"error\":{{\"message\":\"ERROR: invalid byte sequence for encoding UTF8: 0xe2\"}}}}\\n' \"$id\" ;;\n        *) printf '{{\"id\":%s,\"result\":{{\"columns\":[\"id\",\"description\",\"__DBX_LARGE_VALUE_BYTES_T_1\"],\"column_types\":[\"integer\",\"text\",\"text\"],\"rows\":[[1,\"abcdef\",\"T:3\"]],\"affected_rows\":0,\"execution_time_ms\":1,\"truncated\":false}}}}\\n' \"$id\" ;;\n      esac\n      ;;\n    *'\"method\":\"executeQuery\"'*)\n      echo executeQuery >> '{}'\n      case \"$line\" in\n        *'left('*) printf '{{\"id\":%s,\"error\":{{\"message\":\"ERROR: invalid byte sequence for encoding UTF8: 0xe2\"}}}}\\n' \"$id\" ;;\n        *) printf '{{\"id\":%s,\"result\":{{\"columns\":[\"id\",\"description\",\"__DBX_LARGE_VALUE_BYTES_T_1\"],\"column_types\":[\"integer\",\"text\",\"text\"],\"rows\":[[1,\"abcdef\",\"T:3\"]],\"affected_rows\":0,\"execution_time_ms\":1,\"truncated\":false}}}}\\n' \"$id\" ;;\n      esac\n      ;;\n  esac\ndone\n",
                 calls.display(),
                 calls.display()
             ),
@@ -9328,6 +9763,63 @@ for line in sys.stdin:
         assert!(is_connection_error("socket closed"));
         assert!(is_connection_error("unexpected eof"));
         assert!(is_connection_error("Error occurred while creating a new object: error communicating with the server"));
+    }
+
+    #[test]
+    fn postgres_create_table_recovery_only_targets_persistent_tables() {
+        assert_eq!(
+            postgres_create_table_relation("CREATE TABLE \"app\".\"events\" (id bigint)"),
+            Some((Some("app".to_string()), "events".to_string()))
+        );
+        assert_eq!(
+            postgres_create_table_relation("-- ddl\nCREATE TABLE events (id bigint)"),
+            Some((None, "events".to_string()))
+        );
+        assert_eq!(postgres_create_table_relation("CREATE TEMP TABLE events (id bigint)"), None);
+        assert_eq!(postgres_create_table_relation("ALTER TABLE events ADD COLUMN note text"), None);
+    }
+
+    #[test]
+    fn postgres_create_table_recovery_folds_unquoted_identifiers() {
+        assert_eq!(
+            postgres_create_table_relation("CREATE TABLE MyTable (id bigint)"),
+            Some((None, "mytable".to_string()))
+        );
+        assert_eq!(
+            postgres_create_table_relation("CREATE TABLE Core.Orders (id bigint)"),
+            Some((Some("core".to_string()), "orders".to_string()))
+        );
+        assert_eq!(
+            postgres_create_table_relation("CREATE TABLE \"Core\".\"Orders\" (id bigint)"),
+            Some((Some("Core".to_string()), "Orders".to_string()))
+        );
+    }
+
+    #[test]
+    fn postgres_create_table_recovery_requires_native_connection_loss() {
+        let sql = "CREATE TABLE events (id bigint)";
+        assert!(should_verify_postgres_create_table_after_connection_error(
+            Some(DatabaseType::Postgres),
+            sql,
+            "connection closed; PostgreSQL schema.reset cleanup failed: connection closed"
+        ));
+        assert!(should_verify_postgres_create_table_after_connection_error(
+            Some(DatabaseType::Gaussdb),
+            sql,
+            "connection reset by peer"
+        ));
+        assert!(!should_verify_postgres_create_table_after_connection_error(
+            Some(DatabaseType::Postgres),
+            sql,
+            "ERROR: permission denied"
+        ));
+        assert!(!should_verify_postgres_create_table_after_connection_error(
+            Some(DatabaseType::Vastbase),
+            sql,
+            "connection closed"
+        ));
+        assert!(is_postgres_duplicate_relation_error("ERROR: relation \"events\" already exists"));
+        assert!(!is_postgres_duplicate_relation_error("ERROR: permission denied for schema public"));
     }
 
     #[test]
@@ -10244,10 +10736,10 @@ for line in sys.stdin:
             messages: Vec::new(),
         };
 
-        let normalized = normalize_query_result_for_js(result);
+        let serialized = serde_json::to_value(result).unwrap();
 
-        assert_eq!(normalized.rows[0][0], serde_json::json!("2041797190226354178"));
-        assert_eq!(normalized.rows[0][1], serde_json::json!([1, "2041797190226354178"]));
+        assert_eq!(serialized["rows"][0][0], serde_json::json!("2041797190226354178"));
+        assert_eq!(serialized["rows"][0][1], serde_json::json!([1, "2041797190226354178"]));
     }
 
     #[test]

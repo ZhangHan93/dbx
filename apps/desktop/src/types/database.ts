@@ -294,9 +294,27 @@ export type PluginFormFieldBinding = "config" | "secret" | "name" | "host" | "po
 
 export type PluginFormFieldValue = string | number | boolean | undefined;
 
+export interface LocalSshKey {
+  /** Absolute path to the private key file. */
+  path: string;
+  /** SSH algorithm name (e.g. `ssh-ed25519`); empty when undetectable. */
+  algorithm: string;
+  /** SHA-256 fingerprint (`SHA256:...`); empty when the key could not be decoded. */
+  fingerprint: string;
+  /** Heuristic: the key looks passphrase-protected. */
+  hasPassphrase: boolean;
+}
+
 export interface PluginFormFieldOption {
   label: string;
   value: string;
+}
+
+export interface PluginFieldCondition {
+  /** Key of another plugin form field whose current value drives the condition. */
+  field: string;
+  /** The condition matches when the referenced field's value is in this list. */
+  one_of: string[];
 }
 
 export interface PluginFormField {
@@ -308,7 +326,12 @@ export interface PluginFormField {
   required?: boolean;
   default?: PluginFormFieldValue;
   options?: PluginFormFieldOption[];
+  /** Plugin method returning `{ options: [{ value, label }] }` for dynamic
+   * select rendering; falls back to the declared type when unavailable. */
+  options_action?: string;
   binding?: PluginFormFieldBinding;
+  visible_when?: PluginFieldCondition;
+  required_when?: PluginFieldCondition;
 }
 
 export type PluginConnectionCapability = "test" | "connect" | "disconnect";
@@ -1085,6 +1108,13 @@ export interface QueryResult {
   /** Absolute offsets in the editor document at execution time. */
   sourceFrom?: number;
   sourceTo?: number;
+  /**
+   * Frontend-internal: the statement text actually sent for this result when it
+   * differs from `sourceStatement` (pagination wrapping, hidden-key rewrites…).
+   * Backend SQL error positions are relative to this text, so it is needed to
+   * map an error row/column back onto the user's original statement.
+   */
+  executedStatement?: string;
   /** Database server messages (notices, warnings) emitted while producing this result. Omitted when empty. */
   messages?: QueryMessage[];
 }
@@ -1691,6 +1721,29 @@ export interface QueryTab {
     name: string;
     objectType: ObjectSourceKind;
     signature?: string;
+  };
+  /**
+   * 「先出 UI 再加载」的中间态：源码 tab 已经可见，但源码还在路上
+   * （ensureConnected + getObjectSource）。让 tab 栏与编辑区在等待期间就有反馈，
+   * 失败时就地显示错误 + Retry，而不是等到加载完才建 tab、失败只弹 toast。
+   *
+   * 纯运行期字段，刻意不进 openTabsPersistence 的落盘白名单：重启后恢复出的
+   * tab 只是普通空 tab，不会永久停在「加载中」。
+   */
+  sourceLoad?: {
+    startedAt: number;
+    /** 加载失败时写入；保留 request 以便就地重试 */
+    error?: string;
+    /**
+     * 重试所需的请求身份。与 `objectSource` 分开保存：objectType 在这里是
+     * **请求时**的类型，而 `objectSource.objectType` 是 routine fallback
+     * 解析后的类型（PROCEDURE↔FUNCTION、PACKAGE↔PACKAGE_BODY 会被改写）。
+     */
+    request: {
+      name: string;
+      objectType: ObjectSourceKind;
+      signature?: string;
+    };
   };
   tableComment?: string | null;
   tableMeta?: {

@@ -6,6 +6,7 @@ pub mod background_image;
 pub mod cloud_sync;
 pub mod config_cmd;
 pub mod connection;
+pub mod odbc_env;
 #[allow(dead_code, unused_imports)]
 mod connection_secrets;
 pub mod consul_cmd;
@@ -36,7 +37,6 @@ pub mod mq_cmd;
 #[cfg(feature = "mq-admin")]
 pub mod mqtt_cmd;
 pub mod nacos_cmd;
-pub mod odbc_env;
 pub mod plugins;
 pub mod prompt_template;
 pub mod query;
@@ -51,6 +51,7 @@ pub mod schema_diff;
 pub mod sql_file;
 pub mod sqlite_backup;
 pub mod ssh_config;
+pub mod ssh_keys;
 pub mod ssh_prompt;
 pub mod support_info;
 pub mod system_fonts;

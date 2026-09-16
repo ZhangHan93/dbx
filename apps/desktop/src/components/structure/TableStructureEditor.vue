@@ -2301,6 +2301,7 @@ async function revalidateCachedStructureMetadata(loadRequestId: number, scope: {
   const revalidationId = ++structureMetadataRevalidationId;
   const metadataRequest = { connectionId, database, schema, tableName, catalog };
   try {
+    await store.ensureConnected(connectionId);
     // Force alone only clears this facet's own key; the web backend keeps its
     // own backend-columns/backend-comment entries under the same table prefix
     // and would serve them to the forced re-fetch. Drop the whole table scope
@@ -3923,10 +3924,18 @@ onMounted(() => {
   void loadTableOwnerRoles();
   void loadMysqlTableEngine(props.draft?.mysqlTableEngine !== undefined);
   if (props.draft?.initialized) {
-    void hydrateRestoredDraftFromDatabase().then(() => {
+    // A clean persisted editor snapshot is not a live schema cache. After an
+    // MCP DDL, restoring its loaded-facet flags would otherwise bypass the
+    // invalidated backend cache entirely. Legacy/dirty drafts remain intact.
+    const revalidateRestoredColumns = props.draft.dirty === false && !isCreateMode.value && loadedMetadataFacets.has("columns") && !(databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl);
+    void hydrateRestoredDraftFromDatabase().then(async () => {
       applyInitialStructureTarget();
       void loadMysqlAutoIncrementCounter(true);
-      void loadActiveTableStructureMetadataIfNeeded();
+      await loadActiveTableStructureMetadataIfNeeded();
+      if (revalidateRestoredColumns) {
+        // The existing revalidation checks again for edits made while loading.
+        void revalidateCachedStructureMetadata(structureLoadRequestId, { columns: true, tableComment: false }, undefined);
+      }
     });
   } else if (isCreateMode.value) {
     markDraftHydratedAndSync();

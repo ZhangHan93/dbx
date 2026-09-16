@@ -744,9 +744,9 @@ async function importOfflineZip() {
   activeAgentOperationId.value = uuid();
   resetAgentInstallProgress();
   try {
-    const count = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
+    const result = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
     await Promise.all([refreshAgents(), loadJdbcDrivers(), loadJdbcPluginStatus()]);
-    toast(t("driverStore.offlineImportSuccess", { count }));
+    toast(t(result.jreCount > 0 ? (result.count > 0 ? "driverStore.offlineImportWithJreSuccess" : "driverStore.offlineJreImportSuccess") : "driverStore.offlineImportSuccess", { count: result.count, jreCount: result.jreCount }));
   } catch (e: any) {
     toast(t("driverStore.offlineImportFailed", { error: backendError(e) }));
   } finally {
@@ -776,9 +776,9 @@ async function importDriverFile(driver: AgentDriverInfo) {
       activeAgentOperationId.value = uuid();
       resetAgentInstallProgress();
       try {
-        const count = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
+        const result = await api.importAgentsFromZip(selected, activeAgentOperationId.value);
         await Promise.all([refreshAgents(), loadJdbcDrivers(), loadJdbcPluginStatus()]);
-        toast(t("driverStore.offlineImportSuccess", { count }));
+        toast(t(result.jreCount > 0 ? (result.count > 0 ? "driverStore.offlineImportWithJreSuccess" : "driverStore.offlineJreImportSuccess") : "driverStore.offlineImportSuccess", { count: result.count, jreCount: result.jreCount }));
       } finally {
         activeAgentOperationId.value = null;
         resetAgentInstallProgress();
@@ -1443,8 +1443,8 @@ watch(driverStoreTab, (tab) => {
     <div class="driver-store-scroll flex-1 min-h-0 overflow-y-auto">
       <div class="driver-store-container max-w-4xl mx-auto px-6 py-6">
         <Tabs v-model="driverStoreTab" default-value="agent" class="driver-store-tabs-root">
-          <div class="driver-store-header flex items-center justify-between">
-            <TabsList class="driver-store-tabs grid w-[360px] grid-cols-3">
+          <div class="driver-store-header flex flex-wrap items-center justify-between gap-2">
+            <TabsList class="driver-store-tabs grid w-full max-w-[380px] grid-cols-3">
               <TabsTrigger value="agent" class="gap-1.5 relative">
                 {{ t("driverStore.agentDrivers") }}
                 <span v-if="agentTabUpdateCount > 0" class="inline-block h-2 w-2 rounded-full bg-red-500" />
@@ -1547,7 +1547,7 @@ watch(driverStoreTab, (tab) => {
             <!-- Driver List -->
             <div class="relative">
               <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input v-model="agentDriverSearch" class="h-8 pl-8 text-xs" :placeholder="t('driverStore.searchDrivers')" />
+              <Input data-driver-store-agent-search v-model="agentDriverSearch" class="h-8 pl-8 text-xs" :placeholder="t('driverStore.searchDrivers')" />
             </div>
             <!-- Global update section — always above category navigation -->
             <div v-if="globalUpdatableDrivers.length > 0" class="rounded-lg border divide-y">
@@ -1972,7 +1972,7 @@ watch(driverStoreTab, (tab) => {
               </div>
               <div class="relative">
                 <Search class="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-                <Input v-model="jdbcDriverSearch" class="h-8 pl-8 text-xs" :placeholder="t('driverStore.searchJdbcDrivers')" />
+                <Input data-driver-store-jdbc-search v-model="jdbcDriverSearch" class="h-8 pl-8 text-xs" :placeholder="t('driverStore.searchJdbcDrivers')" />
               </div>
               <div class="flex items-center gap-2">
                 <Input v-model="jdbcDriverPathInput" class="flex-1" :placeholder="t('settings.jdbcDriverPathPlaceholder')" @keydown.enter.prevent="importJdbcDriverPathInput" />
@@ -2263,7 +2263,7 @@ watch(driverStoreTab, (tab) => {
 
 .driver-store-tabs {
   display: grid !important;
-  width: 360px !important;
+  width: 480px !important;
   grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
 }
 

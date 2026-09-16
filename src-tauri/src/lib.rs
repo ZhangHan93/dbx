@@ -45,6 +45,10 @@ const APP_CLOSE_REQUESTED_EVENT: &str = "dbx-app-close-requested";
 const APP_MENU_QUIT_ID: &str = "app-menu-quit";
 #[cfg(target_os = "macos")]
 const APP_MENU_COPY_SUPPORT_INFO_ID: &str = "app-menu-copy-support-info";
+#[cfg(target_os = "macos")]
+const APP_MENU_CLOSE_TAB_ID: &str = "app-menu-close-tab";
+#[cfg(target_os = "macos")]
+const APP_CLOSE_ACTIVE_TAB_EVENT: &str = "dbx-close-active-tab";
 
 pub struct CloseBehaviorState {
     confirmed_exit: AtomicBool,
@@ -226,6 +230,13 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
         true,
         Some("Cmd+Q"),
     )?;
+    let close_tab_item = MenuItem::with_id(
+        app_handle,
+        APP_MENU_CLOSE_TAB_ID,
+        app_menu_close_tab_label(&current_app_locale(app_handle)),
+        true,
+        Some("Cmd+W"),
+    )?;
 
     Menu::with_items(
         app_handle,
@@ -246,7 +257,7 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
                     &quit_item,
                 ],
             )?,
-            &Submenu::with_items(app_handle, "File", true, &[&PredefinedMenuItem::close_window(app_handle, None)?])?,
+            &Submenu::with_items(app_handle, "File", true, &[&close_tab_item])?,
             &Submenu::with_items(
                 app_handle,
                 "Edit",
@@ -266,12 +277,7 @@ fn build_app_menu<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> tauri:
                 app_handle,
                 "Window",
                 true,
-                &[
-                    &PredefinedMenuItem::minimize(app_handle, None)?,
-                    &PredefinedMenuItem::maximize(app_handle, None)?,
-                    &PredefinedMenuItem::separator(app_handle)?,
-                    &PredefinedMenuItem::close_window(app_handle, None)?,
-                ],
+                &[&PredefinedMenuItem::minimize(app_handle, None)?, &PredefinedMenuItem::maximize(app_handle, None)?],
             )?,
             &Submenu::with_items(app_handle, "Help", true, &[])?,
         ],
@@ -694,6 +700,17 @@ fn open_ai_config_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
     show_main_window(app);
 }
 
+fn open_plugin_install_deep_links(app: &tauri::AppHandle, links: Vec<String>) {
+    if links.is_empty() {
+        return;
+    }
+    if let Some(state) = app.try_state::<commands::deep_link::DeepLinkOpenState>() {
+        state.push_plugin_install_links(links.clone());
+    }
+    let _ = app.emit("dbx-open-plugin-install-links", links);
+    show_main_window(app);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocaleFamily {
     Azerbaijani,
@@ -771,6 +788,22 @@ fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
         LocaleFamily::Turkish => "Destek bilgilerini kopyala",
         LocaleFamily::Portuguese => "Copiar informações",
         LocaleFamily::English => "Copy Support Info",
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn app_menu_close_tab_label(locale: &str) -> &'static str {
+    match locale_family(locale) {
+        LocaleFamily::SimplifiedChinese => "关闭标签页",
+        LocaleFamily::TraditionalChinese => "關閉分頁",
+        LocaleFamily::Japanese => "タブを閉じる",
+        LocaleFamily::Korean => "탭 닫기",
+        LocaleFamily::Azerbaijani => "Vərəqi bağla",
+        LocaleFamily::Spanish => "Cerrar pestaña",
+        LocaleFamily::Italian => "Chiudi scheda",
+        LocaleFamily::Turkish => "Sekmeyi kapat",
+        LocaleFamily::Portuguese => "Fechar aba",
+        LocaleFamily::English => "Close Tab",
     }
 }
 
@@ -967,14 +1000,15 @@ pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        app_menu_copy_support_info_label, app_menu_quit_label, linux_appimage_requires_dmabuf_workaround,
-        linux_drm_driver_is_software_only, linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state,
-        linux_pci_id_from_sysfs_value, linux_selected_drm_render_device, linux_uses_native_wayland,
-        linux_webkit_environment_override, linux_webkit_rendering_workarounds, native_window_decorations_override,
-        should_confirm_app_exit_request, should_enable_single_instance, should_fallback_to_native_quit,
-        should_hide_window_before_exit, should_hide_window_on_close, should_setup_desktop_tray,
-        should_show_main_window_after_setup, should_show_main_window_before_setup_tasks, startup_data_dir_mode,
-        tray_menu_labels_for_locale, uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
+        app_menu_close_tab_label, app_menu_copy_support_info_label, app_menu_quit_label,
+        linux_appimage_requires_dmabuf_workaround, linux_drm_driver_is_software_only,
+        linux_drm_render_devices_from_paths, linux_nvidia_driver_from_state, linux_pci_id_from_sysfs_value,
+        linux_selected_drm_render_device, linux_uses_native_wayland, linux_webkit_environment_override,
+        linux_webkit_rendering_workarounds, native_window_decorations_override, should_confirm_app_exit_request,
+        should_enable_single_instance, should_fallback_to_native_quit, should_hide_window_before_exit,
+        should_hide_window_on_close, should_setup_desktop_tray, should_show_main_window_after_setup,
+        should_show_main_window_before_setup_tasks, startup_data_dir_mode, tray_menu_labels_for_locale,
+        uses_application_level_icon, LinuxDrmRenderDevice, LinuxNvidiaDriver,
     };
     use crate::data_dir::DataDirMode;
     use std::ffi::OsStr;
@@ -1018,6 +1052,10 @@ mod tests {
         assert_eq!(app_menu_copy_support_info_label("tr-TR"), "Destek bilgilerini kopyala");
         assert_eq!(app_menu_copy_support_info_label("az-AZ"), "Dəstək məlumatlarını kopyala");
         assert_eq!(app_menu_copy_support_info_label("en-US"), "Copy Support Info");
+        assert_eq!(app_menu_close_tab_label("zh-CN"), "关闭标签页");
+        assert_eq!(app_menu_close_tab_label("zh-TW"), "關閉分頁");
+        assert_eq!(app_menu_close_tab_label("ja-JP"), "タブを閉じる");
+        assert_eq!(app_menu_close_tab_label("en-US"), "Close Tab");
     }
 
     #[test]
@@ -1419,6 +1457,8 @@ pub fn run() {
             open_connection_deep_links(app, links);
             let ai_config_links = commands::deep_link::ai_config_deep_links_from_args(args.clone());
             open_ai_config_deep_links(app, ai_config_links);
+            let plugin_install_links = commands::deep_link::plugin_install_deep_links_from_args(args.clone());
+            open_plugin_install_deep_links(app, plugin_install_links);
 
             let paths = commands::external_sql::sql_file_paths_from_args(args.clone(), std::path::Path::new(&cwd));
             if !paths.is_empty() {
@@ -1471,6 +1511,8 @@ pub fn run() {
             if let Err(err) = app.clipboard().write_text(commands::support_info::format_support_info_for_clipboard()) {
                 log::warn!("Failed to copy support info from app menu: {err}");
             }
+        } else if event.id() == APP_MENU_CLOSE_TAB_ID {
+            let _ = app.emit(APP_CLOSE_ACTIVE_TAB_EVENT, ());
         }
     });
 
@@ -1631,6 +1673,8 @@ pub fn run() {
             open_connection_deep_links(app.handle(), startup_links);
             let startup_ai_config_links = commands::deep_link::ai_config_deep_links_from_args(&startup_args);
             open_ai_config_deep_links(app.handle(), startup_ai_config_links);
+            let startup_plugin_install_links = commands::deep_link::plugin_install_deep_links_from_args(&startup_args);
+            open_plugin_install_deep_links(app.handle(), startup_plugin_install_links);
 
             let app_handle = app.handle().clone();
             commands::mcp_bridge::start(app_handle, state, data_dir);
@@ -1811,6 +1855,7 @@ pub fn run() {
             commands::connection::load_connections,
             commands::connection::save_sidebar_layout,
             commands::connection::load_sidebar_layout,
+            commands::odbc_env::list_odbc_dsns,
             commands::plugins::list_plugins,
             commands::plugins::list_plugin_trusted_keys,
             commands::plugins::save_plugin_trusted_key,
@@ -1821,6 +1866,7 @@ pub fn run() {
             commands::plugins::fetch_plugin_marketplace_catalogs,
             commands::plugins::install_marketplace_plugin,
             commands::plugins::install_plugin_package,
+            commands::plugins::install_plugin_package_from_url,
             commands::plugins::rollback_plugin,
             commands::plugins::uninstall_plugin,
             commands::plugins::activate_plugin,
@@ -2006,6 +2052,7 @@ pub fn run() {
             commands::keychain::read_keychain_passwords,
             commands::deep_link::pending_open_connection_links,
             commands::deep_link::pending_open_ai_config_links,
+            commands::deep_link::pending_open_plugin_install_links,
             commands::table_import::preview_table_import_file,
             commands::table_import::import_table_file,
             commands::table_import::cancel_table_import,
@@ -2289,6 +2336,7 @@ pub fn run() {
             commands::document_cmd::document_update_document,
             commands::mongo_cmd::mongo_update_document,
             commands::mongo_cmd::mongo_update_documents,
+            commands::mongo_cmd::mongo_replace_document,
             commands::document_cmd::document_delete_document,
             commands::document_cmd::document_save_meilisearch_batch,
             commands::document_cmd::meilisearch_search_documents,
@@ -2552,8 +2600,8 @@ pub fn run() {
             commands::agents::import_agent_driver_cmd,
             commands::agents::import_agent_jar_cmd,
             commands::system_fonts::list_system_fonts,
-            commands::odbc_env::list_odbc_dsns,
             commands::ssh_config::list_ssh_config_hosts,
+            commands::ssh_keys::list_local_ssh_keys,
             commands::ssh_prompt::ssh_prompt_ready,
             commands::ssh_prompt::ssh_prompt_not_ready,
             commands::ssh_prompt::resolve_ssh_prompt,
@@ -2623,6 +2671,13 @@ pub fn run() {
                     .filter_map(|url| commands::deep_link::ai_config_deep_link_from_arg(&url))
                     .collect();
                 open_ai_config_deep_links(app_handle, ai_config_links);
+
+                let plugin_install_links: Vec<String> = urls
+                    .iter()
+                    .map(|url| url.to_string())
+                    .filter_map(|url| commands::deep_link::plugin_install_deep_link_from_arg(&url))
+                    .collect();
+                open_plugin_install_deep_links(app_handle, plugin_install_links);
 
                 let paths: Vec<String> = urls
                     .iter()
