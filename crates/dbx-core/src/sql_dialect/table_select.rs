@@ -1077,10 +1077,14 @@ mod tests {
         // SELECT the agent pages through its cursor — never a MySQL/Postgres `LIMIT`
         // that SQL Server's ODBC driver rejects with "syntax error near '100'".
         // `Odbc32` is the same driver reached through a 32-bit DSN and must match.
+        //
+        // Expected text taken from the live binary (CDP probe against a real SQL Server
+        // DSN), not derived by hand: `Odbc` is absent from `quote_table_identifier`'s
+        // match arms, so it falls to the `_` arm and the table name **is** double-quoted.
         for database_type in [DatabaseType::Odbc, DatabaseType::Odbc32] {
             let sql = build_table_data_select_sql(opts(database_type, None, None, "register"));
             assert!(!sql.to_uppercase().contains("LIMIT"), "{database_type:?} sql must not contain LIMIT: {sql}");
-            assert_eq!(sql, "SELECT * FROM register;", "{database_type:?} sql changed shape");
+            assert_eq!(sql, "SELECT * FROM \"register\";", "{database_type:?} sql changed shape");
         }
     }
 }
