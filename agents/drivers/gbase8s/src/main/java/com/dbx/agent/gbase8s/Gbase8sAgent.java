@@ -15,6 +15,7 @@ import com.dbx.agent.TableInfo;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -26,9 +27,29 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class Gbase8sAgent extends ConfiguredJdbcAgent {
     private static final long METADATA_CACHE_TTL_MILLIS = 10_000L;
+
+    // Whitelist for a JDBC locale value (language_territory.codeset). The value is concatenated
+    // into the connection URL, so reject anything outside ordinary identifier characters to guard
+    // against a malformed or hostile server-reported collation.
+    private static final Pattern SAFE_DATABASE_LOCALE = Pattern.compile("[A-Za-z0-9_.\\-]{1,64}");
+    // Upper bound on the sysmaster locale-probe connection so a hung probe cannot stall connect.
+    private static final int LOCALE_PROBE_LOGIN_TIMEOUT_SECS = 10;
+
+    /**
+     * Leading directive comment emitted by the Rust admin-SQL layer for GBase 8s / Informix
+     * "Create Database" when the user picks a character set, e.g.
+     * {@code -- DBX_DB_LOCALE=zh_CN.utf8\nCREATE DATABASE mydb;}. Informix cannot express a new
+     * database's codeset in {@code CREATE DATABASE} — it inherits the creating session's DB_LOCALE —
+     * so the chosen locale is carried out-of-band and honored here by opening a sysmaster session
+     * pinned to that DB_LOCALE.
+     */
+    private static final Pattern CREATE_DATABASE_LOCALE_DIRECTIVE = Pattern.compile(
+        "^\\s*--\\s*DBX_DB_LOCALE\\s*=\\s*(\\S+)\\s*\\r?\\n(.*)$", Pattern.DOTALL);
 
     public static final JdbcAgentProfile GBASE8S_PROFILE = new JdbcAgentProfile(
         "com.gbasedbt.jdbc.Driver",
@@ -167,7 +188,7 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
             return cached;
         }
         String collate = "";
-        try (Connection connection = super.openConnection(paramsForDatabase(params, "sysmaster"));
+        try (Connection connection = super.openConnection(withProbeLoginTimeout(paramsForDatabase(params, "sysmaster")));
              PreparedStatement stmt = connection.prepareStatement(
                  "SELECT dbs_collate FROM sysmaster:sysdbslocale WHERE LOWER(dbs_dbsname) = ?")) {
             stmt.setString(1, database.toLowerCase(Locale.ROOT));
@@ -179,8 +200,42 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
         } catch (Exception ignored) {
             // Keep the configured locale when the collation catalog is unreachable.
         }
-        collateByDatabase.put(key, collate);
+        // Only cache a successful lookup. Caching an empty result would pin a transient failure —
+        // or a database that was just created and is not yet listed in sysdbslocale — to the stale
+        // fallback until disconnect, so leave failures uncached to retry on the next connect.
+        if (!collate.isEmpty()) {
+            collateByDatabase.put(key, collate);
+        }
         return collate;
+    }
+
+    /**
+     * Return a copy of {@code params} with a bounded {@code LOGIN_TIMEOUT} appended to its JDBC
+     * parameters (unless one is already configured), so the sysmaster locale probe can never hang
+     * the connect path.
+     */
+    private static ConnectParams withProbeLoginTimeout(ConnectParams params) {
+        String urlParams = params.getUrl_params() == null ? "" : params.getUrl_params();
+        if (containsIgnoreCase(urlParams, "LOGIN_TIMEOUT=")) {
+            return params;
+        }
+        String joined = urlParams.isEmpty()
+            ? "LOGIN_TIMEOUT=" + LOCALE_PROBE_LOGIN_TIMEOUT_SECS
+            : urlParams + ";LOGIN_TIMEOUT=" + LOCALE_PROBE_LOGIN_TIMEOUT_SECS;
+        ConnectParams copy = new ConnectParams(
+            params.getHost(),
+            params.getPort(),
+            params.getDatabase(),
+            params.getUsername(),
+            params.getPassword(),
+            joined,
+            params.getConnection_string(),
+            params.isMysql_compat_mode(),
+            params.getJdbc_driver_class(),
+            params.getJdbc_driver_paths()
+        );
+        copy.setGbase_server(params.getGbase_server());
+        return copy;
     }
 
     private static String currentLocaleOf(ConnectParams params) {
@@ -212,11 +267,82 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
 
     @Override
     public QueryResult executeQuery(String sql, String schema, ExecuteQueryOptions options) {
+        CreateDatabaseLocaleDirective directive = parseCreateDatabaseLocaleDirective(sql);
+        if (directive != null) {
+            runCreateDatabaseWithLocale(directive.statement(), directive.locale());
+            clearMetadataCache();
+            return new QueryResult(Collections.emptyList(), Collections.emptyList(), 0, 0);
+        }
         QueryResult result = super.executeQuery(sql, schema, options);
         if (mayChangeMetadata(sql)) {
             clearMetadataCache();
         }
         return result;
+    }
+
+    /**
+     * A {@code CREATE DATABASE} statement plus the DB_LOCALE carried by its leading directive
+     * comment. Package visible so the routing decision is directly testable without a live
+     * connection.
+     */
+    record CreateDatabaseLocaleDirective(String locale, String statement) {
+    }
+
+    /**
+     * Parse {@code sql} as a directive-prefixed {@code CREATE DATABASE} (as emitted by the Rust
+     * admin-SQL layer), returning {@code null} for anything else so it falls through to the
+     * normal query path.
+     */
+    static CreateDatabaseLocaleDirective parseCreateDatabaseLocaleDirective(String sql) {
+        Matcher directive = sql == null ? null : CREATE_DATABASE_LOCALE_DIRECTIVE.matcher(sql);
+        if (directive == null || !directive.matches()) {
+            return null;
+        }
+        String statement = directive.group(2).trim();
+        if (!statement.regionMatches(true, 0, "CREATE DATABASE", 0, "CREATE DATABASE".length())) {
+            return null;
+        }
+        return new CreateDatabaseLocaleDirective(directive.group(1).trim(), statement);
+    }
+
+    /**
+     * Run a {@code CREATE DATABASE} statement on a sysmaster session whose {@code DB_LOCALE} is
+     * pinned to {@code locale}, so the freshly created database inherits that codeset (Informix has
+     * no charset clause in {@code CREATE DATABASE}). Falls back to the configured locale when
+     * {@code locale} is blank or unsafe.
+     */
+    private void runCreateDatabaseWithLocale(String statement, String locale) {
+        ConnectParams base = databaseListParams;
+        if (base == null) {
+            throw new IllegalStateException("Not connected");
+        }
+        ConnectParams pinned = base;
+        if (locale != null && SAFE_DATABASE_LOCALE.matcher(locale).matches()) {
+            pinned = new ConnectParams(
+                base.getHost(),
+                base.getPort(),
+                base.getDatabase(),
+                base.getUsername(),
+                base.getPassword(),
+                overrideLocaleParams(base.getUrl_params(), locale),
+                base.getConnection_string(),
+                base.isMysql_compat_mode(),
+                base.getJdbc_driver_class(),
+                base.getJdbc_driver_paths()
+            );
+            pinned.setGbase_server(base.getGbase_server());
+        }
+        try (Connection connection = super.openConnection(pinned);
+             Statement stmt = connection.createStatement()) {
+            stmt.execute(stripTrailingSemicolon(statement));
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static String stripTrailingSemicolon(String sql) {
+        String trimmed = sql.trim();
+        return trimmed.endsWith(";") ? trimmed.substring(0, trimmed.length() - 1).trim() : trimmed;
     }
 
     @Override
@@ -553,6 +679,11 @@ public final class Gbase8sAgent extends ConfiguredJdbcAgent {
             return jdbcParams;
         }
         String value = collate.trim();
+        // The value is concatenated into the JDBC URL; only accept an ordinary locale token so a
+        // malformed or hostile server-reported collation cannot inject extra parameters.
+        if (!SAFE_DATABASE_LOCALE.matcher(value).matches()) {
+            return jdbcParams;
+        }
         List<String> segments = new ArrayList<>();
         if (jdbcParams != null && !jdbcParams.isEmpty()) {
             for (String segment : jdbcParams.split(";")) {

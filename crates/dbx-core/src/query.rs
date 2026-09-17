@@ -25,7 +25,7 @@ use crate::db::agent_driver::{AgentCallError, AgentErrorStage, AgentOperationOut
 use crate::models::connection::{ConnectionConfig, DatabaseType};
 use crate::query_execution_sql::{is_oracle_proven_read_only_statement, is_write_sql, strip_sql_comments_and_literals};
 use crate::sql::{split_sql_batches, split_sql_statements, starts_with_executable_sql_keyword_for_database};
-use crate::sql_dialect::{resolve_for_db, CAP_TRANSACTIONAL_DDL};
+use crate::sql_dialect::{quote_iris_identifier, resolve_for_db, CAP_TRANSACTIONAL_DDL};
 use crate::sql_risk::{classify_sql_risk_for_database, SqlRisk};
 
 pub const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -232,14 +232,15 @@ pub struct ExecuteMultiResult {
     pub error: Option<crate::backend_error::BackendError>,
     #[serde(skip_serializing_if = "is_false")]
     pub server_message: bool,
-    /// Oracle-only manual-transaction UX metadata: true only for a statement
-    /// proven to be an ordinary top-level read. Absent/false for every other
-    /// Oracle statement and every non-Oracle execution. Not part of the
-    /// reusable database-result model (`db::QueryResult`).
+    /// Manual-transaction UX metadata for sticky proven-read-only dialects
+    /// (Oracle, OceanBase-Oracle, MySQL, PostgreSQL): true only for a statement
+    /// proven to be an ordinary read by that dialect's strict heuristic.
+    /// Absent/false for unproven statements and non-participating dialects.
+    /// Not part of the reusable database-result model (`db::QueryResult`).
     #[serde(skip_serializing_if = "is_false")]
     pub manual_transaction_proven_read_only: bool,
-    /// Oracle-only manual-transaction UX metadata: true on the synthetic
-    /// successful result when the manual-execution splitter found zero
+    /// Manual-transaction UX metadata for the same dialects: true on the
+    /// synthetic successful result when the manual-execution splitter found zero
     /// statements (empty/whitespace/comments-only script). Lets the frontend
     /// treat it as a no-op rather than an unproven statement.
     #[serde(skip_serializing_if = "is_false")]
@@ -906,7 +907,9 @@ fn sql_for_execution_context_with_identifier_quote(
         return sql.to_string();
     };
     match db_type {
-        Some(DatabaseType::Iris) => qualify_iris_unqualified_dml(sql, schema).unwrap_or_else(|| sql.to_string()),
+        Some(DatabaseType::Iris) => {
+            qualify_iris_unqualified_dml(sql, schema, identifier_quote).unwrap_or_else(|| sql.to_string())
+        }
         Some(DatabaseType::SqlServer) => {
             qualify_sqlserver_unqualified_dml(sql, schema).unwrap_or_else(|| sql.to_string())
         }
@@ -917,13 +920,18 @@ fn sql_for_execution_context_with_identifier_quote(
     }
 }
 
-fn qualify_iris_unqualified_dml(sql: &str, schema: &str) -> Option<String> {
+fn qualify_iris_unqualified_dml(sql: &str, schema: &str, identifier_quote: Option<&str>) -> Option<String> {
     let dialect = GenericDialect {};
     let mut statements = Parser::parse_sql(&dialect, sql).ok()?;
     if statements.is_empty() {
         return None;
     }
 
+    // Caché/IRIS installations may run with delimited identifiers disabled. The
+    // JDBC preparser then turns a double-quoted name into a `:%qpar` parameter,
+    // and the statement fails at prepare with "IDENTIFIER expected". Ordinary
+    // schema names are case-insensitive there, so they must stay unquoted.
+    let schema_identifier = Ident::new(quote_iris_identifier(schema, identifier_quote));
     let mut changed = false;
     for statement in &mut statements {
         if !statement_uses_schema_context(statement) {
@@ -932,7 +940,7 @@ fn qualify_iris_unqualified_dml(sql: &str, schema: &str) -> Option<String> {
         let cte_names = statement_cte_names(statement);
         let table_aliases = statement_table_aliases(statement);
         let _ = visit_relations_mut(statement, |name| {
-            if qualify_unqualified_relation_name(name, schema, &cte_names, &table_aliases) {
+            if qualify_unqualified_relation_name(name, &schema_identifier, &cte_names, &table_aliases) {
                 changed = true;
             }
             ControlFlow::<()>::Continue(())
@@ -957,8 +965,7 @@ fn qualify_sqlserver_unqualified_dml(sql: &str, schema: &str) -> Option<String> 
         let cte_names = statement_cte_names(statement);
         let table_aliases = statement_table_aliases(statement);
         let mut qualifier = SchemaRelationQualifier {
-            schema,
-            identifier_quote: '[',
+            schema_identifier: Ident::with_quote('[', schema),
             cte_names: &cte_names,
             table_aliases: &table_aliases,
             parameterized_table_depth: 0,
@@ -986,8 +993,7 @@ fn qualify_kingbase_unqualified_relations(sql: &str, schema: &str, identifier_qu
         let cte_names = statement_cte_names(statement);
         let table_aliases = statement_table_aliases(statement);
         let mut qualifier = SchemaRelationQualifier {
-            schema,
-            identifier_quote: identifier_quote_char(identifier_quote),
+            schema_identifier: Ident::with_quote(identifier_quote_char(identifier_quote), schema),
             cte_names: &cte_names,
             table_aliases: &table_aliases,
             parameterized_table_depth: 0,
@@ -1001,8 +1007,7 @@ fn qualify_kingbase_unqualified_relations(sql: &str, schema: &str, identifier_qu
 }
 
 struct SchemaRelationQualifier<'a> {
-    schema: &'a str,
-    identifier_quote: char,
+    schema_identifier: Ident,
     cte_names: &'a HashSet<String>,
     table_aliases: &'a HashSet<String>,
     parameterized_table_depth: usize,
@@ -1028,13 +1033,7 @@ impl VisitorMut for SchemaRelationQualifier<'_> {
 
     fn post_visit_relation(&mut self, relation: &mut ObjectName) -> ControlFlow<Self::Break> {
         if self.parameterized_table_depth == 0
-            && qualify_unqualified_relation_name_with_quote(
-                relation,
-                self.schema,
-                self.cte_names,
-                self.table_aliases,
-                self.identifier_quote,
-            )
+            && qualify_unqualified_relation_name(relation, &self.schema_identifier, self.cte_names, self.table_aliases)
         {
             self.changed = true;
         }
@@ -1053,21 +1052,14 @@ fn statement_uses_schema_context(statement: &Statement) -> bool {
     )
 }
 
+/// Qualify a single-part relation with `schema_identifier`, which is already
+/// rendered in the dialect's own spelling (quoted where the dialect needs it,
+/// unquoted where quoting would break parsing).
 fn qualify_unqualified_relation_name(
     name: &mut ObjectName,
-    schema: &str,
+    schema_identifier: &Ident,
     cte_names: &HashSet<String>,
     table_aliases: &HashSet<String>,
-) -> bool {
-    qualify_unqualified_relation_name_with_quote(name, schema, cte_names, table_aliases, '"')
-}
-
-fn qualify_unqualified_relation_name_with_quote(
-    name: &mut ObjectName,
-    schema: &str,
-    cte_names: &HashSet<String>,
-    table_aliases: &HashSet<String>,
-    identifier_quote: char,
 ) -> bool {
     let [ObjectNamePart::Identifier(table)] = name.0.as_slice() else {
         return false;
@@ -1081,10 +1073,7 @@ fn qualify_unqualified_relation_name_with_quote(
     }
 
     let table = table.clone();
-    name.0 = vec![
-        ObjectNamePart::Identifier(Ident::with_quote(identifier_quote, schema)),
-        ObjectNamePart::Identifier(table),
-    ];
+    name.0 = vec![ObjectNamePart::Identifier(schema_identifier.clone()), ObjectNamePart::Identifier(table)];
     true
 }
 
@@ -2072,6 +2061,7 @@ async fn do_execute_typed(
             let cancel_context = state.get_postgres_cancel_context(pool_key).await;
             let result = execute_postgres_pool_statement(
                 &p,
+                pool_db_type,
                 schema.as_deref(),
                 sql,
                 max_rows,
@@ -2091,6 +2081,7 @@ async fn do_execute_typed(
                     );
                     execute_postgres_pool_statement(
                         &p,
+                        pool_db_type,
                         schema.as_deref(),
                         &fallback_sql,
                         max_rows,
@@ -2573,6 +2564,7 @@ fn postgres_preview_fallback_retry_sql(options: &QueryExecutionOptions, error: &
 #[allow(clippy::too_many_arguments)]
 async fn execute_postgres_pool_statement(
     pool: &deadpool_postgres::Pool,
+    db_type: Option<DatabaseType>,
     schema: Option<&str>,
     sql: &str,
     max_rows: Option<usize>,
@@ -2596,6 +2588,7 @@ async fn execute_postgres_pool_statement(
     } else if let Some(schema) = schema {
         db::postgres::execute_query_with_schema_and_max_rows_and_cancel(
             pool,
+            db_type,
             schema,
             sql,
             max_rows,
@@ -4746,7 +4739,7 @@ pub async fn execute_statements_in_transaction_on_pool_typed(
     let result = match path {
         Some(BatchTransactionPath::Pg(pool)) => {
             let cancel_context = state.get_postgres_cancel_context(pool_key).await;
-            exec_tx_pg_inner(pool, statements, schema, start, operation_budget.clone(), cancel_context).await
+            exec_tx_pg_inner(pool, db_type, statements, schema, start, operation_budget.clone(), cancel_context).await
         }
         Some(BatchTransactionPath::Mysql(pool)) => exec_tx_mysql_inner(
             state,
@@ -4869,6 +4862,7 @@ fn batch_transaction_path(pool: &PoolKind) -> BatchTransactionPath {
 
 async fn exec_tx_pg_inner(
     pool: deadpool_postgres::Pool,
+    db_type: Option<DatabaseType>,
     statements: &[String],
     schema: Option<&str>,
     start: std::time::Instant,
@@ -4891,11 +4885,11 @@ async fn exec_tx_pg_inner(
     }
     let tx_result = exec_tx_pg_statements(&mut client, statements, &budget, cancel_context).await;
 
-    // Always reset search_path so the connection is clean when returned to the pool
+    // GaussDB/openGauss reject PostgreSQL's RESET search_path syntax.
     let reset_result = if had_schema {
         db::postgres::execute_postgres_infra_statement(
             &client,
-            "RESET search_path",
+            db::postgres::reset_search_path_sql(db_type),
             budget.cleanup_timeout,
             "schema.reset",
         )
@@ -5378,6 +5372,45 @@ fn mysql_error_is_syntax_error(error: &mysql_async::Error) -> bool {
     }
 }
 
+/// Compute per-execution-statement proven-read-only markers for the sticky
+/// manual-transaction UX (#7122 Oracle, #9018 MySQL/PostgreSQL). The user-facing
+/// classification SQL is split with the same dialect-aware splitter as the
+/// execution SQL and paired by count/position; any mismatch is fail-closed (no
+/// markers). Oracle/OceanBase-Oracle keep the lexical classifier, MySQL and
+/// PostgreSQL use the strict `sql_risk` proof; every other dialect is unproven.
+fn classify_manual_transaction_statements(
+    database_type: Option<DatabaseType>,
+    execution_statement_count: usize,
+    classification_sql: Option<&str>,
+) -> Vec<bool> {
+    let Some(database_type) = database_type.filter(|database_type| {
+        matches!(
+            database_type,
+            DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Mysql | DatabaseType::Postgres
+        )
+    }) else {
+        return Vec::new();
+    };
+    let Some(classification_sql) = classification_sql else {
+        return Vec::new();
+    };
+    let user_statements = crate::sql::split_sql_statements_for_database(classification_sql, database_type);
+    let paired = user_statements.len() == execution_statement_count && !user_statements.is_empty();
+    if !paired {
+        return Vec::new();
+    }
+    user_statements
+        .iter()
+        .map(|statement| match database_type {
+            DatabaseType::Mysql | DatabaseType::Postgres => {
+                crate::sql_risk::prove_read_only_for_database(statement, database_type)
+                    == crate::sql_risk::ReadProof::ProvenReadOnly
+            }
+            _ => is_oracle_proven_read_only_statement(statement),
+        })
+        .collect()
+}
+
 async fn begin_transaction_session(
     state: &AppState,
     connection_id: &str,
@@ -5688,7 +5721,7 @@ pub async fn execute_in_manual_transaction_with_options(
         },
     );
     if statements.is_empty() {
-        // Oracle-only UX marker: the no-op is Core's decision that the script
+        // Sticky-dialect UX marker: the no-op is Core's decision that the script
         // (empty/whitespace/comments-only) has no statements, so the frontend
         // must not treat it as an unproven statement. Every other database
         // receives the plain empty result.
@@ -5696,7 +5729,10 @@ pub async fn execute_in_manual_transaction_with_options(
             empty_query_result(0),
             options.table_data_preview,
         );
-        if matches!(db_type, Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle)) {
+        if matches!(
+            db_type,
+            Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Mysql | DatabaseType::Postgres)
+        ) {
             result = result.with_manual_transaction_no_statement();
         }
         return Ok(vec![result]);
@@ -5752,30 +5788,14 @@ pub async fn execute_in_manual_transaction_with_options(
     let row_limit = options.max_rows.unwrap_or(MAX_ROWS).max(1);
     let mut results = Vec::with_capacity(statements.len());
 
-    // Oracle-only classification pairing. The core splits both the execution
+    // Sticky-dialect classification pairing. The core splits both the execution
     // SQL and, when present, the user-facing classification SQL with the same
-    // Oracle-aware splitter. A marker is emitted only when both lists have the
+    // dialect-aware splitter. A marker is emitted only when both lists have the
     // same non-zero count and every paired user statement is proven read-only;
     // any mismatch is fail-closed (no marker). This is deliberately a
     // trust-boundary count/position pairing, not a SQL-equivalence parser.
-    let classification: Vec<bool> = if let Some(dialect) =
-        db_type.filter(|db_type| matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
-    {
-        match options.classification_sql.as_deref() {
-            Some(classification_sql) => {
-                let user_statements = crate::sql::split_sql_statements_for_database(classification_sql, dialect);
-                let paired = user_statements.len() == statements.len() && !user_statements.is_empty();
-                if paired {
-                    user_statements.iter().map(|statement| is_oracle_proven_read_only_statement(statement)).collect()
-                } else {
-                    Vec::new()
-                }
-            }
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
+    let classification: Vec<bool> =
+        classify_manual_transaction_statements(db_type, statements.len(), options.classification_sql.as_deref());
 
     let mut conn = connection.lock().await;
     for (i, statement) in statements.iter().enumerate() {
@@ -10169,15 +10189,15 @@ for line in sys.stdin:
     fn iris_execution_context_qualifies_unqualified_dml_tables() {
         assert_eq!(
             sql_for_execution_context(Some(DatabaseType::Iris), "SELECT * FROM TABLES", Some("INFORMATION_SCHEMA")),
-            "SELECT * FROM \"INFORMATION_SCHEMA\".TABLES"
+            "SELECT * FROM INFORMATION_SCHEMA.TABLES"
         );
         let qualified_join = sql_for_execution_context(
             Some(DatabaseType::Iris),
             "SELECT * FROM orders o JOIN customers c ON c.id = o.customer_id",
             Some("Sales"),
         );
-        assert!(qualified_join.contains("FROM \"Sales\".orders"));
-        assert!(qualified_join.contains("JOIN \"Sales\".customers"));
+        assert!(qualified_join.contains("FROM Sales.orders"));
+        assert!(qualified_join.contains("JOIN Sales.customers"));
         assert!(qualified_join.contains("c.id = o.customer_id"));
         assert_eq!(
             sql_for_execution_context(Some(DatabaseType::Iris), "SELECT * FROM INFORMATION_SCHEMA.TABLES", Some("APP")),
@@ -10193,7 +10213,7 @@ for line in sys.stdin:
                 "WITH recent AS (SELECT * FROM events) SELECT * FROM recent WHERE EXISTS (SELECT 1 FROM audits)",
                 Some("APP")
             ),
-            "WITH recent AS (SELECT * FROM \"APP\".events) SELECT * FROM recent WHERE EXISTS (SELECT 1 FROM \"APP\".audits)"
+            "WITH recent AS (SELECT * FROM APP.events) SELECT * FROM recent WHERE EXISTS (SELECT 1 FROM APP.audits)"
         );
         assert_eq!(
             sql_for_execution_context(
@@ -10201,7 +10221,7 @@ for line in sys.stdin:
                 "INSERT INTO events SELECT * FROM staging_events",
                 Some("APP")
             ),
-            "INSERT INTO \"APP\".events SELECT * FROM \"APP\".staging_events"
+            "INSERT INTO APP.events SELECT * FROM APP.staging_events"
         );
         assert_eq!(
             sql_for_execution_context(
@@ -10209,8 +10229,32 @@ for line in sys.stdin:
                 "UPDATE events SET status = 'done' WHERE id IN (SELECT event_id FROM audit_events)",
                 Some("APP")
             ),
-            "UPDATE \"APP\".events SET status = 'done' WHERE id IN (SELECT event_id FROM \"APP\".audit_events)"
+            "UPDATE APP.events SET status = 'done' WHERE id IN (SELECT event_id FROM APP.audit_events)"
         );
+    }
+
+    #[test]
+    fn iris_execution_context_keeps_schema_unquoted_for_delimited_identifier_less_servers() {
+        // A double-quoted schema is turned into a `:%qpar` parameter by the
+        // Caché/IRIS JDBC preparser when delimited identifiers are disabled,
+        // which fails at prepare. Ordinary names must stay unquoted; only
+        // spellings that need a delimited name keep the quote characters.
+        let qualified = sql_for_execution_context_with_identifier_quote(
+            Some(DatabaseType::Iris),
+            "SELECT * FROM events",
+            Some("SQLUser"),
+            Some("\""),
+        );
+        assert_eq!(qualified, "SELECT * FROM SQLUser.events");
+        assert!(!qualified.contains('"'));
+
+        let quoted = sql_for_execution_context_with_identifier_quote(
+            Some(DatabaseType::Iris),
+            "SELECT * FROM events",
+            Some("My Schema"),
+            Some("\""),
+        );
+        assert_eq!(quoted, "SELECT * FROM \"My Schema\".events");
     }
 
     #[test]
@@ -10492,6 +10536,44 @@ for line in sys.stdin:
         assert_eq!(second_params["sessionId"], "oracle-go-1");
         assert_eq!(second_params["pageSize"], 100);
         assert!(second_params.get("sql").is_none());
+    }
+
+    /// Spawns a fake Python agent and registers a manual transaction session in
+    /// the app state so `execute_in_manual_transaction_with_options` can run
+    /// end to end without a live database.
+    #[test]
+    fn manual_transaction_classification_pairs_statements_and_fails_closed() {
+        // MySQL/PostgreSQL route through the strict sql_risk proof.
+        assert_eq!(classify_manual_transaction_statements(Some(DatabaseType::Mysql), 1, Some("SELECT 1")), vec![true]);
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::Postgres), 1, Some("SELECT * FROM users")),
+            vec![true]
+        );
+        // Mixed script: every statement is classified individually.
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::Mysql), 2, Some("SELECT 1; DELETE FROM t")),
+            vec![true, false]
+        );
+        // Session-state writes fail the proof (SELECT ... INTO @var).
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::Mysql), 1, Some("SELECT 1 INTO @x")),
+            vec![false]
+        );
+        // Count mismatch, missing classification SQL, non-participating dialects
+        // and unknown connections are all fail-closed (no markers).
+        assert!(classify_manual_transaction_statements(Some(DatabaseType::Mysql), 3, Some("SELECT 1")).is_empty());
+        assert!(classify_manual_transaction_statements(Some(DatabaseType::Mysql), 1, None).is_empty());
+        assert!(classify_manual_transaction_statements(Some(DatabaseType::Doris), 1, Some("SELECT 1")).is_empty());
+        assert!(classify_manual_transaction_statements(None, 1, Some("SELECT 1")).is_empty());
+        // Oracle keeps its lexical classifier and its pairing behavior.
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::Oracle), 1, Some("SELECT * FROM EMP")),
+            vec![true]
+        );
+        assert_eq!(
+            classify_manual_transaction_statements(Some(DatabaseType::OceanbaseOracle), 1, Some("DELETE FROM EMP")),
+            vec![false]
+        );
     }
 
     /// Spawns a fake Python agent and registers a manual transaction session in

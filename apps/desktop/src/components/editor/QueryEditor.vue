@@ -32,7 +32,16 @@ import { copyToClipboard, readTextFromClipboard } from "@/lib/common/clipboard";
 import { completionMatchRanges } from "@/lib/common/completionMatch";
 import { executionCandidateForMode, resolveExecutableSql, type SqlExecutionSnapshot, type SqlExecutionOverride, type SqlExecutionCandidate } from "@/lib/sql/sqlExecutionTarget";
 import { buildExecutionCandidates, hasMultipleExecutionTargets, supportsExecutionTargetPicker, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
-import { executableStatementRangeAtCursor, executableStatementRangeCacheForDoc, executableStatementRangeStartingAt as executableStatementRangeStartingAtLine, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
+import {
+  executableStatementRangeAtCursor,
+  executableStatementRangeCacheForDoc,
+  executableStatementRangeStartingAt as executableStatementRangeStartingAtLine,
+  mapStatementGutterStartIndex,
+  statementGutterStartIndexForCache,
+  statementGutterStartIndexHasStartAt,
+  type ExecutableStatementRangeCache,
+  type StatementGutterStartIndex,
+} from "@/lib/sql/executableStatementRangeCache";
 import { createDeferredEditorTask } from "@/lib/editor/deferredEditorTask";
 import { currentStatementFrameRangeTo } from "@/lib/sql/currentStatementFrame";
 import { looksLikeDmlStatement } from "@/lib/sql/dmlChangePreview";
@@ -154,6 +163,7 @@ import { createSqlAliasHighlights } from "@/lib/editor/codemirrorSqlAliasHighlig
 import { createInsertValueHintsExtension, requestInsertValueHintsRefresh, supportsInsertValueHints } from "@/lib/editor/codemirrorInsertValueHints";
 import { sqlBlockFoldService } from "@/lib/editor/codemirrorSqlBlockFolding";
 import { focusEditorView } from "@/lib/editor/queryEditorFocus";
+import { stabilizeUnfocusedQueryEditorPointerDown } from "@/lib/editor/queryEditorUnfocusedPointer";
 import { createDbxCodeMirrorSqlDialect, type CodeMirrorSqlDialectName } from "@/lib/editor/codemirrorSqlDialect";
 import { sqlSemanticTableNameSpansForSyntaxTree } from "@/lib/editor/codemirrorSqlSemanticHighlight";
 import { startsQueryEditorRectangularSelection, startsQueryEditorSelectionDrag, usesQueryEditorObjectNavigationModifier } from "@/lib/editor/queryEditorPointerSelection";
@@ -246,6 +256,9 @@ const COMPLETION_TRIGGER_DEFER_DELAY_MS = 50;
 const COMPLETION_TAB_RETRY_DELAY_MS = 16;
 const COMPLETION_TAB_MAX_WAIT_MS = COMPLETION_DEBOUNCE_DELAY_MS + COMPLETION_REMOTE_LATENCY_BUDGET_MS + 100;
 const COMPLETION_ENTER_MAX_WAIT_MS = 125;
+// Signature-help only ever looks backward from the cursor; past this distance
+// no human-authored call site is worth the scan on huge documents.
+const SQL_SIGNATURE_HELP_WINDOW_CHARS = 10_000;
 // Internal rollback switch: flip to false to route completion, diagnostics, and navigation through the legacy SQL context path.
 const SEMANTIC_SQL_COMPLETION_ENABLED = true;
 
@@ -680,6 +693,68 @@ function runStatementGutterExtension(): import("@codemirror/state").Extension {
 }
 
 let executableStatementRangeCache: ExecutableStatementRangeCache | null = null;
+
+// Lenient statement-boundary view shared by the run-statement gutter and the
+// current-statement frame. Re-parsing the whole document on every keystroke is
+// the dominant typing cost on large scripts, so while typing we only shift the
+// known start positions / frame range through the ChangeSet (O(statements)) and
+// rebuild exactly once after typing pauses. Paths that must stay exact (gutter
+// click-to-execute, execution picker) keep using the full on-demand parse.
+const STATEMENT_BOUNDARIES_REFRESH_MS = 150;
+let statementBoundariesView: {
+  doc: import("@codemirror/state").Text;
+  startsIndex: StatementGutterStartIndex;
+  frameRange: { from: number; to: number } | null;
+  fresh: boolean;
+  generation: number;
+} | null = null;
+let statementBoundariesGeneration = 0;
+let statementBoundariesRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+let statementBoundariesRefreshEffect: import("@codemirror/state").StateEffectType<null> | null = null;
+
+function refreshStatementBoundaries(state: import("@codemirror/state").EditorState) {
+  executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, state.doc, props.databaseType, sqlStatementParameterOptions());
+  statementBoundariesView = {
+    doc: state.doc,
+    startsIndex: statementGutterStartIndexForCache(executableStatementRangeCache),
+    frameRange: null,
+    fresh: true,
+    generation: statementBoundariesGeneration,
+  };
+}
+
+interface StatementBoundariesView {
+  doc: import("@codemirror/state").Text;
+  startsIndex: StatementGutterStartIndex;
+  frameRange: { from: number; to: number } | null;
+  fresh: boolean;
+  generation: number;
+}
+
+// Returns the view matching `state`, rebuilding it synchronously when the
+// tracked doc fell out of sync (first use, tab switch via setState) or the
+// dialect generation moved. While typing, the tracking plugin keeps the doc
+// reference current through ChangeSet mapping, so this stays cheap.
+function statementBoundariesForState(state: import("@codemirror/state").EditorState): StatementBoundariesView {
+  if (statementBoundariesView && statementBoundariesView.doc === state.doc && statementBoundariesView.generation === statementBoundariesGeneration) return statementBoundariesView;
+  refreshStatementBoundaries(state);
+  return statementBoundariesView!;
+}
+
+function scheduleStatementBoundariesRefresh(currentView: EditorViewType) {
+  // True debounce: continuous typing must never pay a full-document parse —
+  // mapped positions serve the gutter/frame, and one rebuild lands only after
+  // the pause.
+  if (statementBoundariesRefreshTimer !== null) clearTimeout(statementBoundariesRefreshTimer);
+  statementBoundariesRefreshTimer = setTimeout(() => {
+    statementBoundariesRefreshTimer = null;
+    if (view.value !== currentView || !currentView.dom.isConnected) return;
+    refreshStatementBoundaries(currentView.state);
+    if (statementBoundariesRefreshEffect) {
+      currentView.dispatch({ effects: statementBoundariesRefreshEffect.of(null) });
+    }
+  }, STATEMENT_BOUNDARIES_REFRESH_MS);
+}
 let editorScrollbarPointerCleanup: (() => void) | null = null;
 let editorSelectionDragCleanup: (() => void) | null = null;
 let editorSelectionDropCursorEl: HTMLDivElement | null = null;
@@ -1343,7 +1418,11 @@ function tableNavigationIdentifierAt(currentView: EditorViewType, event: MouseEv
   if (!props.connectionId || props.database == null) return null;
   const pos = currentView.posAtCoords({ x: event.clientX, y: event.clientY });
   if (pos == null) return null;
-  const extracted = extractIdentifierDetailsAt(currentView.state.doc.toString(), pos);
+  // Identifier extraction only looks around `pos`; slice a small window so
+  // modifier-held mouse moves never materialize the whole document string.
+  const windowFrom = Math.max(0, pos - 1024);
+  const doc = currentView.state.doc;
+  const extracted = extractIdentifierDetailsAt(doc.sliceString(windowFrom, Math.min(doc.length, pos + 1024)), pos - windowFrom);
   if (!extracted || (!extracted.quoted && isSqlKeyword(extracted.identifier))) return null;
   return extracted.identifier;
 }
@@ -5872,6 +5951,45 @@ onMounted(async () => {
   previewRangeComp = new Compartment();
   indentComp = new Compartment();
   setSqlDiagnosticsEffect = StateEffect.define<SqlSemanticDiagnostic[]>();
+  statementBoundariesRefreshEffect = StateEffect.define<null>();
+  // Keeps the lenient statement-boundary view glued to the live document:
+  // each keystroke shifts the known starts / frame range through the
+  // ChangeSet (O(statements)) and schedules one full rebuild after typing
+  // pauses, so neither the run gutter nor the statement frame re-parses the
+  // whole document synchronously on every keystroke.
+  const statementBoundariesTrackingPlugin = ViewPlugin.fromClass(
+    class {
+      update(update: import("@codemirror/view").ViewUpdate) {
+        if (!update.docChanged) return;
+        const boundaries = statementBoundariesView;
+        // No consumer (run gutter off + statement frame off) ever initialized
+        // the view — nothing to maintain and no refresh to schedule.
+        if (!boundaries) return;
+        if (boundaries.doc === update.startState.doc) {
+          statementBoundariesView = {
+            doc: update.state.doc,
+            startsIndex: mapStatementGutterStartIndex(boundaries.startsIndex, update.changes),
+            frameRange: boundaries.frameRange
+              ? {
+                  from: update.changes.mapPos(boundaries.frameRange.from, 1),
+                  to: update.changes.mapPos(boundaries.frameRange.to, 1),
+                }
+              : null,
+            fresh: false,
+            generation: boundaries.generation,
+          };
+        }
+        scheduleStatementBoundariesRefresh(update.view);
+      }
+
+      destroy() {
+        if (statementBoundariesRefreshTimer !== null) {
+          clearTimeout(statementBoundariesRefreshTimer);
+          statementBoundariesRefreshTimer = null;
+        }
+      }
+    },
+  );
   codeMirrorCompletionStatus = completionStatus;
   codeMirrorAcceptCompletion = acceptCompletion;
   codeMirrorCurrentCompletions = currentCompletions;
@@ -6107,8 +6225,17 @@ onMounted(async () => {
           markers: (currentView) => currentView.state.field(field),
           lineMarker(currentView, line, markers) {
             const executionMarker = markers.find((marker) => marker instanceof StatementExecutionStateMarker)?.marker;
-            const canExecute = showRunButtons && !!executableStatementRangeStartingAt(currentView, line.from);
+            // Membership check against the lenient index (mapped through the
+            // ChangeSet while typing) instead of a full-document re-parse per
+            // keystroke. The click handler still resolves the exact range on
+            // demand, so display-level approximation never affects execution.
+            const canExecute = showRunButtons && statementGutterStartIndexHasStartAt(statementBoundariesForState(currentView.state).startsIndex, line.from);
             return canExecute || executionMarker ? new StatementGutterMarker(canExecute, executionMarker) : null;
+          },
+          lineMarkerChange(update) {
+            // Redraw once the debounced full rebuild has landed.
+            const refreshEffect = statementBoundariesRefreshEffect;
+            return !!refreshEffect && update.transactions.some((transaction) => transaction.effects.some((effect) => effect.is(refreshEffect)));
           },
           domEventHandlers: showRunButtons
             ? {
@@ -6121,10 +6248,15 @@ onMounted(async () => {
   };
   buildSqlSignatureExtension = () =>
     showTooltip.compute(["doc", "selection"], (currentState) => {
-      const signature = getSqlFunctionSignatureHelp(currentState.doc.toString(), currentState.selection.main.head, props.databaseType, sqlDriverProfile.value);
+      const cursor = currentState.selection.main.head;
+      // Signature detection only scans backward from the cursor, so window the
+      // text instead of materializing the whole document prefix on every
+      // keystroke — doc.toString() was O(document) per key on large scripts.
+      const windowFrom = Math.max(0, cursor - SQL_SIGNATURE_HELP_WINDOW_CHARS);
+      const signature = getSqlFunctionSignatureHelp(currentState.doc.sliceString(windowFrom, cursor), cursor - windowFrom, props.databaseType, sqlDriverProfile.value, { truncatedPrefix: windowFrom > 0 });
       if (!signature) return null;
       return {
-        pos: currentState.selection.main.head,
+        pos: cursor,
         above: false,
         clip: false,
         create: () => ({ dom: createSqlSignatureTooltipDom(signature) }),
@@ -6312,43 +6444,60 @@ onMounted(async () => {
     await ensureCodeMirrorVim();
   }
 
-  const currentStatementFrameExtension = currentStatementFrameLayer({ layer, RectangleMarker }, (view) => {
-    if (!settingsStore.editorSettings.showCurrentStatementFrame) return null;
-    if (view.state.selection.ranges.some((range) => !range.empty)) return null;
-    let range = currentExecutableStatementRange(view);
-    if (!range) {
+  const currentStatementFrameExtension = currentStatementFrameLayer(
+    { layer, RectangleMarker },
+    (view) => {
+      if (!settingsStore.editorSettings.showCurrentStatementFrame) return null;
+      if (view.state.selection.ranges.some((range) => !range.empty)) return null;
       const cursorPos = view.state.selection.main.head;
-      const cursorLine = view.state.doc.lineAt(cursorPos);
-      executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, view.state.doc, props.databaseType, sqlStatementParameterOptions());
-      // Find ranges that overlap the cursor line, then expand to include
-      // adjacent ranges (handles parser fragments from edge cases like
-      // ultra-long comments splitting a statement).
-      let mergedFrom = cursorLine.from;
-      let mergedTo = cursorLine.from;
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const cachedRange of executableStatementRangeCache.ranges) {
-          // Only merge ranges that overlap the cursor line or are adjacent
-          // to the current merged region
-          if (cachedRange.from <= mergedTo && cachedRange.to >= mergedFrom) {
-            const newFrom = Math.min(mergedFrom, cachedRange.from);
-            const newTo = Math.max(mergedTo, cachedRange.to);
-            if (newFrom !== mergedFrom || newTo !== mergedTo) {
-              mergedFrom = newFrom;
-              mergedTo = newTo;
-              changed = true;
+      const boundaries = statementBoundariesForState(view.state);
+      if (boundaries && !boundaries.fresh && boundaries.frameRange && cursorPos >= boundaries.frameRange.from && cursorPos <= boundaries.frameRange.to) {
+        // Typing in progress: reuse the ChangeSet-shifted range instead of
+        // re-parsing the whole document. The debounced refresh rebuilds and
+        // repaints the exact frame once typing pauses.
+        return { from: boundaries.frameRange.from, to: currentStatementFrameTo(view, { from: boundaries.frameRange.from, to: boundaries.frameRange.to, sql: "" }) };
+      }
+      let range = currentExecutableStatementRange(view);
+      if (!range) {
+        const cursorLine = view.state.doc.lineAt(cursorPos);
+        executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, view.state.doc, props.databaseType, sqlStatementParameterOptions());
+        // Find ranges that overlap the cursor line, then expand to include
+        // adjacent ranges (handles parser fragments from edge cases like
+        // ultra-long comments splitting a statement).
+        let mergedFrom = cursorLine.from;
+        let mergedTo = cursorLine.from;
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const cachedRange of executableStatementRangeCache.ranges) {
+            // Only merge ranges that overlap the cursor line or are adjacent
+            // to the current merged region
+            if (cachedRange.from <= mergedTo && cachedRange.to >= mergedFrom) {
+              const newFrom = Math.min(mergedFrom, cachedRange.from);
+              const newTo = Math.max(mergedTo, cachedRange.to);
+              if (newFrom !== mergedFrom || newTo !== mergedTo) {
+                mergedFrom = newFrom;
+                mergedTo = newTo;
+                changed = true;
+              }
             }
           }
         }
+        if (mergedTo > mergedFrom) {
+          range = { from: mergedFrom, to: mergedTo, sql: view.state.doc.sliceString(mergedFrom, mergedTo) };
+        }
       }
-      if (mergedTo > mergedFrom) {
-        range = { from: mergedFrom, to: mergedTo, sql: view.state.doc.sliceString(mergedFrom, mergedTo) };
-      }
-    }
-    if (!range) return null;
-    return { from: range.from, to: currentStatementFrameTo(view, range) };
-  });
+      if (boundaries) boundaries.frameRange = range ? { from: range.from, to: range.to } : null;
+      if (!range) return null;
+      return { from: range.from, to: currentStatementFrameTo(view, range) };
+    },
+    {
+      shouldRefresh(update) {
+        const refreshEffect = statementBoundariesRefreshEffect;
+        return !!refreshEffect && update.transactions.some((transaction) => transaction.effects.some((effect) => effect.is(refreshEffect)));
+      },
+    },
+  );
 
   function currentStatementFrameTo(view: import("@codemirror/view").EditorView, range: SqlTextRange): number {
     return currentStatementFrameRangeTo(view.state.doc, range);
@@ -6400,6 +6549,10 @@ onMounted(async () => {
         // immediate drag-select there trigger CodeMirror's edge autoscroll.
         scrollToMatch: (range) => EditorView.scrollIntoView(range, { y: "center" }),
       }),
+      // Must update before the run gutter's plugin registers below: each
+      // keystroke maps the boundary view to the new doc before any lineMarker
+      // callback reads it, otherwise the gutter would trigger a full parse.
+      statementBoundariesTrackingPlugin,
       runGutterComp.of(runStatementGutterExtension()),
       lineNumbersComp.of(lineNumbersExtension(initialSettings.showLineNumbers)),
       createQueryEditorLineNumberAlignmentExtension(ViewPlugin),
@@ -6629,6 +6782,7 @@ onMounted(async () => {
           if (currentView && startEditorSelectionDrag(currentView, event)) {
             return true;
           }
+          if (currentView) stabilizeUnfocusedQueryEditorPointerDown(currentView, event);
           // Alt belongs to CodeMirror's rectangular and multi-cursor gestures,
           // even when Cmd/Ctrl is held at the same time.
           if (!usesQueryEditorObjectNavigationModifier(event)) {
@@ -7165,6 +7319,7 @@ watch([() => props.clientSessionId, () => props.completionContextVersion], () =>
 
 watch([() => props.databaseType, () => props.dialect, () => props.syntaxDialect, sqlDriverProfile], () => {
   executableStatementRangeCache = null;
+  statementBoundariesGeneration += 1;
   if (!view.value || !sqlLanguageComp || !buildSqlLanguageExtension || !sqlSemanticHighlightComp || !buildSqlSemanticHighlightExtension || !sqlSignatureComp || !buildSqlSignatureExtension) return;
   // Signature tooltips depend on the external dialect, so refresh them even when the document and selection stay unchanged.
   view.value.dispatch({
@@ -7181,6 +7336,7 @@ watch(
   (now, before) => {
     if (now === before) return;
     executableStatementRangeCache = null;
+    statementBoundariesGeneration += 1;
     if (props.databaseType !== "opengauss") return;
     if (!view.value) return;
     refreshCompletionCache();

@@ -135,9 +135,9 @@ const patterns: [RegExp, string][] = [
   [/^(?:Agent RPC error \(-?\d+\): )?MongoDB Legacy Agent returned an invalid find cursor$/, "mongo.import.legacyCursorInvalid"],
   [/^(?:Agent RPC error \(-?\d+\): )?MongoDB Legacy Agent returned an invalid find cursor page$/, "mongo.import.legacyCursorInvalid"],
   [/^(?:Agent RPC error \(-?\d+\): )?Find cursor not found$/, "mongo.import.legacyCursorInvalid"],
-[/^(?:Agent RPC error \(-?\d+\): )?MongoDB Legacy Agent does not support type-preserving export; upgrade or reinstall the MongoDB Legacy driver$/, "mongo.import.legacyExportUnsupported"],
-[/^(?:Agent RPC error \(-?\d+\): )?MongoDB Legacy Agent returned the same export page twice; upgrade or reinstall the MongoDB Legacy driver$/, "mongo.import.legacyExportStalled"],
-[/^(?:Agent RPC error \(-?\d+\): )?MongoDB Legacy Agent returned a document without _id$/, "mongo.import.legacyExportMissingId"],
+  [/^(?:Agent RPC error \(-?\d+\): )?MongoDB Legacy Agent does not support type-preserving export; upgrade or reinstall the MongoDB Legacy driver$/, "mongo.import.legacyExportUnsupported"],
+  [/^(?:Agent RPC error \(-?\d+\): )?MongoDB Legacy Agent returned the same export page twice; upgrade or reinstall the MongoDB Legacy driver$/, "mongo.import.legacyExportStalled"],
+  [/^(?:Agent RPC error \(-?\d+\): )?MongoDB Legacy Agent returned a document without _id$/, "mongo.import.legacyExportMissingId"],
   [/^Streaming export needs a result-set session, but this driver returned no session_id\.$/, "exportProgress.agentSessionMissing"],
 
   // Legacy bundled DuckDB error kept for compatibility with older backends.

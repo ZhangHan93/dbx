@@ -145,10 +145,12 @@ pub(super) async fn prepare_table_ddl(
             .await
             {
                 Ok(ddl) => (ddl, true),
-                Err(e) if rebuild => {
-                    // A rebuild cannot fall back to generated DDL when the source DDL
-                    // it promised to reproduce cannot be read.
-                    return Err(format!("Failed to read source DDL for table '{table}' before rebuilding: {e}"));
+                Err(e)
+                    if rebuild || matches!((source_db_type, target_db_type), (DatabaseType::H2, DatabaseType::H2)) =>
+                {
+                    // Rebuilds and H2-to-H2 transfers must not silently discard source
+                    // constraints or generated columns when native DDL cannot be read.
+                    return Err(format!("Failed to read source DDL for table '{table}' before creating target: {e}"));
                 }
                 Err(_) => (
                     generate_create_table_ddl_with_column_quoting(
@@ -373,6 +375,26 @@ mod tests {
         .unwrap();
         assert!(!prepared.reused_source_ddl);
         assert!(prepared.ddl.contains("CREATE TABLE"));
+    }
+
+    #[tokio::test]
+    async fn h2_native_ddl_read_failure_does_not_fall_back_to_lossy_metadata() {
+        let (state, _directory) = state_fixture().await;
+        let error = prepare_table_ddl(
+            &state,
+            &request(false),
+            "child",
+            "child",
+            &DatabaseType::H2,
+            &DatabaseType::H2,
+            "missing-source-pool",
+            &columns(),
+            None,
+            &HashMap::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("Failed to read source DDL"), "{error}");
     }
 
     #[tokio::test]

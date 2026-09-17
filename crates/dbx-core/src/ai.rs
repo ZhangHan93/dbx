@@ -571,6 +571,19 @@ pub struct AiCompletionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_contract: Option<AiTaskContract>,
     pub max_tokens: Option<u32>,
+    /// Stable key for reusing the provider's prompt cache within one conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
+}
+
+fn apply_prompt_cache_key(body: &mut serde_json::Value, request: &AiCompletionRequest) {
+    // Only OpenAI's Responses API documents this field. Other providers may
+    // expose a Responses-compatible route with a strict request schema.
+    if request.config.api_style == AiApiStyle::Responses && is_openai_api_config(&request.config) {
+        if let Some(key) = request.prompt_cache_key.as_deref().filter(|key| !key.is_empty()) {
+            body["prompt_cache_key"] = json!(key);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2402,6 +2415,7 @@ pub async fn call_responses_api(client: &reqwest::Client, request: AiCompletionR
         "max_output_tokens": responses_max_output_tokens(request.max_tokens, &request.config),
     });
     crate::ai_effort::apply_runtime_effort(&mut body, &request.config);
+    apply_prompt_cache_key(&mut body, &request);
 
     let res = client
         .post(resolve_endpoint(&request.config))
@@ -3959,6 +3973,7 @@ async fn stream_responses_api(
         "stream": true,
     });
     crate::ai_effort::apply_runtime_effort(&mut body, &request.config);
+    apply_prompt_cache_key(&mut body, request);
 
     let endpoint = resolve_endpoint(&request.config);
     let config = request.config.clone();
@@ -4661,6 +4676,7 @@ async fn stream_responses_with_tools(
         "stream": true,
     });
     crate::ai_effort::apply_runtime_effort(&mut body, &request.config);
+    apply_prompt_cache_key(&mut body, request);
 
     let endpoint = resolve_endpoint(&request.config);
     let config = request.config.clone();
@@ -5462,6 +5478,7 @@ mod tests {
             }],
             task_contract: None,
             max_tokens: Some(64),
+            prompt_cache_key: None,
         }
     }
 
@@ -5498,6 +5515,7 @@ mod tests {
             }],
             task_contract: None,
             max_tokens: Some(64),
+            prompt_cache_key: None,
         }
     }
 
@@ -8386,6 +8404,7 @@ mod tests {
             }],
             task_contract: None,
             max_tokens: Some(64),
+            prompt_cache_key: None,
         };
         let client = build_ai_http_client(&config, 10).unwrap();
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -9215,6 +9234,46 @@ mod tests {
             "model": "test-model",
         }))
         .unwrap()
+    }
+
+    fn prompt_cache_test_request(config: AiConfig, key: Option<&str>) -> AiCompletionRequest {
+        AiCompletionRequest {
+            config,
+            system_prompt: "Be concise.".to_string(),
+            messages: Vec::new(),
+            task_contract: None,
+            max_tokens: Some(64),
+            prompt_cache_key: key.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn prompt_cache_key_is_injected_only_for_openai_responses() {
+        let body = |config: AiConfig, key: Option<&str>| {
+            let mut body = serde_json::json!({ "model": "test-model" });
+            super::apply_prompt_cache_key(&mut body, &prompt_cache_test_request(config, key));
+            body
+        };
+        let key_of = |value: &serde_json::Value| value.get("prompt_cache_key").cloned();
+
+        let mut responses = test_config(AiProvider::Openai);
+        responses.api_style = AiApiStyle::Responses;
+        assert_eq!(key_of(&body(responses, Some("conv-42"))), Some(serde_json::Value::from("conv-42")));
+
+        // The field is documented only for OpenAI's Responses API. Chat
+        // completions, other providers, and empty keys must stay untouched.
+        let mut completions = test_config(AiProvider::Openai);
+        completions.api_style = AiApiStyle::Completions;
+        assert_eq!(key_of(&body(completions, Some("conv-42"))), None);
+
+        let mut compatible = test_config(AiProvider::OpenaiCompatible);
+        compatible.api_style = AiApiStyle::Responses;
+        assert_eq!(key_of(&body(compatible, Some("conv-42"))), None);
+
+        let mut responses = test_config(AiProvider::Openai);
+        responses.api_style = AiApiStyle::Responses;
+        assert_eq!(key_of(&body(responses.clone(), Some(""))), None);
+        assert_eq!(key_of(&body(responses, None)), None);
     }
 
     #[test]

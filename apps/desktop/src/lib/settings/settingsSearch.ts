@@ -263,6 +263,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "about-support", category: "about", titleKey: "settings.supportInfoTitle", descriptionKey: "settings.supportInfoDescription", targetId: "about" },
   { id: "about-transfer", category: "about", titleKey: "settings.settingsTransferTitle", descriptionKey: "settings.settingsTransferDescription", targetId: "about" },
   { id: "about-update-notifications", category: "about", titleKey: "settings.updateNotificationsEnabled", descriptionKey: "settings.updateNotificationsEnabledDescription", targetId: "about" },
+  { id: "about-auto-download-updates", category: "about", titleKey: "settings.autoDownloadUpdates", descriptionKey: "settings.autoDownloadUpdatesDescription", targetId: "about" },
   { id: "about-update", category: "about", titleKey: "settings.updateDownloadSource", descriptionKey: "settings.updateDownloadSourceDescription", targetId: "about" },
 ];
 

@@ -1717,16 +1717,22 @@ export function shouldAutoOpenSqlCompletion(sql: string, cursor: number, options
   if (isSqlCompletionSuppressedContext(sql, cursor, options)) return false;
   const previousChar = sql[cursor - 1];
   if (!previousChar) return false;
-  if (/\bon\s+$/i.test(sql.slice(0, cursor))) return true;
-  if (isAfterJoinModifierContext(sql.slice(0, cursor), options.databaseType)) return true;
-  if (/\bcall\s+(?:[A-Za-z_][\w$]*\.)?$/i.test(sql.slice(0, cursor))) return true;
+  // Statement-bounded prefix: every probe below is anchored at the cursor and
+  // only looks back within the current statement. Slicing the whole prefix (and
+  // the literal-masking scans inside the modifier/expression helpers) made each
+  // completion trigger O(document) on large scripts.
+  const statementSpan = sqlCompletionStatementSpan(sql, cursor, options);
+  const beforeCursor = sql.slice(statementSpan.start, cursor);
+  if (/\bon\s+$/i.test(beforeCursor)) return true;
+  if (isAfterJoinModifierContext(beforeCursor, options.databaseType)) return true;
+  if (/\bcall\s+(?:[A-Za-z_][\w$]*\.)?$/i.test(beforeCursor)) return true;
   const context = getSqlCompletionContext(sql, cursor, options);
   if (previousChar === "(" && (context.insertTable || context.preferredValueKeywords?.length)) return true;
   if (/[,;()[\]]/.test(previousChar)) return false;
   if (context.exclusiveTableSuggestions || context.exclusiveRoutineSuggestions || context.suggestTables) {
     return true;
   }
-  if (context.exclusiveColumnSuggestions || shouldAutoOpenColumnCompletion(context, sql, cursor, options.databaseType)) return true;
+  if (context.exclusiveColumnSuggestions || shouldAutoOpenColumnCompletion(context, beforeCursor, beforeCursor.length, options.databaseType)) return true;
   return /[A-Za-z_$@.]/.test(previousChar);
 }
 
@@ -2150,9 +2156,9 @@ export function getSqlCompletionResultValidFor(sql: string, cursor: number): Reg
   return undefined;
 }
 
-export function getSqlFunctionSignatureHelp(sql: string, cursor: number, databaseType?: DatabaseType, driverProfile?: string): SqlFunctionSignatureHelp | null {
+export function getSqlFunctionSignatureHelp(sql: string, cursor: number, databaseType?: DatabaseType, driverProfile?: string, options?: { truncatedPrefix?: boolean }): SqlFunctionSignatureHelp | null {
   const beforeCursor = sql.slice(0, cursor);
-  const call = findActiveFunctionCall(beforeCursor);
+  const call = findActiveFunctionCall(beforeCursor, options?.truncatedPrefix === true);
   if (!call) return null;
 
   const observedParameter = countTopLevelCommas(call.groupText);
@@ -5519,8 +5525,8 @@ interface ActiveFunctionCall {
   groupText: string;
 }
 
-function findActiveFunctionCall(sqlBeforeCursor: string): ActiveFunctionCall | null {
-  const activeOpenParen = findActiveFunctionOpenParen(sqlBeforeCursor);
+function findActiveFunctionCall(sqlBeforeCursor: string, truncatedPrefix = false): ActiveFunctionCall | null {
+  const activeOpenParen = findActiveFunctionOpenParen(sqlBeforeCursor, truncatedPrefix);
   if (activeOpenParen == null) return null;
 
   const beforeActiveGroup = sqlBeforeCursor.slice(0, activeOpenParen).trimEnd();
@@ -5569,12 +5575,23 @@ function findMatchingOpenParen(text: string, closeParenIndex: number): number | 
   return null;
 }
 
-function findActiveFunctionOpenParen(sqlBeforeCursor: string): number | null {
+/**
+ * Backward signature scans stop after this many characters: no human-authored
+ * argument group is worth a longer scan, and generated SQL can embed
+ * megabyte-long value lists inside a single call.
+ */
+const SQL_SIGNATURE_SCAN_LIMIT_CHARS = 100_000;
+
+function findActiveFunctionOpenParen(sqlBeforeCursor: string, truncatedPrefix = false): number | null {
   let depth = 0;
   let inSingleQuote = false;
   let inDoubleQuote = false;
+  // With a truncated window the scan must not trust index 0: an "unmatched"
+  // open paren sitting exactly on the window edge may have its match before
+  // the window, which would fabricate a signature tooltip.
+  const floorIndex = Math.max(truncatedPrefix ? 1 : 0, sqlBeforeCursor.length - SQL_SIGNATURE_SCAN_LIMIT_CHARS);
 
-  for (let i = sqlBeforeCursor.length - 1; i >= 0; i--) {
+  for (let i = sqlBeforeCursor.length - 1; i >= floorIndex; i--) {
     const ch = sqlBeforeCursor[i];
     if (ch === "'" && !inDoubleQuote) {
       inSingleQuote = !inSingleQuote;

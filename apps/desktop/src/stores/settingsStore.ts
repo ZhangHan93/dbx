@@ -861,6 +861,7 @@ export interface EditorSettings {
   generateSqlQuoteIdentifiers: boolean;
   formatSqlOnSqlFileSave: boolean;
   updateNotificationsEnabled: boolean;
+  autoDownloadUpdates: boolean;
   sidebarHiddenTablePrefixes: string[];
   sidebarCopyTableNameSeparator: ColumnNameCopySeparator;
   sidebarCopyTableNameIncludeSchema: boolean;
@@ -1102,6 +1103,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   generateSqlQuoteIdentifiers: true,
   formatSqlOnSqlFileSave: false,
   updateNotificationsEnabled: true,
+  autoDownloadUpdates: false,
   sidebarHiddenTablePrefixes: [],
   sidebarCopyTableNameSeparator: "comma",
   sidebarCopyTableNameIncludeSchema: false,
@@ -1598,6 +1600,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     generateSqlQuoteIdentifiers: typeof settings.generateSqlQuoteIdentifiers === "boolean" ? settings.generateSqlQuoteIdentifiers : DEFAULT_EDITOR_SETTINGS.generateSqlQuoteIdentifiers,
     formatSqlOnSqlFileSave: settings.formatSqlOnSqlFileSave === true,
     updateNotificationsEnabled: settings.updateNotificationsEnabled ?? DEFAULT_EDITOR_SETTINGS.updateNotificationsEnabled,
+    autoDownloadUpdates: settings.autoDownloadUpdates === true,
     sidebarHiddenTablePrefixes: normalizeSidebarHiddenTablePrefixes(settings.sidebarHiddenTablePrefixes),
     sidebarCopyTableNameSeparator: normalizeSidebarCopyTableNameSeparator(settings.sidebarCopyTableNameSeparator),
     sidebarCopyTableNameIncludeSchema: settings.sidebarCopyTableNameIncludeSchema === true,
@@ -2327,6 +2330,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.generateSqlQuoteIdentifiers !== undefined) editorSettings.value.generateSqlQuoteIdentifiers = partial.generateSqlQuoteIdentifiers === true;
     if (partial.formatSqlOnSqlFileSave !== undefined) editorSettings.value.formatSqlOnSqlFileSave = partial.formatSqlOnSqlFileSave === true;
     if (partial.updateNotificationsEnabled !== undefined) editorSettings.value.updateNotificationsEnabled = partial.updateNotificationsEnabled;
+    if (partial.autoDownloadUpdates !== undefined) editorSettings.value.autoDownloadUpdates = partial.autoDownloadUpdates === true;
     if (partial.sidebarHiddenTablePrefixes !== undefined) editorSettings.value.sidebarHiddenTablePrefixes = normalizeSidebarHiddenTablePrefixes(partial.sidebarHiddenTablePrefixes);
     if (partial.sidebarCopyTableNameSeparator !== undefined) editorSettings.value.sidebarCopyTableNameSeparator = normalizeSidebarCopyTableNameSeparator(partial.sidebarCopyTableNameSeparator);
     if (partial.sidebarCopyTableNameIncludeSchema !== undefined) editorSettings.value.sidebarCopyTableNameIncludeSchema = partial.sidebarCopyTableNameIncludeSchema === true;

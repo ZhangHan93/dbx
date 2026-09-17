@@ -105,6 +105,7 @@ import {
   tabSwitcherDirectionFromShortcut,
 } from "@/lib/editor/keyboardShortcuts";
 import { createTabNavigationHistory, moveInTabNavigationHistory, recordTabVisit } from "@/lib/tabs/tabNavigationHistory";
+import { canSaveSqlTab } from "@/lib/tabs/sqlTabSaveTarget";
 import { initialTabSwitcherSelection, moveTabSwitcherSelection, tabSwitcherOrder } from "@/lib/tabs/tabSwitcher";
 import { createTabSwitcherKeyboardController } from "@/lib/tabs/tabSwitcherKeyboard";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
@@ -1667,10 +1668,6 @@ function finishSqlLibraryFlyAnimation(animationId: number) {
   window.clearTimeout(sqlLibraryFlyAnimationTimer);
   sqlLibraryFlyAnimation.value = null;
   sqlLibrarySaveFeedbackId.value += 1;
-}
-
-function canSaveSqlTab(tab: QueryTab): boolean {
-  return !!tab.externalSqlPath || !!tab.sql.trim();
 }
 
 function closePendingSavedTab() {

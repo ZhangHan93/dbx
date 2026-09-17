@@ -171,7 +171,7 @@ const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readon
   ],
   shortcuts: ["shortcuts", "sqlShortcuts"],
   snippets: ["snippets"],
-  other: ["updateDownloadSource", "updateNotificationsEnabled"],
+  other: ["updateDownloadSource", "updateNotificationsEnabled", "autoDownloadUpdates"],
 };
 
 const KEY_TO_CATEGORY = new Map<string, SettingsTransferCategoryId>();
@@ -267,6 +267,7 @@ const PASS_THROUGH_BOOLEAN_KEYS = [
   "sidebarAllowHorizontalScroll",
   "sidebarShowTooltips",
   "updateNotificationsEnabled",
+  "autoDownloadUpdates",
 ] as const satisfies readonly EditorSettingsDraftKey[];
 
 const PASS_THROUGH_FIELD_VALIDATORS: Partial<Record<EditorSettingsDraftKey, (value: unknown) => boolean>> = {

@@ -2934,6 +2934,7 @@ watch([localFilterScopeKey, localFilterRestoreKey], ([, restoreKey], [, previous
 
 // --- Pagination ---
 const pageSizePreference = computed(() => resolveDataGridPageSizePreference(props.context, props.pageSizePreference));
+const defaultPageSize = computed(() => preferredDataGridPageSize(settingsStore.editorSettings, pageSizePreference.value));
 const pageSize = ref(preferredDataGridPageSize(settingsStore.editorSettings, pageSizePreference.value, props.pageLimit));
 const currentPage = ref(1);
 const pageSizeOptions = computed(() => resultPageSizeMenuOptions(pageSize.value));
@@ -3356,13 +3357,21 @@ function checkInfiniteScroll(scroller: HTMLElement) {
 function changePageSize(size: number) {
   const normalizedSize = normalizeResultPageSize(size);
   pageSize.value = normalizedSize;
-  settingsStore.updateEditorSettings(dataGridPageSizeSettingsPatch(pageSizePreference.value, normalizedSize));
   currentPage.value = 1;
   lastInfiniteScrollPage = 0;
   infiniteScrollAllLoaded = false;
   infiniteScrollPositions = new WeakMap();
   resetGridVerticalScroll(true);
   emit("paginate", 0, normalizedSize, currentWhereInput(), currentOrderBy());
+}
+
+function setDefaultPageSize() {
+  settingsStore.updateEditorSettings(dataGridPageSizeSettingsPatch(pageSizePreference.value, pageSize.value));
+}
+
+function applyCustomPageSizeAndSetDefault() {
+  applyCustomPageSize();
+  setDefaultPageSize();
 }
 
 function applyCustomPageSize() {
@@ -13435,6 +13444,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
         :infinite-scroll-enabled="infiniteScrollEnabled"
         :infinite-scroll-all-loaded="infiniteScrollAllLoaded"
         :page-size="pageSize"
+        :default-page-size="defaultPageSize"
         :page-size-menu-items="pageSizeMenuItems"
         :export-menu-items="exportMenuItems"
         :current-page="currentPage"
@@ -13443,6 +13453,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
         :can-jump-last-page="canJumpLastPage"
         @select-page-size="selectPageSizeMenuItem"
         @apply-custom-page-size="applyCustomPageSize"
+        @apply-custom-page-size-and-set-default="applyCustomPageSizeAndSetDefault"
         @first-page="firstPage"
         @previous-page="prevPage"
         @next-page="nextPage"

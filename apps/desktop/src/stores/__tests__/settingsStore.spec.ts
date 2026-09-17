@@ -273,6 +273,13 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({}).updateDownloadSource).toBe("official");
   });
 
+  it("requires opting into automatic update downloads and preserves the preference", () => {
+    expect(normalizeEditorSettings({}).autoDownloadUpdates).toBe(false);
+    expect(normalizeEditorSettings({ autoDownloadUpdates: true }).autoDownloadUpdates).toBe(true);
+    expect(normalizeEditorSettings({ autoDownloadUpdates: false }).autoDownloadUpdates).toBe(false);
+    expect(normalizeEditorSettings({ autoDownloadUpdates: "true" } as any).autoDownloadUpdates).toBe(false);
+  });
+
   it("preserves explicit editor themes from saved settings", () => {
     expect(normalizeEditorSettings({ theme: "xcode" }).theme).toBe("xcode");
     expect(normalizeEditorSettings({ theme: "one-dark" }).theme).toBe("one-dark");
