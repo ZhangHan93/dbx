@@ -537,10 +537,12 @@ internal sealed class OdbcSession
     {
         EnsureConn();
         string? schema = OdbcRuntimeServer.Str(p, "schema");
+        bool includeSystem = Bool(p, "include_system_tables");
         var table = SafeSchema("Tables");
         var matchSchema = SchemaFilter(table, schema);
         var rows = table.Rows.Cast<DataRow>()
             .Where(matchSchema)
+            .Where(r => includeSystem || !IsSystemObject(r))
             .OrderBy(r => Str(r, "TABLE_NAME") ?? "", StringComparer.OrdinalIgnoreCase);
 
         var list = new List<object>();
@@ -1003,6 +1005,44 @@ internal sealed class OdbcSession
         if (rows.Any(r => Eq("TABLE_SCHEM", r))) return r => Eq("TABLE_SCHEM", r);
         if (rows.Any(r => Eq("TABLE_CAT", r))) return r => Eq("TABLE_CAT", r);
         return static _ => false;
+    }
+
+    /// <summary>
+    /// 系统对象判据。ODBC 的 SQLTables 会把系统表混在用户表里返回，并且**如实**标了
+    /// <c>TABLE_TYPE='SYSTEM TABLE'</c>（Access/Jet 实测：11 个 MSys* 全是 SYSTEM TABLE，
+    /// 另 3 个是 TABLE）——所以这不是驱动缺陷，是调用方原本没过滤。
+    ///
+    /// 为什么必须在 agent 侧过滤：DBX 前端只有「系统 Schema 可见性」这一个开关
+    /// （<c>show_system_schemas</c>），它作用在 TABLE_SCHEM 上；而 Access / Excel /
+    /// dBase 这类文件驱动的 TABLE_SCHEM **全空**，没得可关 —— MSys* 就会直接铺进
+    /// 侧栏树和主面板（2026-09-17 用户截图复现）。
+    ///
+    /// 判据取 TABLE_TYPE 而非名字前缀（MSys*）：类型是驱动给的权威信息，前缀启发式
+    /// 会误伤用户自建的、恰好叫 MSysXxx 的表。对 SQL Server 一类驱动的用户表
+    /// （TABLE_TYPE='TABLE'）过滤是无操作。
+    ///
+    /// 需要看系统对象时在 params 内传 <c>include_system_tables=true</c>
+    /// （前端目前不会传，留给调试与后续 UI 开关）。
+    /// </summary>
+    static bool IsSystemObject(DataRow r)
+    {
+        string type = (Str(r, "TABLE_TYPE") ?? "").Trim();
+        return type.Contains("SYSTEM", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool Bool(JsonElement p, string key)
+    {
+        if (p.ValueKind != JsonValueKind.Object || !p.TryGetProperty(key, out var v)) return false;
+        switch (v.ValueKind)
+        {
+            case JsonValueKind.True: return true;
+            case JsonValueKind.False: return false;
+            case JsonValueKind.Number: return v.TryGetInt32(out int n) && n != 0;
+            case JsonValueKind.String:
+                return string.Equals(v.GetString(), "true", StringComparison.OrdinalIgnoreCase)
+                       || string.Equals(v.GetString(), "1", StringComparison.Ordinal);
+            default: return false;
+        }
     }
 
     static bool MatchName(DataRow r, string col, string? name)
