@@ -21,6 +21,7 @@ import {
 import type { DataGridTableMeta } from "@/lib/dataGrid/dataGridSql";
 import { binaryCellClipboardText } from "@/lib/dataGrid/binaryCellDownload";
 import { formatError } from "@/lib/backend/errorUtils";
+import { tableMetaWithoutOptionalDatabaseQualifier } from "@/lib/table/tableSelectSql";
 import type { DatabaseType } from "@/types/database";
 
 interface ExtractorRowItem {
@@ -50,6 +51,8 @@ interface UseDataGridExtractorOptions {
   databaseType: ComputedRef<DatabaseType | undefined>;
   identifierQuote?: ComputedRef<string | undefined>;
   tableMeta: ComputedRef<DataGridTableMeta | undefined>;
+  /** Editor setting "Include database name in generated SQL". When false, SQL extractors omit optional schema/database qualifiers. */
+  includeDatabaseName?: ComputedRef<boolean>;
   hasCellSelection: ComputedRef<boolean>;
   selectedCells: ComputedRef<SelectionData>;
   selectedCellMatrix: ComputedRef<CellSelectionMatrix | null>;
@@ -216,9 +219,13 @@ export function useDataGridExtractor(options: UseDataGridExtractorOptions) {
     const rows = rawRows.map((row) => row.map((value, index) => extractorCellValue(value, columnTypes[index], normalizeValues, presentBinaryText, index)));
     const tableMeta =
       descriptor.category === "sql"
-        ? compactTableMeta(
-            options.tableMeta.value,
-            columns.map((column) => column.sourceName ?? column.displayName),
+        ? tableMetaWithoutOptionalDatabaseQualifier(
+            compactTableMeta(
+              options.tableMeta.value,
+              columns.map((column) => column.sourceName ?? column.displayName),
+            ),
+            options.databaseType.value,
+            options.includeDatabaseName?.value,
           )
         : undefined;
     const request: DataGridExtractRequest = {

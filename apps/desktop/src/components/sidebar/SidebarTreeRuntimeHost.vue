@@ -202,7 +202,7 @@ import { savedSqlClipboardFileIds, savedSqlPasteTargetForNode } from "@/lib/save
 import { exportSavedSqlFileContent } from "@/lib/savedSql/savedSqlExport";
 import { isSqlServerLinkedNode } from "@/lib/database/sqlServerLinkedServers";
 import { flattenTree } from "@/composables/useFlatTree";
-import { createDatabaseCollationOptionsForCharset, DEFAULT_GBASE8S_DATABASE_LOCALE, GBASE8S_DATABASE_LOCALES, nextCreateDatabaseCollation, normalizeCreateDatabaseCharset, parseCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
+import { createDatabaseCollationOptionsForCharset, DEFAULT_GBASE8S_DATABASE_LOCALE, defaultGbase8sDatabaseLocale, GBASE8S_DATABASE_LOCALES, nextCreateDatabaseCollation, normalizeCreateDatabaseCharset, parseCreateDatabaseCharsetMetadata } from "@/lib/database/createDatabaseCharsetOptions";
 import { executeWithProductionContextGuard, executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
 import { buildXuguCompileSql } from "@/lib/database/xuguCompileSql";
@@ -3522,7 +3522,7 @@ const canSetCreateDatabaseLocale = computed(() => {
 
 const canDropDatabase = computed(() => {
   const config = activeNode.value.connectionId ? connectionStore.getConfig(activeNode.value.connectionId) : undefined;
-  return activeNode.value.type === "database" && !isSqlServerLinkedNode(activeNode.value) && supportsDatabaseCreation(config?.db_type);
+  return activeNode.value.type === "database" && !isSqlServerLinkedNode(activeNode.value) && (supportsDatabaseCreation(config?.db_type) || supportsCreateDatabaseLocale(config?.db_type, config?.driver_profile));
 });
 
 const databasePropertyGroups = computed(() => {
@@ -3828,12 +3828,13 @@ function openCreateDatabaseDialog() {
   showCreateDatabaseDialog.value = true;
   if (canSetCreateDatabaseLocale.value) {
     // GBase 8s / Informix: the "charset" control selects the new database's DB_LOCALE, which the
-    // agent applies by opening the CREATE DATABASE session with it. Default to UTF-8 so new
-    // databases can store Chinese; no server charset catalog query is needed.
+    // agent applies by opening the CREATE DATABASE session with it. Seed a UTF-8 default, then
+    // repopulate the options with the collations already present on the connected instance.
     createDatabaseCharsetOptions.value = [...GBASE8S_DATABASE_LOCALES];
     createDatabaseCollationsByCharset.value = {};
     createDatabaseCharset.value = DEFAULT_GBASE8S_DATABASE_LOCALE;
     createDatabaseCollation.value = "";
+    void loadGbase8sDatabaseLocales();
   } else if (canSetCreateDatabaseCharset.value) {
     void loadCreateDatabaseCharsetMetadata();
   }
@@ -3953,6 +3954,33 @@ async function loadCreateDatabaseCharsetMetadata(target: "create" | "edit" = "cr
   } catch {
     createDatabaseCharsetOptions.value = fallbackCreateDatabaseCharset.charsets;
     createDatabaseCollationsByCharset.value = fallbackCreateDatabaseCharset.collationsByCharset;
+  } finally {
+    createDatabaseCharsetLoading.value = false;
+  }
+}
+
+async function loadGbase8sDatabaseLocales() {
+  const node = activeNode.value;
+  if (!node.connectionId) return;
+  createDatabaseCharsetLoading.value = true;
+  try {
+    await connectionStore.ensureConnected(node.connectionId);
+    const result = await api.executeQuery(node.connectionId, "", "SELECT DISTINCT dbs_collate FROM sysmaster:sysdbslocale ORDER BY 1", undefined, undefined, { maxRows: 500 });
+    if (!showCreateDatabaseDialog.value) return;
+    const idx = result.columns.findIndex((column) => column.trim().toLowerCase() === "dbs_collate");
+    const locales = [...new Set(result.rows.map((row) => String(row[idx >= 0 ? idx : 0] ?? "").trim()).filter(Boolean))];
+    if (!locales.length) throw new Error("no collations");
+    createDatabaseCharsetOptions.value = locales;
+    createDatabaseCollationsByCharset.value = {};
+    if (!locales.includes(createDatabaseCharset.value)) {
+      updateCreateDatabaseCharset(defaultGbase8sDatabaseLocale(locales));
+    }
+  } catch {
+    createDatabaseCharsetOptions.value = [...GBASE8S_DATABASE_LOCALES];
+    createDatabaseCollationsByCharset.value = {};
+    if (!createDatabaseCharsetOptions.value.includes(createDatabaseCharset.value)) {
+      updateCreateDatabaseCharset(DEFAULT_GBASE8S_DATABASE_LOCALE);
+    }
   } finally {
     createDatabaseCharsetLoading.value = false;
   }
@@ -5598,6 +5626,11 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
       shortcut: shortcutDelete,
       variant: "destructive" as const,
     });
+    // Plugin-contributed entries must be appended before this branch returns.
+    // treeItemMenuItems() stops at the first factory that reports the node as
+    // handled, so a call placed after the factory loop never runs for a
+    // connection node.
+    appendPluginConnectionMenuItems(items, node);
     return true;
   }
 
@@ -6480,8 +6513,6 @@ function treeItemMenuItems(): ContextMenuItem[] {
     items.push({ label: "", separator: true });
     items.push({ label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
   }
-
-  appendPluginConnectionMenuItems(items, node);
 
   return items;
 }

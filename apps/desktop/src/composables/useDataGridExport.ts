@@ -80,6 +80,8 @@ export interface UseDataGridExportOptions {
   sql: ComputedRef<string | undefined>;
   exportSql?: ComputedRef<string | undefined>;
   tableMeta: ComputedRef<DataGridTableMeta | undefined>;
+  /** Editor setting "Include database name in generated SQL" — passed through to SQL extractors. */
+  includeDatabaseName?: ComputedRef<boolean>;
   copyInsertTargetLabel?: ComputedRef<string | undefined>;
   mongoUpdateTarget?: ComputedRef<MongoCopyUpdateTarget | undefined>;
   databaseType: ComputedRef<DatabaseType | undefined>;
@@ -722,6 +724,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     databaseType,
     identifierQuote,
     tableMeta,
+    includeDatabaseName: options.includeDatabaseName,
     hasCellSelection,
     selectedCells,
     selectedCellMatrix,

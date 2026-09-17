@@ -1563,6 +1563,8 @@ export default withEnglishFallback({
     searchResults: "번호, 이름 또는 SQL 검색",
     noMatchingResults: "일치하는 결과가 없습니다",
     removeRun: "실행 {n} 제거",
+    renameResultRun: "결과 탭 이름 변경",
+    resultRunName: "결과 탭 이름",
     pinResultRun: "결과 탭 고정",
     unpinResultRun: "결과 탭 고정 해제",
     unpinAllResultRuns: "모든 결과 탭 고정 해제",
@@ -2985,6 +2987,7 @@ export default withEnglishFallback({
       qoderRunFailed: "Qoder CLI가 예기치 않게 종료되었습니다. 아래 오류 코드와 진단을 사용하여 실패한 실행 파일이나 CLI 출력을 확인하세요.",
     },
     actions: {
+      auto: "자동",
       general: "일반",
       generate: "SQL 생성",
       explain: "SQL 설명",
@@ -2996,6 +2999,11 @@ export default withEnglishFallback({
       exploreSchema: "스키마 검사",
       executeAndExplain: "실행 및 설명",
       generateNoExec: "생성 (실행 안 함)",
+    },
+    routing: {
+      recognizing: "의도 파악 중…",
+      chip: "자동 · {action}",
+      switchTo: "{action}(으)로 전환",
     },
     placeholders: {
       general: "무엇이든 물어보세요...",
@@ -3026,6 +3034,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "에이전트 턴 제한을 저장했습니다",
     defaultAiMode: "기본 AI 모드",
     defaultAiModeDescription: "새 AI 대화를 시작할 때 사용되는 모드입니다. 현재 대화에서 모드를 전환해도 이 설정은 변경되지 않습니다.",
+    defaultAutoRouting: "자동 의도 라우팅 기본 사용",
+    defaultAutoRoutingDescription: "새 AI 대화를 '자동' 선택으로 시작합니다. 전송 시 AI가 의도를 파악해 적절한 기능으로 전환합니다. 현재 대화에는 영향을 주지 않습니다.",
     restoreLastConversation: "열 때 마지막 AI 대화 복원",
     restoreLastConversationDescription: "사용하면 AI 어시스턴트를 열 때 빈 대화 대신 가장 최근에 업데이트된 대화를 불러옵니다.",
     promptTemplates: "시나리오 프롬프트 템플릿",
@@ -6710,7 +6720,7 @@ export default withEnglishFallback({
     executeModeCurrent: "커서 위치의 구문 실행",
     defaultTransactionMode: "기본 트랜잭션 커밋 모드",
     defaultTransactionModeDescription:
-      '새 SQL 편집기를 열 때 기본적으로 사용되는 트랜잭션 모드입니다. "수동 트랜잭션"을 선택하면 새 편집기가 수동 트랜잭션 모드로 시작되어 수동으로 커밋 또는 롤백해야 합니다. "자동 커밋"을 선택하면 각 문이 자동으로 커밋됩니다. 트랜잭션을 지원하는 데이터베이스(PostgreSQL, MySQL, Oracle, JDBC)에만 적용됩니다.',
+      '새 SQL 편집기를 열 때 기본적으로 사용되는 트랜잭션 모드입니다. "수동 트랜잭션"을 선택하면 새 편집기가 수동 트랜잭션 모드로 시작되어 수동으로 커밋 또는 롤백해야 합니다. "자동 커밋"을 선택하면 각 문이 자동으로 커밋됩니다. 트랜잭션을 지원하는 데이터베이스에만 적용됩니다.',
     defaultTransactionModeAuto: "자동 커밋",
     defaultTransactionModeManual: "수동 트랜잭션",
     executeAllOnBlankLine: "빈 줄에서 모든 SQL 실행",

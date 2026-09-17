@@ -251,6 +251,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "ai-config", category: "ai", titleKey: "ai.configList", targetId: "ai" },
   { id: "ai-prompts", category: "ai", titleKey: "ai.promptTemplates", descriptionKey: "ai.promptTemplatesDescription", targetId: "ai" },
   { id: "ai-default-mode", category: "ai", titleKey: "ai.defaultAiMode", descriptionKey: "ai.defaultAiModeDescription", targetId: "ai" },
+  { id: "ai-default-auto-routing", category: "ai", titleKey: "ai.defaultAutoRouting", descriptionKey: "ai.defaultAutoRoutingDescription", targetId: "ai" },
   { id: "ai-agent-turn-limit", category: "ai", titleKey: "ai.maxAgentTurns", descriptionKey: "ai.maxAgentTurnsDescription", targetId: "ai" },
   { id: "ai-global-retries", category: "ai", titleKey: "ai.maxRetriesGlobal", descriptionKey: "ai.maxRetriesGlobalDescription", targetId: "ai" },
   { id: "ai-global-instructions", category: "ai", titleKey: "ai.globalInstructions", descriptionKey: "ai.globalInstructionsDescription", targetId: "ai" },

@@ -1548,6 +1548,8 @@ export default withEnglishFallback({
     searchResults: "Numara, ad veya SQL ile ara",
     noMatchingResults: "Eşleşen sonuç yok",
     removeRun: "{n} numaralı çalıştırmayı kaldır",
+    renameResultRun: "Sonuç sekmesini yeniden adlandır",
+    resultRunName: "Sonuç sekmesi adı",
     pinResultRun: "Sonuç sekmesini sabitle",
     unpinResultRun: "Sonuç sekmesinin sabitlemesini kaldır",
     unpinAllResultRuns: "Tüm sonuç sekmelerinin sabitlemesini kaldır",
@@ -3030,6 +3032,7 @@ export default withEnglishFallback({
       cursorRunFailed: "Cursor CLI beklenmedik şekilde sonlandı. Hatalı çalıştırılabiliri veya CLI çıktısını belirlemek için aşağıdaki hata kodunu ve tanılamayı kullanın.",
     },
     actions: {
+      auto: "Otomatik",
       general: "Genel",
       generate: "SQL Üret",
       explain: "SQL'i Açıkla",
@@ -3041,6 +3044,11 @@ export default withEnglishFallback({
       exploreSchema: "Şemayı İncele",
       executeAndExplain: "Çalıştır ve Açıkla",
       generateNoExec: "Üret (çalıştırma)",
+    },
+    routing: {
+      recognizing: "Niyet algılanıyor…",
+      chip: "Otomatik · {action}",
+      switchTo: "{action} seçeneğine geç",
     },
     placeholders: {
       general: "Bana istediğinizi sorun...",
@@ -3071,6 +3079,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "Agent tur sınırı kaydedildi",
     defaultAiMode: "Varsayılan Yapay Zekâ Modu",
     defaultAiModeDescription: "Yeni bir yapay zekâ konuşması başlatılırken kullanılan mod. Geçerli konuşmada mod değiştirmek bu ayarı değiştirmez.",
+    defaultAutoRouting: "Varsayılan olarak otomatik niyet yönlendirme",
+    defaultAutoRoutingDescription: "Yeni yapay zekâ konuşmalarını Otomatik seçimiyle başlatır: yapay zekâ, gönderim sırasında niyetinizi algılar ve uygun eyleme yönlendirir. Geçerli konuşmayı değiştirmez.",
     restoreLastConversation: "Açılışta son yapay zekâ konuşmasını geri yükle",
     restoreLastConversationDescription: "Etkinleştirildiğinde, yapay zekâ asistanı boş bir konuşma yerine en son güncellenen konuşmayı yükler.",
     promptTemplates: "Senaryo İstem Şablonları",
@@ -7106,7 +7116,7 @@ export default withEnglishFallback({
     executeModeCurrent: "İmleçteki ifadeyi çalıştır",
     defaultTransactionMode: "Varsayılan işlem commit modu",
     defaultTransactionModeDescription:
-      'Yeni bir SQL düzenleyici açıldığında varsayılan olarak kullanılan işlem modu. "Manuel işlem" ile yeni düzenleyiciler manuel işlem modunda başlar ve elle commit ya da rollback gerektirir; "Otomatik commit" ile her ifade otomatik olarak uygulanır. Yalnızca işlemleri destekleyen veritabanları için geçerlidir (PostgreSQL, MySQL, Oracle, JDBC).',
+      'Yeni bir SQL düzenleyici açıldığında varsayılan olarak kullanılan işlem modu. "Manuel işlem" ile yeni düzenleyiciler manuel işlem modunda başlar ve elle commit ya da rollback gerektirir; "Otomatik commit" ile her ifade otomatik olarak uygulanır. Yalnızca işlemleri destekleyen veritabanları için geçerlidir.',
     defaultTransactionModeAuto: "Otomatik commit",
     defaultTransactionModeManual: "Manuel işlem",
     executeAllOnBlankLine: "Boş satırlarda tüm SQL'i çalıştır",

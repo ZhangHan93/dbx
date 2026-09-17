@@ -1650,6 +1650,8 @@ export default withEnglishFallback({
     searchResults: "Buscar por número, nombre o SQL",
     noMatchingResults: "No hay resultados coincidentes",
     removeRun: "Eliminar ejecución {n}",
+    renameResultRun: "Renombrar pestaña de resultados",
+    resultRunName: "Nombre de la pestaña de resultados",
     pinResultRun: "Fijar pestaña de resultado",
     unpinResultRun: "Desfijar pestaña de resultado",
     unpinAllResultRuns: "Desfijar todas las pestañas de resultado",
@@ -3011,6 +3013,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "Límite de turnos del agente guardado",
     defaultAiMode: "Modo de IA predeterminado",
     defaultAiModeDescription: "Modo usado al iniciar una nueva conversación de IA. Cambiar de modo en la conversación actual no modifica esta configuración.",
+    defaultAutoRouting: "Enrutamiento de intención automático por defecto",
+    defaultAutoRoutingDescription: "Inicia nuevas conversaciones de IA con la acción Auto: la IA detecta tu intención al enviar y la dirige a una acción concreta. No cambia la conversación actual.",
     restoreLastConversation: "Restaurar la última conversación de IA al abrir",
     restoreLastConversationDescription: "Al activarlo, el asistente de IA carga la conversación actualizada más recientemente en lugar de una conversación en blanco.",
     promptTemplates: "Plantillas de prompt por escenario",
@@ -3158,6 +3162,7 @@ export default withEnglishFallback({
     codexCliPath: "Ruta de Codex CLI",
     codexCliPathHint: "Déjalo vacío para usar codex desde PATH. Inicia sesión por separado con codex login.",
     actions: {
+      auto: "Auto",
       general: "General",
       generate: "Generar SQL",
       explain: "Explicar SQL",
@@ -3169,6 +3174,11 @@ export default withEnglishFallback({
       exploreSchema: "Inspeccionar esquema",
       executeAndExplain: "Ejecutar y explicar",
       generateNoExec: "Generar (sin ejecutar)",
+    },
+    routing: {
+      recognizing: "Detectando intención…",
+      chip: "Auto · {action}",
+      switchTo: "Cambiar a {action}",
     },
     placeholders: {
       general: "Pregunta lo que quieras...",
@@ -6942,7 +6952,7 @@ export default withEnglishFallback({
     executeModeCurrent: "Ejecutar sentencia en el cursor",
     defaultTransactionMode: "Modo de confirmación de transacción predeterminado",
     defaultTransactionModeDescription:
-      'El modo de transacción que se usa de forma predeterminada al abrir un nuevo editor SQL. Con "Transacción manual", los nuevos editores inician en modo de transacción manual y requieren confirmación o reversión manual; con "Confirmación automática", cada sentencia se confirma automáticamente. Solo se aplica a bases de datos que admiten transacciones (PostgreSQL, MySQL, Oracle, JDBC).',
+      'El modo de transacción que se usa de forma predeterminada al abrir un nuevo editor SQL. Con "Transacción manual", los nuevos editores inician en modo de transacción manual y requieren confirmación o reversión manual; con "Confirmación automática", cada sentencia se confirma automáticamente. Solo se aplica a bases de datos que admiten transacciones.',
     defaultTransactionModeAuto: "Confirmación automática",
     defaultTransactionModeManual: "Transacción manual",
     executeAllOnBlankLine: "Ejecutar todo el SQL desde líneas en blanco",

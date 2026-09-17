@@ -1667,6 +1667,8 @@ export default withEnglishFallback({
     searchResults: "番号、名前、SQL で検索",
     noMatchingResults: "一致する結果はありません",
     removeRun: "実行 {n} を削除",
+    renameResultRun: "結果タブの名前を変更",
+    resultRunName: "結果タブ名",
     pinResultRun: "結果タブを固定",
     unpinResultRun: "結果タブの固定を解除",
     unpinAllResultRuns: "すべての結果タブの固定を解除",
@@ -3047,6 +3049,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "エージェントターン上限を保存しました",
     defaultAiMode: "既定の AI モード",
     defaultAiModeDescription: "新しい AI 会話を開始するときに使用されるモードです。現在の会話でモードを切り替えてもこの設定は変更されません。",
+    defaultAutoRouting: "自動インテントルーティングを既定で有効化",
+    defaultAutoRoutingDescription: "新しい AI 会話を「自動」アクションで開始します。送信時に AI が意図を判定して具体的なアクションにルーティングします。現在の会話には影響しません。",
     restoreLastConversation: "起動時に最後の AI 会話を復元",
     restoreLastConversationDescription: "有効にすると、AI アシスタントを開いたときに空白の会話ではなく、最後に更新された会話を読み込みます。",
     promptTemplates: "シナリオプロンプトテンプレート",
@@ -3182,6 +3186,7 @@ export default withEnglishFallback({
     anthropicMessagesHint: "Anthropic Messages 互換 API は通常 /v1/messages を使用します。",
     openAiCompatibleEndpointHint: "ほとんどの OpenAI 互換 API は /v1 パスプレフィックスが必要です。",
     actions: {
+      auto: "自動",
       general: "一般的な質問",
       generate: "SQLを生成",
       explain: "SQLを説明",
@@ -3193,6 +3198,11 @@ export default withEnglishFallback({
       exploreSchema: "スキーマを確認",
       executeAndExplain: "実行して解説",
       generateNoExec: "生成のみ（実行しない）",
+    },
+    routing: {
+      recognizing: "意図を判定中…",
+      chip: "自動 · {action}",
+      switchTo: "{action}に切り替え",
     },
     placeholders: {
       general: "何でも聞いてください...",
@@ -6966,7 +6976,7 @@ export default withEnglishFallback({
     executeModeCurrent: "カーソル位置の文を実行",
     defaultTransactionMode: "既定のトランザクションコミットモード",
     defaultTransactionModeDescription:
-      "新しい SQL エディタを開いたときに既定で使用するトランザクションモード。「手動トランザクション」を選択すると、新しいエディタは手動トランザクションモードで開始され、手動でコミットまたはロールバックします。「自動コミット」を選択すると、各ステートメントが自動的にコミットされます。トランザクションをサポートするデータベース（PostgreSQL、MySQL、Oracle、JDBC）のみに適用されます。",
+      "新しい SQL エディタを開いたときに既定で使用するトランザクションモード。「手動トランザクション」を選択すると、新しいエディタは手動トランザクションモードで開始され、手動でコミットまたはロールバックします。「自動コミット」を選択すると、各ステートメントが自動的にコミットされます。トランザクションをサポートするデータベースにのみ適用されます。",
     defaultTransactionModeAuto: "自動コミット",
     defaultTransactionModeManual: "手動トランザクション",
     executeAllOnBlankLine: "空行ではすべてのSQLを実行",

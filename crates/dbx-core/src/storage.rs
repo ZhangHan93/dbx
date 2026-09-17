@@ -7685,6 +7685,7 @@ mod tests {
                 selection: AiEffortSelection::Enum("high".to_string()),
             }],
             default_mode: Some(AiAssistantMode::Agent),
+            default_auto_routing: true,
             restore_last_conversation: true,
             default_templates_by_db_type: BTreeMap::from([("postgresql".to_string(), vec!["tpl-1".to_string()])]),
             last_used_templates_by_db_type: BTreeMap::from([("mysql".to_string(), vec!["tpl-2".to_string()])]),

@@ -1547,6 +1547,8 @@ export default withEnglishFallback({
     searchResults: "Nömrə, ad və ya SQL üzrə axtar",
     noMatchingResults: "Uyğun nəticə yoxdur",
     removeRun: "{n} nömrəli icranı çıxar",
+    renameResultRun: "Nəticə sekmesini adlandır",
+    resultRunName: "Nəticə sekmesinin adı",
     pinResultRun: "Nəticə vərəqini sabitlə",
     unpinResultRun: "Nəticə vərəqinin sabitlənməsini ləğv et",
     unpinAllResultRuns: "Bütün nəticə vərəqlərinin sabitlənməsini ləğv et",
@@ -3057,6 +3059,7 @@ export default withEnglishFallback({
       cursorRunFailed: "Cursor CLI gözlənilmədən bağlandı. Problemli icra faylını və ya CLI çıxışını müəyyən etmək üçün aşağıdakı xəta kodundan və diaqnostikadan istifadə edin.",
     },
     actions: {
+      auto: "Avtomatik",
       general: "Ümumi",
       generate: "SQL yarat",
       explain: "SQL-i izah et",
@@ -3068,6 +3071,11 @@ export default withEnglishFallback({
       exploreSchema: "Sxemi yoxla",
       executeAndExplain: "İşlət və izah et",
       generateNoExec: "Yarat (işlətmədən)",
+    },
+    routing: {
+      recognizing: "Niyyət müəyyən edilir…",
+      chip: "Avtomatik · {action}",
+      switchTo: "{action} seçiminə keç",
     },
     placeholders: {
       general: "Mənə istənilən sualı verin...",
@@ -3098,6 +3106,8 @@ export default withEnglishFallback({
     maxAgentTurnsSaved: "Agentin gediş limiti yadda saxlanıldı",
     defaultAiMode: "Standart AI rejimi",
     defaultAiModeDescription: "Yeni AI söhbətinə başlayarkən istifadə olunan rejim. Cari söhbətdə rejimin dəyişdirilməsi bu parametri dəyişmir.",
+    defaultAutoRouting: "Standart olaraq avtomatik niyyət marşrutlaşdırması",
+    defaultAutoRoutingDescription: "Yeni AI söhbətləri Avtomatik seçimi ilə başlayır: AI göndərərkən niyyətinizi müəyyən edib uyğun əməliyyata yönləndirir. Cari söhbətə təsir etmir.",
     restoreLastConversation: "Son AI söhbətini bərpa et",
     restoreLastConversationDescription: "Aktiv olduqda AI köməkçisi açılarkən boş söhbət əvəzinə ən son yenilənmiş söhbət yüklənir.",
     promptTemplates: "Ssenari sorğu şablonları",
@@ -7225,7 +7235,7 @@ export default withEnglishFallback({
     executeModeCurrent: "Kursorun olduğu əmri icra et",
     defaultTransactionMode: "Standart tranzaksiya təsdiqləmə rejimi",
     defaultTransactionModeDescription:
-      'Yeni SQL redaktoru açıldıqda standart olaraq istifadə olunan tranzaksiya rejimi. "Əl ilə tranzaksiya" seçildikdə yeni redaktorlar əl ilə tranzaksiya rejimində açılır və dəyişiklikləri əl ilə təsdiqləmək və ya geri qaytarmaq tələb olunur; "Avtomatik təsdiqləmə" seçildikdə hər əmr avtomatik təsdiqlənir. Yalnız tranzaksiyaları dəstəkləyən verilənlər bazalarına (PostgreSQL, MySQL, Oracle, JDBC) tətbiq olunur.',
+      'Yeni SQL redaktoru açıldıqda standart olaraq istifadə olunan tranzaksiya rejimi. "Əl ilə tranzaksiya" seçildikdə yeni redaktorlar əl ilə tranzaksiya rejimində açılır və dəyişiklikləri əl ilə təsdiqləmək və ya geri qaytarmaq tələb olunur; "Avtomatik təsdiqləmə" seçildikdə hər əmr avtomatik təsdiqlənir. Yalnız tranzaksiyaları dəstəkləyən verilənlər bazalarına tətbiq olunur.',
     defaultTransactionModeAuto: "Avtomatik təsdiqləmə",
     defaultTransactionModeManual: "Əl ilə tranzaksiya",
     executeAllOnBlankLine: "Boş sətirlərdən bütün SQL-i icra et",

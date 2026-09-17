@@ -1729,6 +1729,9 @@ export const useSettingsStore = defineStore("settings", () => {
   const activeModel = ref<{ configId: string; modelId: string } | null>(null);
   const effortPreferences = ref<AiModelEffortPreference[]>([]);
   const defaultAiMode = ref<AiAssistantMode>("ask");
+  // Opt-in (#9118): new conversations land on the `auto` picker entry only when
+  // the user turned the default on in Settings > AI.
+  const defaultAutoRouting = ref(false);
   const restoreLastConversation = ref(false);
   // Per-db_type prompt template defaults (explicit opt-in) and last-used
   // fallback; both resolved when an AI panel mounts or its namespace changes.
@@ -1933,6 +1936,7 @@ export const useSettingsStore = defineStore("settings", () => {
     const savedSelection = await api.loadAiChatSelection().catch(() => null);
     effortPreferences.value = (savedSelection?.effortPreferences ?? []).filter((preference) => aiConfigs.value.some((config) => config.id === preference.configId));
     defaultAiMode.value = savedSelection?.defaultMode ?? "ask";
+    defaultAutoRouting.value = savedSelection?.defaultAutoRouting ?? false;
     restoreLastConversation.value = savedSelection?.restoreLastConversation ?? false;
     aiDefaultTemplatesByDbType.value = normalizeTemplateIdsByDbType(savedSelection?.defaultTemplatesByDbType);
     aiLastUsedTemplatesByDbType.value = normalizeTemplateIdsByDbType(savedSelection?.lastUsedTemplatesByDbType);
@@ -2074,6 +2078,12 @@ export const useSettingsStore = defineStore("settings", () => {
     persistAiChatSelection();
   }
 
+  function setDefaultAutoRouting(value: boolean) {
+    if (value === defaultAutoRouting.value) return;
+    defaultAutoRouting.value = value;
+    persistAiChatSelection();
+  }
+
   function setRestoreLastConversation(value: boolean) {
     if (value === restoreLastConversation.value) return;
     restoreLastConversation.value = value;
@@ -2140,6 +2150,7 @@ export const useSettingsStore = defineStore("settings", () => {
         selection: { ...preference.selection },
       })),
       defaultMode: defaultAiMode.value,
+      defaultAutoRouting: defaultAutoRouting.value,
       restoreLastConversation: restoreLastConversation.value,
       // Match the backend's skip_serializing_if(empty): omit the per-db_type
       // records entirely while nothing is configured so the payload stays
@@ -2533,6 +2544,8 @@ export const useSettingsStore = defineStore("settings", () => {
     activeEffort,
     defaultAiMode,
     setDefaultAiMode,
+    defaultAutoRouting,
+    setDefaultAutoRouting,
     restoreLastConversation,
     setRestoreLastConversation,
     aiDefaultTemplatesByDbType,

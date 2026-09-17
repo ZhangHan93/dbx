@@ -7465,6 +7465,7 @@ const {
   sql: computed(() => props.sql),
   exportSql: computed(() => props.exportSql),
   tableMeta: computed(() => (props.tableMeta ? { ...props.tableMeta } : undefined)),
+  includeDatabaseName: computed(() => settingsStore.editorSettings.generateSqlIncludeDatabaseName),
   copyInsertTargetLabel: computed(() => props.tableMeta?.tableName ?? props.customSaveHandler?.targetLabel),
   mongoUpdateTarget: computed(() => props.mongoUpdateTarget),
   databaseType: computed(() => props.databaseType),

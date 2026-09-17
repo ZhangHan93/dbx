@@ -1678,6 +1678,7 @@ describe("settingsStore activeModel lifecycle", () => {
         active: undefined,
         effortPreferences: [],
         defaultMode: "ask",
+        defaultAutoRouting: false,
         restoreLastConversation: false,
       }),
     );
@@ -1766,6 +1767,7 @@ describe("settingsStore activeModel lifecycle", () => {
         },
       ],
       defaultMode: "ask",
+      defaultAutoRouting: false,
       restoreLastConversation: false,
     });
   });
@@ -1874,5 +1876,43 @@ describe("settingsStore defaultAiMode lifecycle", () => {
 
     await vi.waitFor(() => expect(saveAiChatSelection).toHaveBeenCalled());
     expect(saveAiChatSelection.mock.calls[0][0]).toMatchObject({ defaultMode: "agent" });
+  });
+
+  it("falls back to disabled auto routing when the saved chat selection has none", async () => {
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+      loadAiChatSelection: vi.fn().mockResolvedValue(null),
+      saveAiChatSelection: vi.fn().mockResolvedValue(undefined),
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+
+    await store.initAiConfigs();
+
+    expect(store.defaultAutoRouting).toBe(false);
+  });
+
+  it("restores and persists the default auto-routing preference", async () => {
+    const saveAiChatSelection = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({
+      loadAiConfigs: vi.fn().mockResolvedValue([]),
+      loadAiConfig: vi.fn().mockResolvedValue(null),
+      loadAiProviderConfigs: vi.fn().mockResolvedValue(null),
+      loadAiChatSelection: vi.fn().mockResolvedValue({ version: 1, effortPreferences: [], defaultAutoRouting: true }),
+      saveAiChatSelection,
+    }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initAiConfigs();
+
+    expect(store.defaultAutoRouting).toBe(true);
+    store.setDefaultAutoRouting(false);
+    store.setDefaultAutoRouting(true);
+
+    await vi.waitFor(() => expect(saveAiChatSelection).toHaveBeenLastCalledWith(expect.objectContaining({ defaultAutoRouting: true })));
   });
 });

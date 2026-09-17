@@ -5605,7 +5605,7 @@ onUnmounted(() => {
                   </Select>
                 </div>
 
-                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2" data-editor-default-transaction-mode>
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2 md:col-span-2" data-editor-default-transaction-mode>
                   <div class="min-w-0 space-y-1">
                     <Label for="editor-default-transaction-mode">{{ t("settings.defaultTransactionMode") }}</Label>
                     <p class="text-xs text-muted-foreground">
@@ -8312,6 +8312,22 @@ LIMIT 100;</pre
                     </button>
                   </div>
                   <div class="flex-1"></div>
+                </div>
+              </div>
+
+              <!-- Default auto intent routing (list mode, global) -->
+              <div v-if="aiConfigListMode === 'list'" class="space-y-3">
+                <Separator />
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
+                    <Label for="ai-default-auto-routing">
+                      {{ t("ai.defaultAutoRouting") }}
+                    </Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("ai.defaultAutoRoutingDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="ai-default-auto-routing" :model-value="settingsStore.defaultAutoRouting" @update:model-value="(value) => settingsStore.setDefaultAutoRouting(Boolean(value))" />
                 </div>
               </div>
 
