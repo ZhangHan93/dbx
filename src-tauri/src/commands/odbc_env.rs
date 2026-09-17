@@ -9,10 +9,19 @@
 //!
 //! **位宽语义（实测，见 DBX-PITFALLS.md §5.4.5）**：
 //!   - 系统 DSN 在 `HKLM` 下**严格按位宽重定向**：64 位进程看不到 32 位建的 DSN，反之亦然；
-//!   - 用户 DSN 在 `HKCU` 下**不重定向**，两个位宽读到的是同一份。
-//! 因此本命令一次性返回**两个位宽视图**的全部 DSN，由前端按连接类型过滤：
-//! 这样即使将来位宽映射改了，也只是「少显示」而不会「显示错」——顺手把
-//! `IM014 驱动程序和应用程序之间的体系结构不匹配` 这个坑从根上堵死。
+//!   - 用户 DSN 在 `HKCU` 下**不重定向**，两个位宽读到的是同一份列表。
+//!
+//! ⚠️ 但「两个位宽读到同一份」**不等于**「两个位宽都能用」。用户 DSN 里存的是
+//! **驱动名**（REG_SZ，如 `Driver do Microsoft Access (*.mdb)`），驱动管理器拿到它
+//! 还要回**本位宽视图**的 `ODBCINST.INI` 查同名子键拿 DLL 路径，查不到就失败——
+//! 64 位进程访问只在 32 位注册的驱动（Jet/Access、老 Oracle 等）正是
+//! `IM014 驱动程序和应用程序之间的体系结构不匹配` 的来源（实测本机 64 位 ODBCINST
+//! 里只有 SQL Server 家族）。所以用户 DSN 的 `view` 不能无条件填两个，必须过一遍
+//! `driver_registered`。
+//!
+//! 本命令返回**两个位宽视图**的 DSN（含 `view` 标记），由前端按连接类型过滤：
+//! 这样即使将来位宽映射改了，也只是「少显示」而不会「显示错」——顺手把 `IM014`
+//! 这个坑从根上堵死。
 
 use serde::Serialize;
 
@@ -125,11 +134,59 @@ fn enumerate() -> Result<Vec<OdbcDsnEntry>, String> {
         out
     }
 
+    /// 某个位宽视图下 `ODBCINST.INI` 里是否存在名为 `driver` 的驱动条目。
+    ///
+    /// 这是「该 DSN 在本位宽下能否被驱动管理器加载」的**权威判据**：管理器拿到
+    /// DSN 记的驱动名后，要回本位宽视图的 `ODBCINST.INI` 下查同名子键拿 DLL 路径，
+    /// 查不到即失败（64 位进程访问只在 32 位注册的驱动 → `IM014 体系结构不匹配`）。
+    ///
+    /// 刻意**不**改成「解析 DSN 的 `Driver` 值、读 PE 头判 32/64 位」：ODBCINST 里
+    /// 存的常是 `%WINDIR%\system32\xxx.dll` 这种**依赖调用方进程位宽**的字面量，
+    /// 32 位进程靠 WOW64 文件重定向才落到 `SysWOW64`。脱离调用方去解析这个路径，
+    /// 方向本身就是错的（实测 `gmd` 的 `Driver` 指向 64 位下并不存在的
+    /// `system32\odbcjt32.dll`，但它作为 32 位 DSN 完全可用）。
+    fn driver_registered(driver: &str, flags: u32) -> bool {
+        if driver.is_empty() {
+            return false;
+        }
+        // 注册表里只有 `\` 是路径分隔符，驱动名不会含它，可以直接拼子键路径。
+        let sub = wide(&format!(r"SOFTWARE\ODBC\ODBCINST.INI\{driver}"));
+        let mut key: HKEY = std::ptr::null_mut();
+
+        // SAFETY: sub 是本函数内在栈上构造的、以 NUL 结尾的宽字符串；
+        // 成功时系统把新句柄写入 key，失败时 key 保持空指针（下方不会关闭它）。
+        let rc = unsafe {
+            RegOpenKeyExW(
+                HKEY_LOCAL_MACHINE,
+                sub.as_ptr(),
+                0,
+                KEY_READ | flags,
+                &mut key,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return false;
+        }
+
+        // SAFETY: key 由上面成功的 RegOpenKeyExW 返回，且仅在此处释放一次。
+        unsafe { RegCloseKey(key) };
+        true
+    }
+
     let mut entries = Vec::new();
 
-    // 用户 DSN：不参与 WOW64 重定向，两个位宽读到同一份 → 一份数据登记到两个视图
+    // 用户 DSN：注册表不参与 WOW64 重定向，两个位宽读到的是同一份列表 —— 但「同一个
+    // DSN 名」不代表「两位宽都能用」，所以逐条按驱动注册情况决定登记到哪个视图。
     for (name, driver) in read_view(HKEY_CURRENT_USER, 0) {
-        for view in ["x64", "x86"] {
+        let in_x64 = driver_registered(&driver, KEY_WOW64_64KEY);
+        let in_x86 = driver_registered(&driver, KEY_WOW64_32KEY);
+
+        // 只在一边注册 → 只登记那一边；两边都注册（SQL Server 家族），或两边都查不到
+        // （驱动名对不上，信息不足时宁可多显示也不凭空隐藏）→ 两个视图都列。
+        for (view, visible) in [("x64", in_x64 || !in_x86), ("x86", in_x86 || !in_x64)] {
+            if !visible {
+                continue;
+            }
             entries.push(OdbcDsnEntry {
                 name: name.clone(),
                 driver: driver.clone(),

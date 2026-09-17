@@ -2659,6 +2659,10 @@ watch(
         sysdba: config.sysdba || isOracleSysUser(config),
         oracle_connection_type: config.oracle_connection_type || "service_name",
         connection_string: config.connection_string,
+        // ODBC 三字段方案下 DSN 独立成字段，不再塞在 connection_string 里。
+        // hydrate 的这个字面量是**手工维护**的：漏字段的症状是「保存能存进去、
+        // 重新编辑却看不到」（`dsn` 就漏过一次），新增表单字段时务必同步加到这里。
+        dsn: config.dsn,
         jdbc_driver_class: config.jdbc_driver_class,
         jdbc_driver_paths: config.jdbc_driver_paths || [],
         redis_connection_mode: config.redis_connection_mode || "standalone",
@@ -3143,10 +3147,13 @@ const usesLocalFilePathInput = computed(() => isLocalFileTypeDb(form.value.db_ty
 
 // ODBC DSN enumeration.
 // DSN lives in the registry (not a connection parameter) and is bitness-scoped:
-// system DSNs are strictly WOW64-redirected, user DSNs are not. The command
-// returns both the x64 and x86 views; we only filter by connection type here so
-// a wrong mapping could ever only hide entries, never show wrong ones - which
-// also rules out IM014 (architecture mismatch) by construction.
+// system DSNs are strictly WOW64-redirected; user DSNs (HKCU) are not redirected,
+// so "the same DSN name is reachable from both bitnesses" does NOT mean its driver
+// can load in both. The backend resolves that per entry by checking whether the
+// DSN's driver name is registered in that bitness' ODBCINST.INI, and only then
+// labels the entry x64 / x86. We merely filter by connection type here, so a DSN
+// whose driver is absent from the selected architecture cannot be picked at all -
+// which is what rules out IM014 (architecture mismatch).
 const odbcDsns = ref<OdbcDsnEntry[]>([]);
 const odbcDsnsLoading = ref(false);
 const odbcDsnView = computed(() => (form.value.db_type === "odbc32" ? "x86" : "x64"));

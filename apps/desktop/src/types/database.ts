@@ -236,8 +236,12 @@ export interface SshConfigHostEntry {
 /**
  * 本机已配置的一条 ODBC DSN（由后端直接读注册表得到）。
  *
- * 位宽语义：系统 DSN（HKLM）按位宽重定向，用户 DSN（HKCU）两个位宽共享同一份。
- * 后端一次性返回 `x64` / `x86` 两个视图的全部条目，前端按连接类型过滤：
+ * 位宽语义：系统 DSN（HKLM）按位宽重定向；用户 DSN（HKCU）两个位宽共享同一份
+ * 注册表列表，但**共享列表 ≠ 驱动两位宽都能加载**——DSN 里存的是驱动名，还要在
+ * 本位宽的 `ODBCINST.INI` 里注册过才能取到 DLL。后端因此逐条判定 `view`：
+ * 驱动只在 32 位注册（Jet/Access 等）的用户 DSN 只会被标成 `x86`。
+ *
+ * 后端返回 `x64` / `x86` 两个视图的条目，前端按连接类型过滤：
  * `odbc` → `x64`，`odbc32` → `x86`。这样即使位宽映射将来变也只会少显示、不会显示错。
  */
 export interface OdbcDsnEntry {
