@@ -26,6 +26,7 @@ const props = defineProps<{
   checkingUpdates: boolean;
   updateCheckFailed: boolean;
   updateDownloadSource: UpdateDownloadSource;
+  updatesDisabled?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -200,7 +201,7 @@ watch(
         <template v-else>
           <div class="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
             <Button v-if="!isCloseBlocked" variant="outline" class="shrink-0" @click="handleCancel">{{ t("dangerDialog.cancel") }}</Button>
-            <Button v-if="updateCheckMessage" class="shrink-0" @click="emit('open-latest-release')">{{ t("updates.openRelease") }}</Button>
+            <Button v-if="updateCheckMessage && !updatesDisabled" class="shrink-0" @click="emit('open-latest-release')">{{ t("updates.openRelease") }}</Button>
           </div>
         </template>
       </DialogFooter>

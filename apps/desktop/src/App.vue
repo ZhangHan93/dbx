@@ -231,6 +231,7 @@ const {
   isIgnoringUpdate,
   activeTaskCount: activeUpdateTaskCount,
   hasUpdateAvailable,
+  updatesDisabled,
   openUrl,
   checkUpdates,
   openLatestRelease,
@@ -4181,6 +4182,7 @@ onUnmounted(() => {
           v-model:open="showUpdateDialog"
           :update-info="updateInfo"
           :update-check-message="updateCheckMessage"
+          :updates-disabled="updatesDisabled"
           :checking-updates="checkingUpdates"
           :update-check-failed="updateCheckFailed"
           :update-download-source="settingsStore.editorSettings.updateDownloadSource"
