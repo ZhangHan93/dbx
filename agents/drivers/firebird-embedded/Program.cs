@@ -7,20 +7,24 @@ using FirebirdSql.Data.FirebirdClient;
 
 // DBX 原生 Firebird Embedded agent：JSON-RPC 2.0 over stdio（换行分隔），启动先输出 {"ready":true}。
 //
-// 骨架克隆自 agents/drivers/odbc/Program.cs（同一个 Agent Protocol v2 multi_session 运行时），
-// 差异只有四处：
+// 骨架克隆自 agents/drivers/odbc/Program.cs（同一个 Agent Protocol v2 运行时），
+// 差异有四处 + 一个总开关：
 //   ① 连接层：OdbcConnection → FbConnection，连接串里带 ClientLibrary=所选引擎 DLL 的绝对路径；
 //   ② ★ 引擎钉死（EnginePinning.cs）：首次 attach 决定引擎后永不变更，绝不同进程加载第二个；
 //   ③ 库识别（FirebirdHeader.cs）：attach 前自读文件头拿 ODS + dialect，ODS 决定用哪套引擎；
-//   ④ 元数据：ODBC 的 conn.GetSchema() → Firebird 的 RDB$ 系统表。
+//   ④ 元数据：ODBC 的 conn.GetSchema() → Firebird 的 RDB$ 系统表；
+//   ⑤ ★★ DeclareMultiSession = false（见下）——与 odbc 驱动最大的行为差异，决定进程模型。
 //
 // 契约（缺一不可，否则 DBX 会在握手后直接 kill 进程并报 Agent RPC error -32000）：
-//   1. handshake 必须返回 protocolVersion >= 2 且 capabilities 为【数组】并含 multi_session；
+//   1. handshake 必须返回 protocolVersion >= 2 且 capabilities 为【数组】；
+//      ⚠️ 本 agent **故意不含** multi_session —— 那正是「每连接一起进程」的实现手段，见下；
 //   2. 必须实现 open_session / close_session / validate_session / cancel_session；
+//      （不声明 multi_session 时 DBX 走 legacy 路径，不注入 agentSessionId，会话 id 回落到 __legacy__）
 //   3. 除 handshake / test_connection / shutdown 外，DBX 会在 params 中注入 agentSessionId；
 //   4. 不同会话的请求可并发到达，响应可乱序，回写 stdout 必须加锁。
 //
-// 参考：agents/docs/agent-protocol-v2.md、agents/common/src/main/resources/agent-protocol-v2.json
+// 参考：agents/docs/agent-protocol-v2.md、agents/common/src/main/resources/agent-protocol-v2.json、
+//       agents/docs/firebird-embedded-plan.zh-CN.md §2.3
 
 internal static class Program
 {
@@ -175,52 +179,61 @@ internal sealed class FirebirdRuntimeServer
     }
 
     /// <summary>
-    /// ★★ 决定「一个 agent 进程服务几个连接」的总开关 —— 唯一需要理解的地方在下面。
+    /// ★★ 决定「一个 agent 进程服务几个连接」的总开关 —— 全驱动唯一需要理解的地方。
     ///
-    /// <para><b>true（当前默认）—— 每个 db_type 共用一个进程。</b></para>
+    /// <para><b>取值 false = 每个连接各起一个 agent.exe。这是 2026-09-18 的定案。</b></para>
     /// <para>
-    /// DBX 的 runtime 缓存键是 <c>agent_key|program|args|working_dir</c>
-    /// （<c>agent_runtime.rs::shared_runtime_key</c>），**与连接 id 无关** ⇒ 声明了
-    /// <c>multi_session</c> 之后，同一个 db_type 的**所有连接都复用同一个 agent.exe**，
-    /// 各占一个 <c>agentSessionId</c>。
-    /// </para>
-    /// <para>
-    /// 代价（已实测并写进 EnginePinning.cs）：同一进程只能钉一套引擎，所以
-    /// **两个 ODS 版本不同的 Firebird 连接无法同时打开** —— 后开的那个会触发
+    /// 为什么必须显式选：DBX 的 runtime 缓存键是 <c>agent_key|program|args|working_dir</c>
+    /// （<c>agent_runtime.rs::shared_runtime_key</c>），**与连接 id 无关** ⇒ 一旦声明了
+    /// <c>multi_session</c>，同一个 db_type 的**所有连接就会复用同一个 agent.exe**
+    /// （各占一个 <c>agentSessionId</c>）。而一个进程只能钉住一套引擎 ⇒
+    /// **两个 ODS 版本不同的 Firebird 连接就无法同时打开**：后开的那个会触发
     /// <c>replace_runtime</c>，把进程连同先开的连接一起换掉（"音乐椅"）。
-    /// 同 ODS 的多个连接（含同一个库文件）**完全正常**。
+    /// 那样「一进程一引擎」就只剩代码纪律在兜底了。
     /// </para>
     ///
-    /// <para><b>false —— 每个连接各起一个 agent.exe（DBX 的旧版兼容路径）。</b></para>
+    /// <para><b>机制（不可省略的一步）：</b></para>
     /// <para>
-    /// 原理：DBX 的 runtime 构造**硬要求** <c>protocolVersion>=2</c> 且 capabilities 含
-    /// <c>multi_session</c>（<c>agent_driver.rs:101-104</c>），否则 kill 进程并抛出
+    /// DBX 的 runtime 构造**硬要求** <c>protocolVersion>=2</c> 且 capabilities 含
+    /// <c>multi_session</c>（<c>agent_driver.rs:101-104</c>），否则直接 kill 进程并抛出
     /// "Agent runtime does not support multi_session protocol v2"；
     /// <c>connection.rs:2651-2681</c> 捕到这句话后改走
-    /// <c>spawn_with_extra_java_args</c>（`spawn_client_for_key` **无条件新起进程、
+    /// <c>spawn_with_extra_java_args</c>（<c>spawn_client_for_key</c> **无条件新起进程、
     /// 不查任何缓存**）并调用 legacy 的 <c>connect</c> 方法（本文件 <c>case "connect"</c>
-    /// → 挂到 <c>__legacy__</c> 会话，后续方法不带 agentSessionId 也能路由）。
-    /// 那条路径上的 <c>try_optional_handshake</c> 对握手**完全宽容**，因此可行。
+    /// → 挂到 <c>__legacy__</c> 会话；后续方法不带 agentSessionId 时由
+    /// <c>RouteToSession</c> 自动回落到同一会话）。
+    /// 那条路径上的 <c>try_optional_handshake</c> 对握手**完全宽容**（任何错误都降级继续），
+    /// 所以「不声明 multi_session」不会导致连接失败，只会让它换一条路。
     /// </para>
-    /// <para>
-    /// 收益：「一个进程一套引擎」从**代码纪律**重新变成**架构保证**，混合 ODS 可并存。
-    /// </para>
-    /// <para>
-    /// 代价（实测上游行为，非猜测）：DBX 对每个连接建 **2 个池**
-    /// （池键 = <c>{connection_id}\0{database}\0{session_role}</c>，role 分
-    /// Metadata / Query）⇒ 每个连接 **2 个进程**、各自加载一套引擎（fb50 含 27 MB
-    /// ICU 数据）⇒ 内存与开连接耗时都翻倍；并且这条路径是上游的
-    /// **旧版兼容分支**，随 DBX 版本演进有被移除的风险（一旦移除就是彻底连不上，
-    /// 而不是优雅降级）。
-    /// </para>
-    /// <para>
-    /// ⚠️ 两个形态的 <c>engines/</c> 布局、文件头识别、方言处理、字符集还原**完全一样**，
-    /// 只有本开关与 EnginePinning 的定位不同。切换后必须重跑
-    /// <c>firebird_agent_probe.py --pin-test</c>（<c>multi_session=false</c> 时该测试
-    /// 的"同进程"前提消失，应改为验证"两个连接 → 两个 agent.exe"）。
-    /// </para>
+    ///
+    /// <para><b>换来的东西：</b>「一个进程一套引擎」从**代码纪律**回到**架构保证**；
+    /// EnginePin 从"唯一防线"降级为**安全网**（正常使用不会触发）；混合 ODS 可并存。</para>
+    ///
+    /// <para><b>代价（实测上游行为，不是猜测）：</b></para>
+    /// <list type="number">
+    /// <item>DBX 对每个连接建 **2 个池**（池键 = <c>{connection_id}\0{database}\0{session_role}</c>，
+    /// role 分 Metadata / Query）⇒ 每个连接 **2 个进程**、各自加载一套引擎
+    /// （fb50 带 27 MB ICU 数据）⇒ 内存占用与开连接耗时都高于共享形态。</item>
+    /// <item>共享 runtime 的构造会先起一个进程、发现没有 multi_session 后 kill 掉，再起真正那个
+    /// ⇒ 每次建池多一次进程启停（握手发生在任何引擎加载之前，所以不会白加载引擎）。</item>
+    /// <item>这条路径是上游的**旧版兼容分支**，随 DBX 版本演进有被移除的风险。
+    /// 一旦被移除，症状是**彻底连不上**（"does not support multi_session protocol v2"）
+    /// 而不是优雅降级 ⇒ 届时把本开关改回 <c>true</c> 即可，其余代码不用动
+    /// （<c>open_session</c> / EnginePin / AgentFault 全部照旧可用）。</item>
+    /// </list>
     /// </summary>
-    const bool DeclareMultiSession = true;
+    /// <remarks>
+    /// 两个形态的 <c>engines/</c> 布局、文件头识别、方言处理、字符集还原**完全一样**，
+    /// 差别只在本开关与 EnginePin 的定位。
+    /// 验证方式：【本形态】两个连接应产生**两个** agent.exe，且可同时打开不同 ODS 的库；
+    /// 【共享形态】同进程里第二个不同 ODS 的库必须返回 <c>replace_runtime</c>
+    /// （<c>firebird_agent_probe.py --pin-test</c> 验的是后者）。
+    ///
+    /// ⚠️ 仍然**保留 v2 与其余能力**，只是不声明 multi_session。
+    /// 不要顺手把 <c>protocolVersion</c> 降成 1：那会让 capability 数组失去意义，
+    /// 也会让握手之后的分支行为更难预测。
+    /// </remarks>
+    const bool DeclareMultiSession = false;
 
     static object Handshake() => new
     {
@@ -232,9 +245,6 @@ internal sealed class FirebirdRuntimeServer
                 "connect", "test_connection", "metadata", "query", "paged_query", "transaction", "ddl",
                 "multi_session"
             }
-            // 注意：**仍然保留 v2 与结构化能力**，只是不声明 multi_session。
-            // 不要顺手把 protocolVersion 降成 1 —— 那会同时关掉 AgentFault 依赖的
-            // legacy hints 解析之外的兼容空间，也会让 capability 数组失去意义。
             : new[]
             {
                 "connect", "test_connection", "metadata", "query", "paged_query", "transaction", "ddl"

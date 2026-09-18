@@ -44,24 +44,19 @@
 //   ⇒ 契约字段名错一个字符就静默退化成 KeepSession，所以 AgentFault.cs 里的常量
 //     不要手改；`firebird_agent_probe.py` 每次都会断言 data 形状。
 //
-// ⚠️ ReplaceRuntime 的已知代价（上游设计使然，不是本驱动引入）：DBX 换进程时会
-//    摘掉**所有复用该 runtime 的连接**（第④步 filter 用的是 uses_runtime，不是连接 id）。
+// ✅ 形态已定（2026-09-18）：`Program.cs::DeclareMultiSession = false`
+//    ⇒ DBX 为**每个连接单起一个 agent.exe**（走 legacy connect 路径），
+//    所以「一个进程只服务一个库」重新成为**架构保证**，本类退化为**安全网**：
+//    正常使用不会触发，触发即说明前提被破坏（上游改了进程模型、或有人把开关改回 true）。
 //
-// ⚠️ **已知限制：混合 ODS 的两个连接会互相踢（"音乐椅"）**。因为同一 db_type 只有
-//    一个 runtime，所以：
-//      · 连接1 = ODS 10（fb25）、连接2 = ODS 13（fb50）同时开着时 ——
-//        谁后开谁赢；先开的那条连接池被摘掉 ⇒ UI 上表现为「另一条连接自己断了」。
-//        用户重新打开它，又反过来把对方踢掉。**交替操作会持续重启 agent 进程**。
-//      · 功能不坏（不会静默混版、不会算错），但**性能与体验都不好**。
-//      · 这是上游缺少「按连接分进程」能力导致的（native agent 的
-//        launch spec = {program: 固定路径, args: [], working_dir: driver_dir(driver_key)}，
-//        见 agent_manager.rs:892-905 ⇒ runtime_key 与连接无关）。
-//    ⇒ **缓解办法（未实施，备选）**：再注册 3 个 driver_key
-//      （firebird-embedded-fb25/30/50），各自 launch config 指向同一个 agent.exe
-//      但带不同 args（args 参与 runtime_key ⇒ 天然分进程），前端各加一个「引擎」
-//      下拉（Auto / 强制 2.5 / 强制 3.0 / 强制 5.0）。仅当用户**必须**同时开混合
-//      ODS 连接时才需要，且要改 yaml + Rust + 前端 ⇒ 走 CI（≈60 min）。
-//      当前不出自动检测是更重要的能力，这条留作后续按需补。
+// ⚠️ 如果哪天把 `DeclareMultiSession` 改回 true：同一 db_type 的所有连接会共用**一个**
+//    进程，于是会出现"音乐椅" —— 连接1 = ODS 10（fb25）与连接2 = ODS 13（fb50）
+//    谁后开谁赢，先开的那条连接池被摘掉（UI 上表现为「另一条连接自己断了」），
+//    重新打开它又反过来把对方踢掉。**功能不坏**（不会静默混版、不会算错数据），
+//    但体验与性能都差。根因是 upstream 的 runtime 缓存键不含连接 id
+//    （`agent_manager.rs:892-905` ⇒ launch spec 恒为 {固定 program, args:[], driver_dir}）。
+//    真要同时开混合 ODS 又不想每连接两进程，才需要"多 driver_key + 引擎下拉"那套
+//    （改 yaml + Rust + 前端 ⇒ 走 CI ≈60 min），当前不必要。
 // ============================================================================
 
 internal enum EngineState

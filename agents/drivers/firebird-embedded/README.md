@@ -14,22 +14,61 @@ Firebird databases are single files (`.fdb` / `.gdb`, and older `.g_b`). Opening
 
 ODBC cannot serve this case: a Firebird ODBC driver is **not** shipped here in x86 form, and Firebird's ODBC driver has no embedded mode at all.
 
-## Architecture constraint: one process, one engine
+## Architecture: one process, one engine
 
-**How many connections share one `agent.exe`?** Not one — it depends on the process-wide mode switch `DeclareMultiSession` in `Program.cs`, and the answer was only settled by reading upstream (2026-09-18), because an earlier *measurement* had said the opposite:
+**One connection = one `agent.exe`.** This is settled by a single switch in `Program.cs`:
 
-| | `DeclareMultiSession = true` (default) | `DeclareMultiSession = false` |
+```csharp
+const bool DeclareMultiSession = false;   // ← the whole design hinges on this line
+```
+
+The handshake deliberately **omits** the `multi_session` capability. DBX then takes its per-process path
+(`AgentRuntimeClient::spawn` rejects the shared runtime with *"Agent runtime does not support multi_session protocol v2"*,
+`agent_driver.rs:101`; the connection falls back to `spawn_client_for_key`, `connection.rs:2651`), and each connection
+gets its own process — actually **two**, one for the Metadata pool and one for the Query pool.
+
+That matters because upstream shared-runtime caching is keyed by `agent_key|program|args|working_dir`
+(`agent_runtime.rs::shared_runtime_key`) — **connection id is not part of the key**. Declaring `multi_session` would
+collapse every connection of a `db_type` into one process, and two databases with different ODS versions would then evict
+each other on every switch (the "musical chairs" failure). With `false`, "one process, one engine" stops being a code
+discipline and becomes an **architectural guarantee**.
+
+> ⚠️ **Open contradiction — do not treat the paragraph above as settled (found 2026-09-18).**
+> The "declaring `multi_session` ⇒ one process per `db_type`" rule is from **static reading of upstream only**, and a real
+> GUI measurement contradicts it. On 2026-09-17, two `odbc32` connections with identical `db_type`, identical
+> `driver_profile` and no `agent_java_options` (verified in `dbx.db`) were opened via the real desktop app and produced
+> **two** `agent.exe` processes — even though the deployed `odbc32/agent.exe` **does** advertise `multi_session`
+> (confirmed by an actual handshake against the shipped binary, not by string scanning). The legacy per-process spawn
+> (`spawn_connection_client`) is reachable **only** through the `multi_session`-rejection fallback
+> (`connection.rs:2656`), so the code says the connections should have shared.
+> Either the shared path is not actually taken for these connections, or the runtime is dropped between opens.
+> **This does not change the safety of `DeclareMultiSession = false`** — refusing the shared runtime yields per-connection
+> processes under either reading. But it does mean the *reason* stated here is under-verified, and it is worth one
+> re-measurement through the GUI before the "musical chairs" claim is used to justify anything else.
+
+Cost of this choice, stated plainly — it is a deliberate trade, not a free win:
+
+- **~2× processes and memory per connection**, plus a slightly slower connect (process start is on the critical path).
+- **The first connect starts a shared runtime that is then killed.** DBX tries the shared path first; our rejection arrives
+  after the process is already up. One wasted spawn per `db_type`, then it stops.
+- **It depends on an upstream legacy-compatibility branch.** If upstream ever removes `spawn_client_for_key`, the failure is
+  not graceful degradation — the connection simply stops working. The fix is one character (`= true`), at the cost of the
+  "musical chairs" behaviour above. This is the one upstream assumption worth re-checking on a DBX upgrade.
+
+| | `DeclareMultiSession = false` (**this build**) | `DeclareMultiSession = true` (rejected) |
 |---|---|---|
-| DBX path | shared runtime | legacy fallback (`spawn_client_for_key`) |
-| Processes | **1 per `db_type`**, N sessions | **2 per connection** (Metadata pool + Query pool) |
-| "One process, one engine" | code discipline + `replace_runtime` recovery | **architectural guarantee** |
-| Two connections, different ODS | ❌ they evict each other | ✅ coexist |
+| DBX path | legacy per-process (`spawn_client_for_key`) | shared runtime |
+| Processes | **2 per connection** (Metadata pool + Query pool) | 1 per `db_type`, N sessions |
+| "One process, one engine" | **architectural guarantee** | code discipline + `replace_runtime` recovery |
+| Two connections, different ODS | ✅ coexist | ❌ they evict each other |
 
-Upstream runtime caching is keyed by `agent_key|program|args|working_dir` (`agent_runtime.rs::shared_runtime_key`) — **connection id is not part of the key** — so declaring `multi_session` collapses every connection of a `db_type` into one process. Dropping `multi_session` makes `AgentRuntimeClient::spawn` reject the shared runtime (`agent_driver.rs:101`), which sends the connection down the legacy per-process path.
+> An earlier note in this project claimed "two connections with an identical `db_type` get two independent processes".
+> That was **measured before multi-session existed**, when every connection still took the legacy path — it was true then,
+> and it is true again now *for this agent* only because we explicitly opt out. It is **not** a property of DBX's agent
+> protocol. Do not rely on it without checking this switch.
 
-> The earlier note "two connections with an identical `db_type` get two independent processes" was measured **before** multi-session was implemented, when every connection took the legacy fallback. It is no longer true for a multi-session agent. Do not rely on it.
-
-Under **both** modes the agent enforces "one engine per process" in code, in `EnginePinning.cs`:
+Even with the architectural guarantee in place, the agent still enforces "one engine per process" in code, in
+`EnginePinning.cs` — now as a **safety net** rather than the primary mechanism:
 
 | # | Rule | Why |
 |---|---|---|
@@ -37,7 +76,10 @@ Under **both** modes the agent enforces "one engine per process" in code, in `En
 | 2 | A request for a *different* engine **fails loudly**; it never loads a second one. | A second engine silently binds to the first `fbclient.dll` and produces a **mixed-version engine**. Its query results are not trustworthy and the module list does not reveal it. |
 | 3 | A failed load marks the engine **unusable** for the whole process. | Closes the "fail → retry → load a different engine" path, which is the most dangerous one. |
 
-Rejection is not a dead end. The error carries `sessionDisposition: "replace_runtime"` (`AgentFault.cs`), and DBX responds by **killing the agent process and starting a fresh one**, so reopening the connection just works. Verified end to end:
+The safety net is not a dead end when it does fire. The error carries `sessionDisposition: "replace_runtime"`
+(`AgentFault.cs`), and DBX responds by **killing the agent process and starting a fresh one**, so reopening the connection
+just works. The agent side of that chain is **directly measured** — one process is handed an ODS 10 database and then an
+ODS 13 database:
 
 ```
 open_session A (ODS 10, fb25)  -> ok
@@ -45,7 +87,18 @@ open_session B (ODS 13, fb50)  -> ERROR ... sessionDisposition = replace_runtime
 list_tables  A (after the rejection) -> ok    (the guard never breaks live sessions)
 ```
 
-> ⚠️ `replace_runtime` makes DBX drop **every connection sharing that runtime**, not just the failing one. In shared mode that means a rejected second connection disconnects the first as well. This is upstream behaviour, and it is why `DeclareMultiSession` is worth revisiting (see the table above).
+> Precision about what is verified where: the sessions above were driven **straight against the agent** (via the probe),
+> and the four-step chain by which DBX turns that error into a replaced runtime is **static reading**
+> (`agent_driver.rs:670` → `agent_driver.rs:718` → `agent_recovery.rs:57` → `connection.rs:736`), not a GUI run.
+> Treat "DBX will start a fresh process" as high-confidence but not measured-through-the-app.
+
+Reaching that error requires two *different* ODS versions in one process, which `DeclareMultiSession = false` makes
+impossible in normal use — so in practice the guard only trips if the upstream process model changes underneath us, or if
+somebody flips the switch. That is exactly what a safety net is for.
+
+> ⚠️ `replace_runtime` makes DBX drop **every connection sharing that runtime**, not just the failing one. That blast radius
+> is the real reason `DeclareMultiSession = false` is the default here: in shared mode, a rejected second connection would
+> also disconnect the first. Disconnecting one connection must never disturb another.
 
 ### Bitness
 

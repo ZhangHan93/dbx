@@ -94,9 +94,9 @@ agent.exe  (x86)   ← 一个连接 = 一个进程（DBX 已实测为连接级�
  └── engines\fb25\  engines\fb30\  engines\fb50\   ← 三套引擎整目录，随 exe 一起打包
 ```
 
-### 2.1 为什么单 exe 就够
+### 2.1 ⚠️ 原判据已失效：「agent 是连接级进程」只在**不声明 `multi_session`** 时成立
 
-**因为 DBX 是连接级进程隔离**（2026-09-17 真机 GUI 实测，证据见
+本方案 v11/施工单最初依据的是 2026-09-17 的真机 GUI 实测（证据见
 `DBX离线包/DBX-agent进程模型与Firebird识别-实测报告-20260917.md`）：
 
 ```
@@ -104,10 +104,66 @@ agent.exe  (x86)   ← 一个连接 = 一个进程（DBX 已实测为连接级�
 双击 Interface  +1s   agent.exe = ['48240','56744']   ← 两个 db_type 完全相同的连接，仍各起独立进程
 ```
 
-⇒ **每个 `agent.exe` 一生只服务一个连接 = 只服务一个库 = 只会加载一个引擎**。
-「同进程多引擎」这个雷，在「一个连接一个进程」的前提下**不会触发**。
+**这个实测是过期的，2026-09-18 读上游源码后推翻**（原结论只在「该 agent 未实现多会话」时成立）：
 
-### 2.2 但「一进程一引擎」已从**架构保证**降级为**代码纪律**（S4-2，必修）
+| 事实 | 代码位置 |
+|---|---|
+| runtime 缓存键 = `"{agent_key}\|{program}\|{args}\|{working_dir}"` —— **不含连接 id、不含库路径** | `crates/dbx-core/src/agent_runtime.rs` `shared_runtime_key()` |
+| 所有 agent 型连接都按该键在 `manager.connection_runtimes` 里**缓存并复用**进程 | `crates/dbx-core/src/connection.rs` `spawn_routed_shared_agent_client()`（`:2600` 起，仅 ZooKeeper 例外） |
+| native agent 的 launch spec **恒为** `{program: 固定路径, args: [], working_dir: driver_dir(driver_key)}` ⇒ 键与连接无关 | `crates/dbx-core/src/agent_manager.rs:892-905` |
+| ⭐ runtime 构造**硬要求** 含 `multi_session`，否则 **kill 进程**并返回那句错误 | `crates/dbx-core/src/db/agent_driver.rs:101-104` |
+| ⭐ 上面那句错误被 `connection.rs:2651-2681` 捕获后改走 **legacy 单会话路径**：`spawn_with_extra_java_args` → `spawn_client_for_key` **无条件新起进程、不查任何缓存**，再调 legacy `connect` | `crates/dbx-core/src/agent_runtime.rs:300-312` |
+| 那条路径上的 `try_optional_handshake` 对握手**完全宽容**（任何错误都降级 continuation） | `crates/dbx-core/src/db/agent_driver.rs:2876-2897` |
+
+⇒ **进程模型由 agent 自己的 `capabilities` 决定**，所以本方案把它做成了**一行开关**
+（`Program.cs` 的 `DeclareMultiSession`）。
+
+🔴 **定案（2026-09-18，用户拍板）：`DeclareMultiSession = false`** —— 取「每连接一个进程」。
+
+| | `DeclareMultiSession = false` ✅ **本方案采用** | `= true`（已否决） |
+|---|---|---|
+| DBX 走哪条路 | legacy fallback（`spawn_client_for_key`） | 共享 runtime |
+| agent.exe 数量 | **每个连接 2 个**（池键 `{conn}\0{db}\0{session_role}`，role 分 Metadata/Query） | **每个 `db_type` 一个**（所有连接共享，各自一个 `agentSessionId`） |
+| 「一进程一引擎」 | **架构保证** | 代码纪律 + `replace_runtime` 兜底 |
+| 两个 ODS 版本不同的连接同时开 | ✅ 各用各的进程 | ❌ **互相踢**（见 §6 N8） |
+| 一条连接出错的影响面 | **只影响它自己** | `replace_runtime` 会摘掉**所有**共享该 runtime 的连接池 |
+| 依赖 | 上游**旧版兼容分支**（无测试覆盖，有被移除风险） | 现代路径（有测试覆盖） |
+
+**为什么宁可依赖旧版分支**：N8 押注（「agent 是连接级进程」）被证伪后，走共享 runtime 就等于把
+「一进程一引擎」退化为代码纪律，同时引入「两条连接互相踢」这个**用户可见**的故障形态。
+而 `= false` 让「一进程一引擎」重新成为**架构保证**，`EnginePinning` 退化为**安全网** ——
+正是方案 N8 的**原始意图**。
+
+> ⚠️ **未闭环矛盾（2026-09-18 复查时发现，必须在正式定稿前解决）**
+>
+> 上表的「`= true` ⇒ 每个 `db_type` 一个进程」**只是静态读码结论，与一次真机 GUI 实测冲突**：
+>
+> | 证据 | 内容 |
+> |---|---|
+> | GUI 实测（2026-09-17 20:13，`DBX-agent进程模型与Firebird识别-实测报告-20260917.md` §2.1） | 两条连接**均为 `odbc32`**、`driver_profile` 均为 `odbc32`、`dbx.db` 里**两边的 `agent_java_options` 键都不存在** ⇒ `shared_runtime_key` 必然相同 ⇒ **按代码应共用 1 个进程**；实际是 **2 个进程**（`disconnect(Interface)` 杀一个、`disconnect(GMD)` 杀另一个） |
+> | 实测握手（2026-09-18，直接 spawn 已部署的 exe 发 `handshake`） | `odbc32\agent.exe` **确实返回** `capabilities=[... ,"multi_session"]` ⇒ 它**没有**走 §2.1 的"不声明"分支 |
+> | 静态调用图（2026-09-18） | legacy 单进程入口 `spawn_connection_client` **仅**被 `spawn_with_extra_java_args` 调用，而后者在 `connection.rs` 里**只出现在 `multi_session` 被拒的回退分支**（`:2656` / `:2738`）⇒ 代码上不存在"另有并行的每连接起进程"通道 |
+>
+> ⇒ **三者不能同时成立。** 要么共享路径对这些连接实际没被走到（`get_or_create_pool_for_session_inner`
+> 之外还有别的入口，或 runtime 在两次 open 之间被 `is_failed()` 摘掉），要么 09-17 那次实测的读法有问题。
+>
+> **对定案的影响**：**不影响安全性** —— `false` 是"主动拒绝共享 runtime"，
+> 无论共享路径在其类型上是否生效，结果都是**每连接一个进程**。
+> 影响的是**理由**与**代价评估**（若共享路径根本不影响 `odbc32`，那 N8 的"证伪"本身需要重判，
+> `= true` 与 `= false` 在进程模型上可能没有区别，代价清单也要重算）。
+> ⇒ **建议：正式定稿前，用现成 CDP 脚本再做一次 GUI 复测**（开两条 `odbc32` 连接数进程数）。
+
+**三条代价（必须写清，这是权衡不是白赚）**：
+1. **进程数与内存约 ×2**（每连接 2 个进程），开连接时多一次进程启动；
+2. **每个 `db_type` 首次连接会白起一个共享 runtime 再被 kill**（DBX 先试共享路径，我们的拒绝在进程起来之后才到达）；
+3. **依赖上游 legacy 兼容分支**。若上游移除 `spawn_client_for_key`，症状是**彻底连不上**（不是优雅降级），
+   届时把这一行改成 `true` 即可恢复 —— 代价是重新接受「音乐椅」。
+
+### 2.2 为什么必须有「引擎钉死」：同进程第二个引擎**必炸**（S4-2）
+
+> 定案取 `DeclareMultiSession = false` 后，正常使用**不会**出现同进程第二个引擎。
+> 但 §2.3 的逃生通道、以及「上游进程模型变化」这个押注，都要求这层护栏**照常实现**——
+> 它从**唯一防线**降级为**安全网**，但那句「绝不静默加载第二个引擎」的纪律不能省。
 
 同进程加载**第二个**引擎**必炸**，2026-09-17 深夜 T4 实测，不可推翻：
 
@@ -123,7 +179,7 @@ agent.exe  (x86)   ← 一个连接 = 一个进程（DBX 已实测为连接级�
 - ⚠️ **假阳性陷阱**：`fb25→fb50→fb30` 顺序下三引擎**真能共存**（16 模块、查询全对），但共享 ALC 与独立 ALC 结果**完全相同** ⇒ 功劳在**顺序**不在隔离；且靠「FB3.0 的 `Engine12` 挂在 FB5.0 的 `fbclient` 上」这种**官方不支持的混版引擎**。
   ⇒ **别测出一次通过就当可行。**
 
-⇒ 结论：单 exe 方案**必须**由 **S4-2 的「引擎钉死」代码**兜底。这是本方案**唯一的架构红线**。
+⇒ 结论：单 exe 方案**必须**保留 **S4-2 的「引擎钉死」代码**。这是本方案**唯一的架构红线**。
 
 **每条纪律（违反必炸）**：
 
@@ -134,6 +190,64 @@ agent.exe  (x86)   ← 一个连接 = 一个进程（DBX 已实测为连接级�
 | ③ | 每套引擎目录**自带完整依赖** | fb25：`fbembed.dll`+`intl\`+`icu*30.dll`+`firebird.msg`；fb30：`fbclient.dll`+`plugins\engine12.dll`+`intl\`+`icu*52*`+`firebird.conf`；fb50：同 fb30 换 `engine13`/`icu*63`+`tzdata\`+`plugins\{srp,legacy_auth,chacha,udr_engine}.dll` |
 | ④ | **FB 2.5 的 DLL 保持原名 `fbembed.dll`**，不要改名为 `fbclient.dll` | 有 `ClientLibrary` 就不必给裸名让路；改名无任何收益 |
 | ⑤ | fb30 / fb50 需 **`ServerMode = SuperClassic`** | 3.0+ 默认 `Super`＝独占，会挡住现场服务（见 §6 N1） |
+
+### 2.3 逃生通道：护栏拒绝 ≠ 死路（2026-09-18 逐环节静态核验）
+
+护栏拒绝的**唯一价值**在于「拒绝之后 DBX 会换一个干净的进程」。这条链路已按代码逐环节核
+验，**环节③是命门：字段名错一个字符就静默退化成 `KeepSession`**，所以 `AgentFault.cs`
+里的常量不要手改。
+
+| # | 环节 | 位置 | 关键点 |
+|---|---|---|---|
+| ① | 分支选择 | `agent_driver.rs:670-674` | **未声明 `structured_error_v1` ⇒ `strict=false` ⇒ 直接 return `Legacy` 分支**（不看契约） |
+| ② | 字段解析 | `agent_driver.rs:718-732` `legacy_agent_hints` | 认 `error.data` 里的 `category` / `retryable` / `sessionDisposition` / `stage` / `operationOutcome` / `agentSessionId`（**camelCase**）；`"replace_runtime"` → `Some(ReplaceRuntime)` |
+| ③ | 决策 | `agent_recovery.rs:57` `from_disposition` | `Some(ReplaceRuntime)` 命中**首臂**，**不校验 category、不校验 `RecoveryScope`** ⇒ 任何调用点都能换进程 |
+| ④ | 执行 | `connection.rs:736-752` | `kill()` runtime + 摘掉所有 `uses_runtime(failed_runtime)` 的连接池，并 `finish_detach` 通知 UI |
+
+⚠️ **不要声明 `structured_error_v1`**：一旦声明就切到严格分支，
+`valid_agent_error_combination()` 会校验 category/stage/outcome 组合，
+不合就变成 `ContractViolation` → `QuarantineSession`，**逃生通道直接失效**。
+`firebird_agent_probe.py` 每次都会断言这一点。
+
+`test_connection` 故意传 `requestRuntimeReplacement: false`：护栏是在**任何东西被加载之前**
+拒绝的，进程还干净，不该因为用户随手点一下"测试连接"就把他在用的其他 Firebird 连接一起杀掉。
+（定案取 `false` 后这条更少被触发，但**语义不变**——安全网不该有副作用。）
+
+### 2.4 S4 真机验证结果（2026-09-18，两轮）
+
+**第一轮：`DeclareMultiSession = true`（后被否决的形态）** —— 产物 md5 `b431ca08…`。
+
+| 用例 | 结果 |
+|---|---|
+| 握手 | `protocolVersion=2` + 数组 + **含** `multi_session` + **未**声明 `structured_error_v1` ✔ |
+| ODS 13.1 库 | `open_session ok` |
+| 非 Firebird 文件（zip） | `not a Firebird database: header page type is 19280, expected 1` ✔ |
+| **客户老库 `病例.g_b`（ODS 10.0 / dialect 1）** | `open_session ok`；`server_version = WI-V2.5.9.27139 Firebird 2.5`；`connection_charset="NONE"`；`engine="fb25"`；`identifierQuote=""` |
+| `list_tables` | `['PTNTBL','TMPTBL','USERTBL']`，**`RDB$*` 泄漏 = 0** |
+| `get_columns('PTNTBL')` | 12 列全对（`RECID INTEGER pk` / `PTNNM VARCHAR(25)` / …） |
+| **方言语义对照（决定性）** | `dia1.fdb`（头 dialect 1）→ `7/2` = **3.5**；`dia3.fdb`（头 dialect 3）→ **3**。⇒ **两端相反，文件头 dialect 必须写进连接串**，不写会**静默算错** |
+| 双引号归一化 | dialect 1 库上 `SELECT … FROM "PTNTBL"` 从 `SQL error -104` 变为可执行 ✔ |
+| **引擎钉死（决定性）** | 同进程 `fb25 → fb50` 与 `fb50 → fb25` 均返回 `sessionDisposition=replace_runtime`；**会话 A 复查仍可用**（护栏不破坏已有会话）✔ |
+| 同引擎共存 | 同进程两个 ODS13 库（不同文件）、以及**同一个文件开两个会话**，均 `ok` ✔ |
+
+**第二轮：`DeclareMultiSession = false`（✅ 定案形态）** —— 产物 md5 `4424e635…`，PE `0x014C`(x86)。
+
+| 用例 | 结果 |
+|---|---|
+| 握手 | `capabilities = ['connect','test_connection','metadata','query','paged_query','transaction','ddl']` —— **故意不含 `multi_session`** ✔ |
+| **legacy 调用形态 · ODS 10.0 老库**（⚠️ 直连 agent 验证，**未经 DBX**） | `connect` / `connection_info` / `list_tables` / `execute_query` / `disconnect` **全部不带 `agentSessionId`** 均 `ok`；`{"engine":"fb25","charset":null,"connection_charset":"NONE","identifierQuote":""}`；`tables=3`、`RDB$*` 泄漏 **0** |
+| **legacy 调用形态 · ODS 13.0**（⚠️ 直连 agent 验证） | `{"engine":"fb50","charset":"NONE","connection_charset":"(default)","identifierQuote":"\""}`；`tables=1`（`T1`）、泄漏 **0** |
+| **方言对照（同一探针，两条库）** | od10 `SELECT 7/2` = **`3.5`**；ods13 = **`3`** ✔ —— 与第一轮结论一致 |
+| **安全网 pin-test** | 同进程 `fb50 → fb25` 仍返回 `sessionDisposition=replace_runtime`，会话 A 复查 `ok` ✔（证明护栏在 legacy 路径上照常工作） |
+| 反例 | `fake.zip` → `connect: ERROR not a Firebird database: header page type is 19280, expected 1` ✔ |
+
+⚠️ **两个尚未闭环的验证**：
+1. **中文字符集还原未在真机验证到** —— `病例.g_b` 的文字列（`PTNNM`/`PTNSEX`）真实值多为
+   `NULL`，`FirebirdText` 只做到编译级验证。要闭环得找一个真有 GBK 文本的 NONE 字符集库。
+2. **测试 adapter 的宽度断言是"假绿"** —— `apps/desktop/src-tauri/tests/adapters/dataGridSql.rs`
+   与 `crates/dbx-core/src/sql_dialect/capabilities.rs` 里都有 `SELECT 7/2`，
+   但**只有 dialect 3 的库**，所以「dialect 没写进连接串」这个坑在现有单测里**检测不到**。
+   要扩成"双方言库各验一次"，否则永远是绿的。
 
 ---
 
@@ -337,12 +451,20 @@ Firebird 引擎加载失败（fb50）: <原始错误>
 static object Handshake() => new {
     protocolVersion = 2,
     agentProtocolVersion = 2,          // ★ 必须与 protocolVersion 同时给
-    capabilities = new[] {             // ★ 必须是数组，且必须含 multi_session
-        "connect","test_connection","metadata","query","paged_query","transaction","ddl","multi_session"
+    capabilities = new[] {             // ★ 必须是数组；★ 故意【不含】multi_session
+        "connect","test_connection","metadata","query","paged_query","transaction","ddl"
     }
 };
 ```
-`agent_driver.rs` 硬校验：`protocolVersion >= 2` + `capabilities` **是数组** + 含 `multi_session`。违反 ⇒ `Agent runtime does not support multi_session protocol v2` ⇒ **agent 被杀**，之后**所有**调用都是 `-32000`。
+🔴 **本 agent 故意不声明 `multi_session`**（见 §2.1 定案）。这不是笔误：
+`agent_driver.rs` 硬校验 `protocolVersion >= 2` + `capabilities` **是数组** + 含 `multi_session`，
+**缺 `multi_session` 时它 kill 掉共享 runtime 并抛** `Agent runtime does not support multi_session protocol v2`，
+该错误被 `connection.rs:2651-2681` 捕获后**改走 legacy 单会话路径**（`spawn_client_for_key`，无条件新起进程）。
+⇒ 这正是"每连接一个进程"的实现手段，也是"一进程一引擎"从代码纪律升回**架构保证**的关键。
+⚠️ 若把 `multi_session` 加回去：agent **仍能跑**（切到共享 runtime 路径），但会变成
+"同一 `db_type` 的所有连接共用一个进程" ⇒ 混合 ODS 互踢。改这一处等于改架构建模，必须同步改 §2.1 与 README。
+⚠️ 仍然**不要声明 `structured_error_v1`**（见 §2.3：声明后逃生通道失效）。
+`firebird_agent_probe.py` 每次都会断言这两点（含 `connect`、**不含** `multi_session`、**不含** `structured_error_v1`）。
 
 **S4-4 会话契约**：必须实现 `open_session` / `close_session` / `validate_session` / `cancel_session`（除 `handshake`/`test_connection`/`shutdown` 外，DBX 会自动注入 `agentSessionId`）。
 - 不同会话**可并发、响应可乱序**（按 `id` 关联）⇒ **回写 stdout 必须加锁**；同一会话内**串行**。
@@ -610,7 +732,9 @@ cd "$SRC"
 | **N5** | x86 agent 的 2 GB 地址空间上限（大库/大结果集） | 未评估 | 首版观察；必要时再议 x64 引擎分支 |
 | **N6** | `list_databases` 在 `singleDatabase: true` 下的预期行为 | 未确认 | 照抄 access/odbc 的行为，真机确认树形态（是否出现数据库层级） |
 | **N7** | 上游 MCP（0.4.89）**看不见 `odbc32`**（静默丢弃未知 `db_type`）⇒ 新增 `firebird-embedded` **同样看不见** | 已确认 | **自研类型的功能验证只能走桌面程序**；若需 MCP 支持要同步改 MCP server 的已知类型表 |
-| **N8** | ⚠️ **本方案押注「agent 是连接级进程」**——这是**上游实现细节、不是契约**。若上游改成 `agent_key` 级进程池（多连接共享一个 `agent.exe`），「一进程一引擎」前提即失效 | 未验（当前实测为连接级：两个同 `db_type` 连接各起独立进程） | `PinEngine` 会以**明确报错**形式暴露（而不是静默混版）；届时引入 `fbhost.exe` 子进程池即可恢复隔离 |
+| **N8** | ⚠️ **已定案（原押注被推翻）**：运行时**不是**连接级进程隔离。同一 `db_type` 的连接**共用一个 `agent.exe`**（除非 agent 不声明 `multi_session`，见 §2.1）。⇒ **两个 ODS 版本不同的 Firebird 连接无法同时打开**：后开的那条会触发 `replace_runtime`，把进程连同先开的连接一起换掉（"音乐椅"） | **已验（静态读上游 + 探针实测）**：`open_session B` 返回 `sessionDisposition=replace_runtime`，会话 A 不受护栏影响仍可用；`replace_runtime_after_open_failure` 摘的是**所有 `uses_runtime(failed_runtime)` 的连接池**（含 A）。（⚠️ 但 09-17 的 GUI 实测与本节的静态结论**冲突**，见 **N10**） | ① 同 ODS 的多个连接（含同一个库文件）**完全正常**；② 需要同时开混合 ODS ⇒ 把 `DeclareMultiSession` 改成 `false`（一行，无需 CI）；③ 或走"多 driver_key + 引擎下拉"方案（要动 yaml+Rust+前端 ⇒ 走 CI），见 N9 |
+| **N9** | `DeclareMultiSession` 取 true（1 进程/db_type，混合 ODS 互踢）还是 false（2 进程/连接，架构保证但依赖旧版兼容分支） | ✅ **已定案（2026-09-18 用户拍板）＝ `false`** | 取 `false` ⇒ 每连接一起进程，「一进程一引擎」由**架构保证**，`EnginePinning` 退化为安全网。代价见 §2.1「三条代价」 |
+| **N10** | ⚠️ **§2.1 的「声明 `multi_session` ⇒ 每 `db_type` 一个进程」与 09-17 GUI 实测（2 × `odbc32` → 2 进程）矛盾** | **未闭环（2026-09-18 复查时发现）** | 用现成 CDP 脚本再做一次 GUI 复测：开两条 `odbc32` 连接数进程数。**不影响 `false` 的安全性**（两种读法下都是每连接一进程），但影响 N8「证伪」是否成立、以及代价清单是否需要重算。详见 §2.1 的 ⚠️ 块 |
 
 ---
 
