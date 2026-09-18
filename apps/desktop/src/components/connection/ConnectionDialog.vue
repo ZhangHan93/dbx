@@ -6108,7 +6108,7 @@ async function browseKafkaKerberosFile(target: "keytab" | "krb5") {
 async function browseDbFilePath() {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const filters = form.value.db_type === "duckdb" ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }] : form.value.db_type === "access" ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }] : form.value.db_type === "h2" ? [{ name: "H2", extensions: ["db"] }] : form.value.db_type === "firebird-embedded" ? [{ name: "Firebird Database", extensions: ["fdb", "gdb"] }] : undefined;
+    const filters = form.value.db_type === "duckdb" ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }] : form.value.db_type === "access" ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }] : form.value.db_type === "h2" ? [{ name: "H2", extensions: ["db"] }] : form.value.db_type === "firebird-embedded" ? [{ name: "Firebird Database", extensions: ["fdb", "gdb"] }, { name: "All Files", extensions: ["*"] }] : undefined;
     const selected = await open({
       title: "Select Database File",
       multiple: false,
@@ -6949,13 +6949,13 @@ function openExternalUrl(url: string) {
                         </p>
                       </div>
                     </div>
-                    <template v-if="form.db_type === 'h2' || form.db_type === 'access'">
+                    <template v-if="form.db_type === 'h2' || form.db_type === 'access' || form.db_type === 'firebird-embedded'">
                       <div class="grid grid-cols-4 items-center gap-4">
-                        <Label :class="connectionLabelClass">{{ t("connection.user") }}{{ form.db_type === "access" ? t("connection.optionalSuffix") : "" }}</Label>
-                        <Input v-model="form.username" class="col-span-3" :placeholder="form.db_type === 'access' ? '' : 'sa'" />
+                        <Label :class="connectionLabelClass">{{ t("connection.user") }}{{ (form.db_type === "access" || form.db_type === "firebird-embedded") ? t("connection.optionalSuffix") : "" }}</Label>
+                        <Input v-model="form.username" class="col-span-3" :placeholder="form.db_type === 'firebird-embedded' ? 'sysdba' : (form.db_type === 'access' ? '' : 'sa')" />
                       </div>
                       <div class="grid grid-cols-4 items-center gap-4">
-                        <Label :class="connectionLabelClass">{{ t("connection.password") }}{{ form.db_type === "access" ? t("connection.optionalSuffix") : "" }}</Label>
+                        <Label :class="connectionLabelClass">{{ t("connection.password") }}{{ (form.db_type === "access" || form.db_type === "firebird-embedded") ? t("connection.optionalSuffix") : "" }}</Label>
                         <PasswordInput v-model="form.password" class="col-span-3" />
                       </div>
                     </template>
