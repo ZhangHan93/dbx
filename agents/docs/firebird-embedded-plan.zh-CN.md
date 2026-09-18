@@ -94,76 +94,88 @@ agent.exe  (x86)   ← 一个连接 = 一个进程（DBX 已实测为连接级�
  └── engines\fb25\  engines\fb30\  engines\fb50\   ← 三套引擎整目录，随 exe 一起打包
 ```
 
-### 2.1 ⚠️ 原判据已失效：「agent 是连接级进程」只在**不声明 `multi_session`** 时成立
+### 2.1 进程模型定案：桌面端「每连接一个 `agent.exe`」；`DeclareMultiSession = false` 是**防御性绊线**
 
-本方案 v11/施工单最初依据的是 2026-09-17 的真机 GUI 实测（证据见
-`DBX离线包/DBX-agent进程模型与Firebird识别-实测报告-20260917.md`）：
+**先给结论（2026-09-18 协议探针实测 + 上游源码双重确认）：**
+
+- **桌面程序建立连接时，每个连接各起一个 `agent.exe`，与 agent 是否声明 `multi_session` 无关。**
+- `DeclareMultiSession = false` **不是这个结果的原因** —— 它是针对「上游把入口改接到共享路径」的防御。
+- 2026-09-17 那次真机 GUI 实测（两条 `odbc32` → 两个进程）**是对的，从未被推翻**。
+  被推翻的是本施工单早先一版**静态读码结论**：那版把**共享路径**的代码当成了桌面路径。
+
+#### 桌面端实际走的路径（唯一权威）
 
 ```
-双击 GMD        +1s   agent.exe = ['56744']
-双击 Interface  +1s   agent.exe = ['48240','56744']   ← 两个 db_type 完全相同的连接，仍各起独立进程
+DBX GUI   connect_db                       src-tauri/src/commands/connection.rs:1669
+   └─ db_type if is_agent_type(&db_type)                                (:2034)
+        └─ connect_agent_pool                                            (:170)
+             ├─ agent_manager.spawn(db_type, profile)   ← legacy，无条件
+             │    └─ spawn_connection_client → spawn_first_available_client
+             │         → spawn_client_for_key       agent_runtime.rs:300
+             │              → AgentDriverClient::spawn(launch)   ← 新起进程，不查缓存
+             └─ AgentMethod::Connect                    ← legacy connect，不注入 agentSessionId
 ```
 
-**这个实测是过期的，2026-09-18 读上游源码后推翻**（原结论只在「该 agent 未实现多会话」时成立）：
+`spawn_client_for_key` 的关键性质：**无条件新起进程、不查任何缓存、完全不看 capabilities**
+⇒ 每个连接一个 `agent.exe`，与握手怎么声明无关。
+
+#### 实测证据（2026-09-18，协议探针）
+
+把 `odbc32/agent.exe` 换成一个**明确声明 `multi_session`** 的探针 agent（它把收到的每个请求写文件），
+经真实 GUI 打开连接，每条连接收到的**全部**请求恰好是：
+
+```
+handshake        {appVersion:"0.6.15", supportedProtocolVersions:[2]}
+connect          ← 不是 open_session；未注入 agentSessionId
+connection_info
+```
+
+每个连接**恰好一个进程**，且**无 kill/respawn 痕迹**。
+⇒ 一个「声明了 `multi_session`」的 agent 与「不声明」的 agent 在这条路径上被**完全同样对待**，因为它压根不问。
+
+#### 共享 runtime 路径在哪里（它服务的是别的入口）
 
 | 事实 | 代码位置 |
 |---|---|
 | runtime 缓存键 = `"{agent_key}\|{program}\|{args}\|{working_dir}"` —— **不含连接 id、不含库路径** | `crates/dbx-core/src/agent_runtime.rs` `shared_runtime_key()` |
-| 所有 agent 型连接都按该键在 `manager.connection_runtimes` 里**缓存并复用**进程 | `crates/dbx-core/src/connection.rs` `spawn_routed_shared_agent_client()`（`:2600` 起，仅 ZooKeeper 例外） |
+| 该路径的调用者是 `get_or_create_pool_for_session_inner`，**不是**桌面首次连接 | `crates/dbx-core/src/connection.rs:2183`（共享客户端构造在 `:2600` 起，仅 ZooKeeper 例外） |
 | native agent 的 launch spec **恒为** `{program: 固定路径, args: [], working_dir: driver_dir(driver_key)}` ⇒ 键与连接无关 | `crates/dbx-core/src/agent_manager.rs:892-905` |
-| ⭐ runtime 构造**硬要求** 含 `multi_session`，否则 **kill 进程**并返回那句错误 | `crates/dbx-core/src/db/agent_driver.rs:101-104` |
-| ⭐ 上面那句错误被 `connection.rs:2651-2681` 捕获后改走 **legacy 单会话路径**：`spawn_with_extra_java_args` → `spawn_client_for_key` **无条件新起进程、不查任何缓存**，再调 legacy `connect` | `crates/dbx-core/src/agent_runtime.rs:300-312` |
-| 那条路径上的 `try_optional_handshake` 对握手**完全宽容**（任何错误都降级 continuation） | `crates/dbx-core/src/db/agent_driver.rs:2876-2897` |
+| runtime 构造**硬要求**含 `multi_session`，否则 **kill 进程**并返回那句错误 | `crates/dbx-core/src/db/agent_driver.rs:101-104` |
+| 被拒后 `connection.rs:2651-2681` 捕获该错误并改走 legacy `connect` | `crates/dbx-core/src/agent_runtime.rs:300-312` |
 
-⇒ **进程模型由 agent 自己的 `capabilities` 决定**，所以本方案把它做成了**一行开关**
-（`Program.cs` 的 `DeclareMultiSession`）。
+⇒ 共享 runtime 服务于 **MCP / Web / 懒建会话池** 这类入口；**桌面 GUI 首次连接不经过它**。
+「音乐椅」（两条连接互相踢）在那条路上是真实的，在桌面路径上不会发生。
 
-🔴 **定案（2026-09-18，用户拍板）：`DeclareMultiSession = false`** —— 取「每连接一个进程」。
+#### 两条入口对照
 
-| | `DeclareMultiSession = false` ✅ **本方案采用** | `= true`（已否决） |
+| | 桌面 GUI —— `connect_agent_pool` | 共享路径 —— `get_or_create_pool_for_session_inner` |
 |---|---|---|
-| DBX 走哪条路 | legacy fallback（`spawn_client_for_key`） | 共享 runtime |
-| agent.exe 数量 | **每个连接 2 个**（池键 `{conn}\0{db}\0{session_role}`，role 分 Metadata/Query） | **每个 `db_type` 一个**（所有连接共享，各自一个 `agentSessionId`） |
-| 「一进程一引擎」 | **架构保证** | 代码纪律 + `replace_runtime` 兜底 |
-| 两个 ODS 版本不同的连接同时开 | ✅ 各用各的进程 | ❌ **互相踢**（见 §6 N8） |
-| 一条连接出错的影响面 | **只影响它自己** | `replace_runtime` 会摘掉**所有**共享该 runtime 的连接池 |
-| 依赖 | 上游**旧版兼容分支**（无测试覆盖，有被移除风险） | 现代路径（有测试覆盖） |
+| agent 侧 API | `handshake` → **`connect`**（无会话 id） | `handshake` → **`open_session`**（注入 `agentSessionId`） |
+| 每连接进程数 | **1**，恒定 | 每个 `db_type` **1 个**，所有连接共享 |
+| 读 `capabilities` | **不读** | 读 —— 无 `multi_session` 即拒绝 |
+| 两个 ODS 不同的连接同时开 | ✅ 各自独立进程 | ❌ 互相踢（见 §6 N8） |
+| `replace_runtime` 逃生通道 | **不可达**（拒绝只表现为一次连接失败） | ✅ DBX kill 该 runtime 后重起 |
 
-**为什么宁可依赖旧版分支**：N8 押注（「agent 是连接级进程」）被证伪后，走共享 runtime 就等于把
-「一进程一引擎」退化为代码纪律，同时引入「两条连接互相踢」这个**用户可见**的故障形态。
-而 `= false` 让「一进程一引擎」重新成为**架构保证**，`EnginePinning` 退化为**安全网** ——
-正是方案 N8 的**原始意图**。
+#### 🔴 定案（2026-09-18 用户拍板）：`DeclareMultiSession = false`
 
-> ⚠️ **未闭环矛盾（2026-09-18 复查时发现，必须在正式定稿前解决）**
->
-> 上表的「`= true` ⇒ 每个 `db_type` 一个进程」**只是静态读码结论，与一次真机 GUI 实测冲突**：
->
-> | 证据 | 内容 |
-> |---|---|
-> | GUI 实测（2026-09-17 20:13，`DBX-agent进程模型与Firebird识别-实测报告-20260917.md` §2.1） | 两条连接**均为 `odbc32`**、`driver_profile` 均为 `odbc32`、`dbx.db` 里**两边的 `agent_java_options` 键都不存在** ⇒ `shared_runtime_key` 必然相同 ⇒ **按代码应共用 1 个进程**；实际是 **2 个进程**（`disconnect(Interface)` 杀一个、`disconnect(GMD)` 杀另一个） |
-> | 实测握手（2026-09-18，直接 spawn 已部署的 exe 发 `handshake`） | `odbc32\agent.exe` **确实返回** `capabilities=[... ,"multi_session"]` ⇒ 它**没有**走 §2.1 的"不声明"分支 |
-> | 静态调用图（2026-09-18） | legacy 单进程入口 `spawn_connection_client` **仅**被 `spawn_with_extra_java_args` 调用，而后者在 `connection.rs` 里**只出现在 `multi_session` 被拒的回退分支**（`:2656` / `:2738`）⇒ 代码上不存在"另有并行的每连接起进程"通道 |
->
-> ⇒ **三者不能同时成立。** 要么共享路径对这些连接实际没被走到（`get_or_create_pool_for_session_inner`
-> 之外还有别的入口，或 runtime 在两次 open 之间被 `is_failed()` 摘掉），要么 09-17 那次实测的读法有问题。
->
-> **对定案的影响**：**不影响安全性** —— `false` 是"主动拒绝共享 runtime"，
-> 无论共享路径在其类型上是否生效，结果都是**每连接一个进程**。
-> 影响的是**理由**与**代价评估**（若共享路径根本不影响 `odbc32`，那 N8 的"证伪"本身需要重判，
-> `= true` 与 `= false` 在进程模型上可能没有区别，代价清单也要重算）。
-> ⇒ **建议：正式定稿前，用现成 CDP 脚本再做一次 GUI 复测**（开两条 `odbc32` 连接数进程数）。
+**它保证什么**：万一将来上游把桌面入口也接到共享路径上，**不声明 `multi_session` 仍会走 legacy spawn**
+⇒ 依然是每连接一进程，「一进程一引擎」不受上游变化影响。
 
-**三条代价（必须写清，这是权衡不是白赚）**：
-1. **进程数与内存约 ×2**（每连接 2 个进程），开连接时多一次进程启动；
-2. **每个 `db_type` 首次连接会白起一个共享 runtime 再被 kill**（DBX 先试共享路径，我们的拒绝在进程起来之后才到达）；
-3. **依赖上游 legacy 兼容分支**。若上游移除 `spawn_client_for_key`，症状是**彻底连不上**（不是优雅降级），
-   届时把这一行改成 `true` 即可恢复 —— 代价是重新接受「音乐椅」。
+**它的代价**：**在桌面路径上为零**。该路径本来就不复用进程，不存在"多开进程"的额外开销；
+也不存在"先起一个共享 runtime 再被 kill"的浪费（那只发生在共享路径上）。
+唯一影响面是只走共享路径的入口（MCP / Web）：在那边本开关用内存换隔离。
+
+> ⚠️ **本节的早先版本有两处错误，已作废**（2026-09-18 修正）：
+> ① 称 09-17 实测「过期 / 被推翻」—— 实测是对的，错的是把共享路径当桌面路径的那份读码；
+> ② 列了三条「代价」（每连接 2 进程 / 白起一个 runtime / 依赖旧版分支）—— 前两条只发生在共享路径上，
+> 第三条表述也不准确：桌面路径本来就只用 legacy `spawn`，`false` 并未额外增加对旧分支的依赖。
 
 ### 2.2 为什么必须有「引擎钉死」：同进程第二个引擎**必炸**（S4-2）
 
-> 定案取 `DeclareMultiSession = false` 后，正常使用**不会**出现同进程第二个引擎。
-> 但 §2.3 的逃生通道、以及「上游进程模型变化」这个押注，都要求这层护栏**照常实现**——
-> 它从**唯一防线**降级为**安全网**，但那句「绝不静默加载第二个引擎」的纪律不能省。
+> 桌面路径「每连接一进程」已使正常使用**不会**出现同进程第二个引擎（见 §2.1）。
+> 但那层保证来自上游的一个**实现细节**，而不是协议承诺 ⇒ 本护栏必须**照常实现**：
+> 它在桌面路径上是**安全网**（正常不触发），在共享路径上是**唯一防线**。
+> 那句「绝不静默加载第二个引擎」的纪律不能省。
 
 同进程加载**第二个**引擎**必炸**，2026-09-17 深夜 T4 实测，不可推翻：
 
@@ -240,6 +252,7 @@ agent.exe  (x86)   ← 一个连接 = 一个进程（DBX 已实测为连接级�
 | **方言对照（同一探针，两条库）** | od10 `SELECT 7/2` = **`3.5`**；ods13 = **`3`** ✔ —— 与第一轮结论一致 |
 | **安全网 pin-test** | 同进程 `fb50 → fb25` 仍返回 `sessionDisposition=replace_runtime`，会话 A 复查 `ok` ✔（证明护栏在 legacy 路径上照常工作） |
 | 反例 | `fake.zip` → `connect: ERROR not a Firebird database: header page type is 19280, expected 1` ✔ |
+| **★ N10 闭环实验（协议探针，2026-09-18）** | 把 `odbc32/agent.exe` 换成**明确声明 `multi_session`** 的探针 agent（它将收到的每个请求写入文件）：每条连接收到的**全部**请求恒为 `handshake → connect → connection_info`，**从不出现 `open_session`**、**从不注入 `agentSessionId`**；每连接**恰好 1 个进程**，5ms 粒度采样下**无 kill/respawn** ⇒ **桌面路径压根不看 `multi_session`**，09-17 实测正确（结论与代码路径详见 §2.1） |
 
 ⚠️ **两个尚未闭环的验证**：
 1. **中文字符集还原未在真机验证到** —— `病例.g_b` 的文字列（`PTNNM`/`PTNSEX`）真实值多为
@@ -456,15 +469,17 @@ static object Handshake() => new {
     }
 };
 ```
-🔴 **本 agent 故意不声明 `multi_session`**（见 §2.1 定案）。这不是笔误：
-`agent_driver.rs` 硬校验 `protocolVersion >= 2` + `capabilities` **是数组** + 含 `multi_session`，
-**缺 `multi_session` 时它 kill 掉共享 runtime 并抛** `Agent runtime does not support multi_session protocol v2`，
-该错误被 `connection.rs:2651-2681` 捕获后**改走 legacy 单会话路径**（`spawn_client_for_key`，无条件新起进程）。
-⇒ 这正是"每连接一个进程"的实现手段，也是"一进程一引擎"从代码纪律升回**架构保证**的关键。
-⚠️ 若把 `multi_session` 加回去：agent **仍能跑**（切到共享 runtime 路径），但会变成
-"同一 `db_type` 的所有连接共用一个进程" ⇒ 混合 ODS 互踢。改这一处等于改架构建模，必须同步改 §2.1 与 README。
-⚠️ 仍然**不要声明 `structured_error_v1`**（见 §2.3：声明后逃生通道失效）。
-`firebird_agent_probe.py` 每次都会断言这两点（含 `connect`、**不含** `multi_session`、**不含** `structured_error_v1`）。
+🔴 **本 agent 故意不声明 `multi_session`**（见 §2.1 定案）。这不是笔误，但必须**理解它挡的是哪条路**：
+- **桌面路径不受它影响**：桌面走 `connect_db → connect_agent_pool → agent_manager.spawn()`，
+  该路径是 legacy、**完全不读 capabilities** ⇒ 声明与否都是每连接一进程（协议探针实测，见 §2.4）。
+- **它挡的是共享路径**：`agent_driver.rs:101-104` 硬校验 `protocolVersion >= 2` + `capabilities` 是数组 + **含 `multi_session`**；
+  缺 `multi_session` 时它 kill 掉共享 runtime 并抛 `Agent runtime does not support multi_session protocol v2`，
+  该错误被 `connection.rs:2651-2681` 捕获后改走 legacy（`spawn_client_for_key`，无条件新起进程）。
+  ⇒ 于是**即便上游哪天把桌面入口接到共享路径，本 agent 仍会退到 legacy**，一进程一引擎不受影响。
+- ⚠️ 若把 `multi_session` 加回去：**桌面行为不变**（同前），但共享路径会变成
+  "同一 `db_type` 的所有连接共用一个进程" ⇒ 那条路上混合 ODS 互踢。改这一处必须同步改 §2.1 与 README。
+- ⚠️ 仍然**不要声明 `structured_error_v1`**（见 §2.3：声明后逃生通道失效）。
+- `firebird_agent_probe.py` 每次都会断言这两点（含 `connect`、**不含** `multi_session`、**不含** `structured_error_v1`）。
 
 **S4-4 会话契约**：必须实现 `open_session` / `close_session` / `validate_session` / `cancel_session`（除 `handshake`/`test_connection`/`shutdown` 外，DBX 会自动注入 `agentSessionId`）。
 - 不同会话**可并发、响应可乱序**（按 `id` 关联）⇒ **回写 stdout 必须加锁**；同一会话内**串行**。
@@ -663,7 +678,7 @@ if (Test-Path "engines") {
 | 14 | **i18n 保留字符**（裸 `{` `}` `@` `\|` `$`） | **整块表单 body 消失**（外壳/按钮都在，中间不在 DOM） | 本方案**不新增文案**；若加则转义 `{'{'}` 并跑 `validate-i18n.mjs` | 若加文案 |
 | 15 | **self-contained 单文件 exe 冷启动慢** | UI 先报超时、agent 其实还在连 | S3-**F3** 加进 `DRIVER_STARTUP_FLOOR_TYPES`（30s 下限） | 真机首连 |
 | 16 | **共享 agent 方法返回字段必须取并集** | 侧栏能看到分组节点、**展开是空的**（`list_objects` 报 `missing field 'object_type'`） | S4-5：实现前回 Rust 侧核对**非 `Option`** 字段 | 写 agent 时 + 真机展开分组 |
-| 17 | **握手不合规 ⇒ agent 被 kill** | 之后**所有**调用 `-32000` | S4-3 逐字照抄（`protocolVersion:2` + `agentProtocolVersion:2` + **数组** + 含 `multi_session`） | 首个 agent 版本 |
+| 17 | **握手不合规 ⇒ agent 被 kill**（⚠️ **仅共享路径**） | 之后**所有**调用 `-32000` | S4-3 逐字照抄（`protocolVersion:2` + `agentProtocolVersion:2` + **数组**）。⚠️ **桌面路径不做这项校验**（`agent_manager.spawn` 走 legacy，`try_optional_handshake` 对握手完全宽容）⇒ 本行症状**不会在桌面上出现** | 首个 agent 版本 |
 | 18 | **`cancel_session` 放在会话锁内** | 被正在跑的查询挡住（DBX 只给 5s） | S4-4：**必须在会话锁之外** | 写 agent 时 |
 | 19 | **stdout 回写不加锁** | 并发会话响应交错、JSON 撕裂 | S4-4：回写加锁 | 写 agent 时 |
 | 20 | **CI 产物路径写错**（`target/release/dbx.exe` 在 **workspace 根**，不是 `src-tauri/target/`） | run **绿色成功**但 zip 里只有 agent | 取产物后**必须下载核对内容** | 每次取产物 |
@@ -732,9 +747,9 @@ cd "$SRC"
 | **N5** | x86 agent 的 2 GB 地址空间上限（大库/大结果集） | 未评估 | 首版观察；必要时再议 x64 引擎分支 |
 | **N6** | `list_databases` 在 `singleDatabase: true` 下的预期行为 | 未确认 | 照抄 access/odbc 的行为，真机确认树形态（是否出现数据库层级） |
 | **N7** | 上游 MCP（0.4.89）**看不见 `odbc32`**（静默丢弃未知 `db_type`）⇒ 新增 `firebird-embedded` **同样看不见** | 已确认 | **自研类型的功能验证只能走桌面程序**；若需 MCP 支持要同步改 MCP server 的已知类型表 |
-| **N8** | ⚠️ **已定案（原押注被推翻）**：运行时**不是**连接级进程隔离。同一 `db_type` 的连接**共用一个 `agent.exe`**（除非 agent 不声明 `multi_session`，见 §2.1）。⇒ **两个 ODS 版本不同的 Firebird 连接无法同时打开**：后开的那条会触发 `replace_runtime`，把进程连同先开的连接一起换掉（"音乐椅"） | **已验（静态读上游 + 探针实测）**：`open_session B` 返回 `sessionDisposition=replace_runtime`，会话 A 不受护栏影响仍可用；`replace_runtime_after_open_failure` 摘的是**所有 `uses_runtime(failed_runtime)` 的连接池**（含 A）。（⚠️ 但 09-17 的 GUI 实测与本节的静态结论**冲突**，见 **N10**） | ① 同 ODS 的多个连接（含同一个库文件）**完全正常**；② 需要同时开混合 ODS ⇒ 把 `DeclareMultiSession` 改成 `false`（一行，无需 CI）；③ 或走"多 driver_key + 引擎下拉"方案（要动 yaml+Rust+前端 ⇒ 走 CI），见 N9 |
-| **N9** | `DeclareMultiSession` 取 true（1 进程/db_type，混合 ODS 互踢）还是 false（2 进程/连接，架构保证但依赖旧版兼容分支） | ✅ **已定案（2026-09-18 用户拍板）＝ `false`** | 取 `false` ⇒ 每连接一起进程，「一进程一引擎」由**架构保证**，`EnginePinning` 退化为安全网。代价见 §2.1「三条代价」 |
-| **N10** | ⚠️ **§2.1 的「声明 `multi_session` ⇒ 每 `db_type` 一个进程」与 09-17 GUI 实测（2 × `odbc32` → 2 进程）矛盾** | **未闭环（2026-09-18 复查时发现）** | 用现成 CDP 脚本再做一次 GUI 复测：开两条 `odbc32` 连接数进程数。**不影响 `false` 的安全性**（两种读法下都是每连接一进程），但影响 N8「证伪」是否成立、以及代价清单是否需要重算。详见 §2.1 的 ⚠️ 块 |
+| **N8** | 运行时**不是**协议级连接隔离：**共享路径**上同一 `db_type` 的连接共用一个 `agent.exe`（见 §2.1）。**桌面路径**上则每连接一个进程 ⇒ 混合 ODS 可共存 | ✅ **已闭环（2026-09-18 协议探针实测）**：桌面路径实测序列恒为 `handshake → connect → connection_info`，每连接 **1 个进程、无 kill/respawn** ⇒ **桌面不会出现"音乐椅"**。共享路径上的 `replace_runtime` 行为（`open_session B` 返回 `sessionDisposition=replace_runtime`、且 A 的池被一并摘掉）来自**直连 agent + 静态读码**，仅在 MCP / Web 入口生效 | 无需动作（定案形态下桌面已满足）。若将来桌面入口被上游改接到共享路径，由 `Program.cs::DeclareMultiSession = false` 兜住 |
+| **N9** | 是否声明 `multi_session` | ✅ **已定案（2026-09-18 用户拍板）= 不声明** | 桌面路径**不读**该能力 ⇒ 对桌面进程模型**零影响**（实测：声明了的探针 agent 与不声明的待遇完全相同）。它的价值是**防御**：上游若把桌面入口改接到共享路径，不声明仍走 legacy ⇒ 仍每连接一进程。代价在桌面上为零 —— 详见 §2.1 |
+| **N10** | 「声明 `multi_session` ⇒ 每 `db_type` 一进程」与 09-17 GUI 实测（2 × `odbc32` → 2 进程）的矛盾 | ✅ **已闭环（2026-09-18）＝ 早先的静态读码读错了入口** | 根因：`connection.rs:2600` 那套共享路径属于 `get_or_create_pool_for_session_inner`（`:2183`），**桌面 GUI 首次连接不走它**。桌面走 `connect_db` → `connect_agent_pool`（`src-tauri/src/commands/connection.rs:170`）→ `agent_manager.spawn()`（legacy，**不看 capabilities**）。协议探针实测：一个**声明了 `multi_session`** 的 agent 仍只收到 `connect`，每连接 1 个进程。⇒ **09-17 实测是正确的，早先的"证伪"作废** |
 
 ---
 

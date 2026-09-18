@@ -1,18 +1,30 @@
 // ============================================================================
-// ★ S4-2「引擎钉死」—— Firebird Embedded agent 唯一的架构红线（必修）
+// ★ S4-2「引擎钉死」—— Firebird Embedded agent 的第二道防线
 //
 // 为什么需要它
 // ------------
-// 单 exe 架构下「一个进程只加载一套引擎」**没有任何架构保证**，只有代码纪律。
+// 「一个进程只加载一套引擎」在**桌面连接路径**上已由架构保证（每连接一个 agent.exe），
+// 但那条保证来自上游的一个实现细节，而不是协议承诺 ⇒ 必须有代码兜底。
 //
-// ⚠️⚠️ 2026-09-18 读上游源码后**推翻了方案 N8 的前提**：
-//   方案押注「DBX 是连接级进程隔离 ⇒ 一进程一引擎天然成立」。**押注不成立**：
-//     · crates/dbx-core/src/agent_runtime.rs  `shared_runtime_key()`
+// ⚠️ 2026-09-18 两次修正后的准确图景（此前两个版本都写错过，以此为准）：
+//
+//   桌面程序走 `connect_db`（src-tauri/src/commands/connection.rs:1669）
+//     → `db_type if is_agent_type(&db_type)`（:2034）→ `connect_agent_pool`（:170）
+//     → `agent_manager.spawn()` → `spawn_client_for_key`（agent_runtime.rs:300）
+//     ⇒ **无条件新起进程、不查任何缓存、不看 capabilities** ⇒ 每连接一个 agent.exe。
+//   （2026-09-18 协议探针实测：每条连接只收到 handshake → connect → connection_info，
+//     从不出现 open_session，也无 kill/respawn 痕迹；2026-09-17 真机同结论。）
+//
+//   而「共享 runtime」是**另一条入口**：
+//     · crates/dbx-core/src/agent_runtime.rs `shared_runtime_key()`
 //         = "{agent_key}|{program}|{args}|{working_dir}"   ← 不含连接 id、不含库路径
-//     · crates/dbx-core/src/connection.rs     `spawn_routed_shared_agent_client()`
+//     · crates/dbx-core/src/connection.rs:2183 `get_or_create_pool_for_session_inner()`
 //         按该 key 在 `manager.connection_runtimes` 里**缓存并复用** agent 进程
-//   ⇒ 同一个 db_type 的**所有连接共用一个 agent.exe**。
-//   所以「一个进程先后遇到两个不同 ODS 的库」是**正常使用就会发生**的事。
+//     ⇒ 那条路上同一 db_type 的**所有连接共用一个 agent.exe**。
+//   桌面 GUI 首次连接不走它（MCP / Web / 懒建会话池才走）。
+//
+//   ⇒ 本类的定位：桌面路径上是**安全网**（正常不触发）；
+//     共享路径上是**唯一防线**（那条路上一个进程真的会先后遇到不同 ODS 的库）。
 //
 // 而「同进程多引擎」的后果是不可观测的：
 //   · fb30 的 fbclient.dll 一进进程，fb50 的 engine13.dll 就按**基名**命中它
@@ -45,13 +57,22 @@
 //     不要手改；`firebird_agent_probe.py` 每次都会断言 data 形状。
 //
 // ✅ 形态已定（2026-09-18）：`Program.cs::DeclareMultiSession = false`
-//    ⇒ DBX 为**每个连接单起一个 agent.exe**（走 legacy connect 路径），
-//    所以「一个进程只服务一个库」重新成为**架构保证**，本类退化为**安全网**：
-//    正常使用不会触发，触发即说明前提被破坏（上游改了进程模型、或有人把开关改回 true）。
+//    ⇒ 把共享 runtime 入口挡在门外：即便将来上游把桌面入口也接到共享路径上，
+//      本 agent 也不声明 multi_session，因而仍走 legacy spawn ⇒ 仍是每连接一进程。
+//    所以本类退化为**安全网**：正常使用不会触发，触发即说明前提被破坏
+//    （上游改了进程模型、有人把开关改回 true、或某条入口强制走 open_session）。
 //
-// ⚠️ 如果哪天把 `DeclareMultiSession` 改回 true：同一 db_type 的所有连接会共用**一个**
-//    进程，于是会出现"音乐椅" —— 连接1 = ODS 10（fb25）与连接2 = ODS 13（fb50）
-//    谁后开谁赢，先开的那条连接池被摘掉（UI 上表现为「另一条连接自己断了」），
+// ⚠️ 逃生通道（ReplaceRuntime）的可达性**因入口而异**：
+//    · 共享路径：`open_session` 收到本类的 replace_runtime ⇒ DBX kill 该 runtime 并重起
+//      （`connection.rs:736 replace_runtime_after_open_failure`，逐环节静态核验见下）；
+//    · 桌面路径：agent 由 legacy `connect` 驱动，而 `connect_agent_pool` 只会对 Oracle
+//      描述符做重试（`connection.rs:204`）⇒ 此时 replace_runtime 表现为**一条连接失败提示**，
+//      不会自动换进程。这不是实际缺口：桌面路径每连接一进程，本类不会触发。
+//
+// ⚠️ 如果哪天把 `DeclareMultiSession` 改回 true：走共享路径的入口会变成
+//    同一 db_type 的所有连接共用**一个**进程，于是出现"音乐椅" ——
+//    连接1 = ODS 10（fb25）与连接2 = ODS 13（fb50）谁后开谁赢，
+//    先开的那条连接池被摘掉（UI 上表现为「另一条连接自己断了」），
 //    重新打开它又反过来把对方踢掉。**功能不坏**（不会静默混版、不会算错数据），
 //    但体验与性能都差。根因是 upstream 的 runtime 缓存键不含连接 id
 //    （`agent_manager.rs:892-905` ⇒ launch spec 恒为 {固定 program, args:[], driver_dir}）。

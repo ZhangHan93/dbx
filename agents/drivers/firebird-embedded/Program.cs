@@ -13,14 +13,15 @@ using FirebirdSql.Data.FirebirdClient;
 //   ② ★ 引擎钉死（EnginePinning.cs）：首次 attach 决定引擎后永不变更，绝不同进程加载第二个；
 //   ③ 库识别（FirebirdHeader.cs）：attach 前自读文件头拿 ODS + dialect，ODS 决定用哪套引擎；
 //   ④ 元数据：ODBC 的 conn.GetSchema() → Firebird 的 RDB$ 系统表；
-//   ⑤ ★★ DeclareMultiSession = false（见下）——与 odbc 驱动最大的行为差异，决定进程模型。
+//   ⑤ ★★ DeclareMultiSession = false（见下）——不是进程模型的成因，而是对上游入口变化的防御。
 //
 // 契约（缺一不可，否则 DBX 会在握手后直接 kill 进程并报 Agent RPC error -32000）：
 //   1. handshake 必须返回 protocolVersion >= 2 且 capabilities 为【数组】；
-//      ⚠️ 本 agent **故意不含** multi_session —— 那正是「每连接一起进程」的实现手段，见下；
+//      ⚠️ 本 agent **故意不含** multi_session —— 目的是把「共享 runtime」这条入口挡在门外，
+//         与桌面端的「每连接一进程」无关（桌面走 legacy spawn，压根不看 capabilities）；
 //   2. 必须实现 open_session / close_session / validate_session / cancel_session；
-//      （不声明 multi_session 时 DBX 走 legacy 路径，不注入 agentSessionId，会话 id 回落到 __legacy__）
-//   3. 除 handshake / test_connection / shutdown 外，DBX 会在 params 中注入 agentSessionId；
+//      （桌面端不注入 agentSessionId，会话 id 回落到 __legacy__；共享入口才会用到 open_session）
+//   3. 除 handshake / test_connection / shutdown 外，DBX 可能在 params 中注入 agentSessionId；
 //   4. 不同会话的请求可并发到达，响应可乱序，回写 stdout 必须加锁。
 //
 // 参考：agents/docs/agent-protocol-v2.md、agents/common/src/main/resources/agent-protocol-v2.json、
@@ -179,59 +180,45 @@ internal sealed class FirebirdRuntimeServer
     }
 
     /// <summary>
-    /// ★★ 决定「一个 agent 进程服务几个连接」的总开关 —— 全驱动唯一需要理解的地方。
+    /// ★★ <c>multi_session</c> 声明开关 —— 对**未来**的防御性绊线，不是当前进程模型的成因。
     ///
-    /// <para><b>取值 false = 每个连接各起一个 agent.exe。这是 2026-09-18 的定案。</b></para>
+    /// <para><b>取值 false。桌面程序根本不看这个开关（2026-09-18 实测修正）。</b></para>
     /// <para>
-    /// 为什么必须显式选：DBX 的 runtime 缓存键是 <c>agent_key|program|args|working_dir</c>
-    /// （<c>agent_runtime.rs::shared_runtime_key</c>），**与连接 id 无关** ⇒ 一旦声明了
-    /// <c>multi_session</c>，同一个 db_type 的**所有连接就会复用同一个 agent.exe**
-    /// （各占一个 <c>agentSessionId</c>）。而一个进程只能钉住一套引擎 ⇒
-    /// **两个 ODS 版本不同的 Firebird 连接就无法同时打开**：后开的那个会触发
-    /// <c>replace_runtime</c>，把进程连同先开的连接一起换掉（"音乐椅"）。
-    /// 那样「一进程一引擎」就只剩代码纪律在兜底了。
+    /// 桌面端连接入口是 <c>connect_db</c>（<c>src-tauri/src/commands/connection.rs:1669</c>）
+    /// → <c>db_type if is_agent_type(&amp;db_type)</c>（<c>:2034</c>）→ <c>connect_agent_pool</c>
+    /// （<c>:170</c>）→ <c>agent_manager.spawn()</c> → <c>spawn_client_for_key</c>
+    /// （<c>agent_runtime.rs:300</c>）⇒ **无条件新起一个进程、不查任何缓存、不看 capabilities**，
+    /// 随后调 legacy 的 <c>connect</c>。所以「每连接一个 agent.exe」在桌面上是**既有事实**，
+    /// 与本开关无关：2026-09-18 用协议探针（明确声明 <c>multi_session</c> 的假 agent）实测，
+    /// 每条连接只收到 <c>handshake → connect → connection_info</c>，**从不出现
+    /// <c>open_session</c>**，也无 kill/respawn 痕迹。
     /// </para>
     ///
-    /// <para><b>机制（不可省略的一步）：</b></para>
     /// <para>
-    /// DBX 的 runtime 构造**硬要求** <c>protocolVersion>=2</c> 且 capabilities 含
-    /// <c>multi_session</c>（<c>agent_driver.rs:101-104</c>），否则直接 kill 进程并抛出
-    /// "Agent runtime does not support multi_session protocol v2"；
-    /// <c>connection.rs:2651-2681</c> 捕到这句话后改走
-    /// <c>spawn_with_extra_java_args</c>（<c>spawn_client_for_key</c> **无条件新起进程、
-    /// 不查任何缓存**）并调用 legacy 的 <c>connect</c> 方法（本文件 <c>case "connect"</c>
-    /// → 挂到 <c>__legacy__</c> 会话；后续方法不带 agentSessionId 时由
-    /// <c>RouteToSession</c> 自动回落到同一会话）。
-    /// 那条路径上的 <c>try_optional_handshake</c> 对握手**完全宽容**（任何错误都降级继续），
-    /// 所以「不声明 multi_session」不会导致连接失败，只会让它换一条路。
+    /// <b>那它还有什么用：</b>共享 runtime 那条路
+    /// （<c>AgentRuntimeClient::spawn</c> + <c>open_session</c>，缓存键
+    /// <c>agent_key|program|args|working_dir</c>，<c>agent_runtime.rs::shared_runtime_key</c>，
+    /// **与连接 id 无关**）属于**另一个入口**
+    /// <c>ConnectionManager::get_or_create_pool_for_session_inner</c>（<c>connection.rs:2183</c>），
+    /// 桌面 GUI 首次连接不走它（MCP / Web / 懒建会话池才走）。
+    /// 万一哪天上游把 GUI 入口也接到那条路上，声明 <c>multi_session</c> 就会让同一 db_type 的
+    /// **所有连接共用一个进程** —— 而一个进程只能钉住一套引擎 ⇒ 两个 ODS 不同的库无法同时打开
+    /// （后开的触发 <c>replace_runtime</c>，把先开的连接一并换掉，即"音乐椅"）。
+    /// <b>不声明就是针对这种未来的防御：届时仍走 legacy，一进程一引擎不受影响。</b>
     /// </para>
     ///
-    /// <para><b>换来的东西：</b>「一个进程一套引擎」从**代码纪律**回到**架构保证**；
-    /// EnginePin 从"唯一防线"降级为**安全网**（正常使用不会触发）；混合 ODS 可并存。</para>
-    ///
-    /// <para><b>代价（实测上游行为，不是猜测）：</b></para>
-    /// <list type="number">
-    /// <item>DBX 对每个连接建 **2 个池**（池键 = <c>{connection_id}\0{database}\0{session_role}</c>，
-    /// role 分 Metadata / Query）⇒ 每个连接 **2 个进程**、各自加载一套引擎
-    /// （fb50 带 27 MB ICU 数据）⇒ 内存占用与开连接耗时都高于共享形态。</item>
-    /// <item>共享 runtime 的构造会先起一个进程、发现没有 multi_session 后 kill 掉，再起真正那个
-    /// ⇒ 每次建池多一次进程启停（握手发生在任何引擎加载之前，所以不会白加载引擎）。</item>
-    /// <item>这条路径是上游的**旧版兼容分支**，随 DBX 版本演进有被移除的风险。
-    /// 一旦被移除，症状是**彻底连不上**（"does not support multi_session protocol v2"）
-    /// 而不是优雅降级 ⇒ 届时把本开关改回 <c>true</c> 即可，其余代码不用动
-    /// （<c>open_session</c> / EnginePin / AgentFault 全部照旧可用）。</item>
-    /// </list>
+    /// <para><b>代价：桌面上为零。</b>该路径本来就不复用进程，不存在"多开进程"的额外开销；
+    /// 也不存在"先起一个共享 runtime 再被 kill"的浪费（那只发生在共享路径上）。
+    /// 唯一影响面是只走共享路径的入口（MCP / Web）：在那边本开关会拿内存换隔离。</para>
     /// </summary>
     /// <remarks>
-    /// 两个形态的 <c>engines/</c> 布局、文件头识别、方言处理、字符集还原**完全一样**，
-    /// 差别只在本开关与 EnginePin 的定位。
-    /// 验证方式：【本形态】两个连接应产生**两个** agent.exe，且可同时打开不同 ODS 的库；
-    /// 【共享形态】同进程里第二个不同 ODS 的库必须返回 <c>replace_runtime</c>
-    /// （<c>firebird_agent_probe.py --pin-test</c> 验的是后者）。
-    ///
     /// ⚠️ 仍然**保留 v2 与其余能力**，只是不声明 multi_session。
     /// 不要顺手把 <c>protocolVersion</c> 降成 1：那会让 capability 数组失去意义，
     /// 也会让握手之后的分支行为更难预测。
+    ///
+    /// 两个形态的 <c>engines/</c> 布局、文件头识别、方言处理、字符集还原**完全一样**。
+    /// 验证方式见 <c>firebird_agent_probe.py</c>（<c>--legacy</c> 验生产路径、
+    /// <c>--pin-test</c> 验同进程换引擎必须返回 <c>replace_runtime</c>）。
     /// </remarks>
     const bool DeclareMultiSession = false;
 
