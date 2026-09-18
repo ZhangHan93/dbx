@@ -11,10 +11,10 @@
 
 | 项 | 定案 | 依据 |
 |---|---|---|
-| agent 形态 | **两个 exe**：`agent.exe`（调度层，**零 native**）+ `fbhost.exe`（引擎宿主，**每引擎一实例**） | v11 §3.1；多引擎同进程已被证伪不可依赖 |
+| agent 形态 | ★**单 exe**：`agent.exe` 进程内加载引擎，**不做 `fbhost.exe`**。靠**连接级进程隔离**（DBX 已实测）+ **引擎钉死纪律**（S4-2，必修）保证「一进程一引擎」 | 2026-09-18 决策；依据见 §2 |
 | agent 位宽 | **只编 x86** | ODS 10 必须 32 位引擎（FB 2.5 无 x64 embedded）；fb30/fb50 也用 x86 引擎，同进程位宽才能共存 |
 | 引擎 | `fb25`(2.5.9) / `fb30`(3.0.14) / `fb50`(5.0.4)，**全 Win32 x86**，共 **89 MB**；**fb40 不需要** | ODS 与引擎严格一一对应（非向下兼容） |
-| 引擎随谁走 | **不进 git、不进 CI**；CI 只产 `agent.exe` + `fbhost.exe`，引擎在**打包/部署时**本地拷入 | 保持仓库轻、CI 快；引擎可直接从 firebirdsql.org 复现 |
+| 引擎随谁走 | **不进 git、不进 CI**；CI 只产 `agent.exe`，引擎在**打包/部署时**本地拷入 | 保持仓库轻、CI 快；引擎可直接从 firebirdsql.org 复现 |
 | **文件路径存哪个字段** | ★**复用 `host`** —— **不新增 `file_path` 字段** | access / sqlite / duckdb 的既有先例；可**完全绕开「增传参数」整类坑**（见 §1.1） |
 | `formKind` | ★**不写**（走默认 `standard`） | `formKind` 是**闭集**，写 `firebird-embedded` 会直接炸校验器（见 §1.2） |
 | `localFile: true` | 要写 | 一行换到「文件路径输入框 + 浏览按钮 + 副标题 + 必填校验」全套泛化能力 |
@@ -22,7 +22,7 @@
 | 引擎选择 | 开库前**自读文件头**三判据 → 选定引擎 + Dialect | 2026-09-17 实测（13 真库全中 / 6 反例全排除） |
 | 本机可编？ | ✅ **C# agent 分钟级本地可编**（dotnet 10.0.401 已装）⇒ 只有**前端/Rust**改动才要等 CI | 见 §5.2 |
 
-**工作量分解（改动面）**：Rust **5 处**（其中 1 处漏了编译红、1 处漏了**静默算错**）· 前端 **4 处** · 配置 **2 个 yaml + 3 个生成物** · 新代码 **2 个 C# 工程** · CI **1 个 workflow**。
+**工作量分解（改动面）**：Rust **5 处**（其中 1 处漏了编译红、1 处漏了**静默算错**）· 前端 **4 处** · 配置 **2 个 yaml + 3 个生成物** · 新代码 **1 个 C# 工程** · CI **1 个 workflow**。
 
 ---
 
@@ -78,30 +78,52 @@ v11 §3.2 写「追加一条 `dbType: firebird-embedded`」——**错**。它�
 
 ---
 
-## 2. 架构定案（为什么是两个 exe）
+## 2. 架构定案：**单 exe**（进程内加载引擎，不做 `fbhost`）
 
 ```
 DBX (dbx.exe, x64)
  │  spawn，按 agentKey 找 <data>/agents/drivers/firebird-embedded/agent.exe
  ▼
-agent.exe  (x86)  ← 调度层：零 native、不引用 FirebirdClient
+agent.exe  (x86)   ← 一个连接 = 一个进程（DBX 已实测为连接级进程隔离）
  │   · handshake / 会话 / 元数据 / 查询 / 分页 / 取消 / 事务   ← 克隆 odbc 骨架
- │   · 自读文件头 → 选引擎 + 定 Dialect                        ← 不需要 native
- │   · 打开前探测 / 副本兜底 / ODS 前后断言                    ← 不需要 native
- │   · list_tables 等结果做系统表过滤
+ │   · 自读文件头 → 选引擎 + 定 Dialect                        ← 纯托管 IO
+ │   · 打开前探测 / 副本兜底 / ODS 前后断言
+ │   · ★引擎钉死：本进程只允许加载一个引擎（S4-2，必修）
+ │   · FbConnection（进程内）→ ClientLibrary = engines\<key>\<dll> 绝对路径
  │
- │  IPC：stdin/stdout 行式 JSON（复用 JSON-RPC 形状），每引擎一个子进程
- ▼
-fbhost.exe (x86) × N   ← 引擎宿主：**进程内永远只有一个 fbclient/fbembed**
-    argv[1] = fb25 | fb30 | fb50  →  决定 ClientLibrary 指向哪套目录的哪个 DLL
-    里面才是 FbConnection / 连接串拼装
+ └── engines\fb25\  engines\fb30\  engines\fb50\   ← 三套引擎整目录，随 exe 一起打包
 ```
 
-**为什么必须拆**（2026-09-17 深夜实测定案，不可推翻）：
-- 同进程多引擎 = 「**顺序敏感 + 混版引擎 + 不可观测**」。`fb30` 的 `fbclient.dll` 一进进程，`fb50` 的 `engine13.dll` 就按**基名**命中它 → **err=127 找不到入口点**。
-- ALC（AssemblyLoadContext）**只治托管层**（能力标志污染），**治不了 native 插件层**；`Unload()` + 3×GC 后 DLL **仍驻留进程**。
-- 子目录无用（导入表是**裸名**，与磁盘路径无关）；改名更糟（err 127 → **err 126 彻底打不开**）。
-- ⚠️ 假阳性陷阱：`fb25→fb50→fb30` 顺序下三引擎**真能共存**（官方不支持的**混版引擎**组合）⇒ **别测出一次通过就当可行**。
+### 2.1 为什么单 exe 就够
+
+**因为 DBX 是连接级进程隔离**（2026-09-17 真机 GUI 实测，证据见
+`DBX离线包/DBX-agent进程模型与Firebird识别-实测报告-20260917.md`）：
+
+```
+双击 GMD        +1s   agent.exe = ['56744']
+双击 Interface  +1s   agent.exe = ['48240','56744']   ← 两个 db_type 完全相同的连接，仍各起独立进程
+```
+
+⇒ **每个 `agent.exe` 一生只服务一个连接 = 只服务一个库 = 只会加载一个引擎**。
+「同进程多引擎」这个雷，在「一个连接一个进程」的前提下**不会触发**。
+
+### 2.2 但「一进程一引擎」已从**架构保证**降级为**代码纪律**（S4-2，必修）
+
+同进程加载**第二个**引擎**必炸**，2026-09-17 深夜 T4 实测，不可推翻：
+
+| 实测项 | 结果 |
+|---|---|
+| `fb50 → fb30` 同进程 | ⛔ **必炸**（native 插件层 `err=127` —— 加载器按**基名**命中的是第一个进进程的 `fbclient`） |
+| `fb30 → fb50` 同进程 | ⛔ **必炸** |
+| 单个引擎 | **从未失败** |
+| ALC `Unload()` + 3×GC 后 | `fbclient.dll` / `Engine13.DLL` **仍驻留进程**（引擎 attach 后起内部线程/共享内存） |
+
+- **ALC 只治托管层**（provider 能力标志污染），**治不了 native 插件层**（中间隔着 P/Invoke 边界）。
+- **子目录无用**：导入表里是**裸名** `fbclient.dll`，与磁盘路径无关。**改名更糟**：err 127 → **err 126 彻底打不开**。
+- ⚠️ **假阳性陷阱**：`fb25→fb50→fb30` 顺序下三引擎**真能共存**（16 模块、查询全对），但共享 ALC 与独立 ALC 结果**完全相同** ⇒ 功劳在**顺序**不在隔离；且靠「FB3.0 的 `Engine12` 挂在 FB5.0 的 `fbclient` 上」这种**官方不支持的混版引擎**。
+  ⇒ **别测出一次通过就当可行。**
+
+⇒ 结论：单 exe 方案**必须**由 **S4-2 的「引擎钉死」代码**兜底。这是本方案**唯一的架构红线**。
 
 **每条纪律（违反必炸）**：
 
@@ -132,13 +154,12 @@ fbhost.exe (x86) × N   ← 引擎宿主：**进程内永远只有一个 fbclien
 3. 建目录骨架：
    ```
    agents/drivers/firebird-embedded/
-   ├── src/agent/agent.csproj          # 调度层
-   ├── src/fbhost/fbhost.csproj        # 引擎宿主
-   ├── src/agent/Program.cs            # 克隆 ../odbc/Program.cs
-   ├── src/fbhost/Program.cs
+   ├── dbx-agent-firebird-embedded.csproj   # 单工程（照抄 ../odbc/dbx-agent-odbc.csproj + FirebirdClient 包）
+   ├── Program.cs                           # 克隆 ../odbc/Program.cs + S4-2 引擎钉死
    ├── build.ps1
    ├── README.md
-   └── .gitignore                      # bin/ obj/ publish/ engines/
+   ├── .gitignore                           # bin/ obj/ publish/ engines/
+   └── engines/                             # 【不进 git】fb25|fb30|fb50 三套，打包/部署时本地拷入
    ```
 
 ### S1 · 连接类型注册（源 → 生成物）
@@ -264,23 +285,50 @@ cd "$SRC" && "$NODE" scripts/sync-connection-types.mjs
 
 ### S4 · agent 本体（C#，**本地分钟级可编**，不占 CI）
 
-**S4-1 `src/agent/agent.csproj`**（照抄 odbc 的 csproj，换名 + 换包）：
+**S4-1 `dbx-agent-firebird-embedded.csproj`**（照抄 odbc 的 csproj，换名 + 加包）：
 
 ```xml
 <TargetFramework>net8.0</TargetFramework>
 <AssemblyName>dbx-agent-firebird-embedded</AssemblyName>
 <RootNamespace>DbxAgentFirebirdEmbedded</RootNamespace>
 <!-- 其余同 agents/drivers/odbc/dbx-agent-odbc.csproj -->
-<!-- 不引用 FirebirdClient：调度层零 native -->
-```
-
-**S4-2 `src/fbhost/fbhost.csproj`**：
-
-```xml
-<TargetFramework>net8.0</TargetFramework>
-<AssemblyName>dbx-fbhost</AssemblyName>
 <PackageReference Include="FirebirdSql.Data.FirebirdClient" Version="10.*" />
 ```
+> 单 exe 方案下 **agent 自己就要用 `FbConnection`** ⇒ 必须引用 provider（不同于双 exe 的"调度层零 native"）。
+> provider 是**纯托管**的，P/Invoke 按需触发 ⇒ 引用它**不会**在启动时就碰引擎。
+
+**S4-2 ★★★ 引擎钉死 —— 单 exe 方案下**唯一的架构红线（必修，不是可选）
+
+架构不再是「每个引擎一个进程」，所以**必须由代码保证同一个 `agent.exe` 进程只碰一个引擎**。
+
+```csharp
+// 进程级状态：一旦非 null，永不变更
+static string? _pinnedEngine = null;   // "fb25" | "fb30" | "fb50"
+static string? _pinnedDllAbs = null;
+
+static void PinEngine(string engineKey, string dllAbsPath) {
+    if (_pinnedEngine is null) { _pinnedEngine = engineKey; _pinnedDllAbs = dllAbsPath; return; }
+    if (_pinnedEngine != engineKey)
+        throw new InvalidOperationException(
+            $"引擎已钉死为 {_pinnedEngine}，本进程内不允许再加载 {engineKey}。请断开该连接后重新连接。");
+}
+```
+
+| # | 硬性要求 | 为什么 |
+|---|---|---|
+| 1 | **首次 attach 决定引擎，此后永不加载第二个** | native 插件层无解（T4 实测）；第二次加载会**静默**命中第一个 `fbclient` ⇒ 混版引擎 ⇒ 行为了不可预测 |
+| 2 | **需要不同引擎 ⇒ 明确报错，绝不尝试加载** | 静默加载 = 必炸且**不可观测**（模块列表看不出 `Engine12` 实际跑在哪个 `fbclient` 上） |
+| 3 | **加载失败 ⇒ 本进程标记「引擎不可用」，后续请求直接返回同一错误** | 堵死「失败 → 重试 → 换个引擎加载」这条最危险的路径 |
+
+**错误文案必须给出恢复路径**（单 exe 下用户只有这一条路可走）：
+
+```
+Firebird 引擎加载失败（fb50）: <原始错误>
+本进程内无法切换引擎，请【断开该连接】后重新连接。
+```
+
+这与 DBX 行为天然契合：实测 `disconnect` **立即杀 agent.exe**（`t=+0.00s`）⇒
+用户「断开重连」拿到的是**全新进程**，污染自动清零，**不需要任何额外机制**。
 
 **S4-3 握手 —— 逐字照抄 ODBC（三种写错都会被杀进程）**
 
@@ -345,6 +393,7 @@ list.Add(new {
 - **两个偏移历史坑**：`+0x00` 是**页类型**（header=1）**不是** pageno（曾用 `==0` 判据 ⇒ 全部真库误判为非 FB）；`+0x13` 在 ODS 11+ 是 `0x80` **标志位**，**不是** minor。
 - **Dialect**：`+0x2A` u16 的 **bit4** 置位 ⇒ dialect 3，否则 1。**必须显式写进连接串**（客户库 dialect 1，不写吃 provider 默认 3 ⇒ `SELECT 7/2` 得 **3** 而非 **3.5**，**不报错但算错数**）。
 - 读 `0x60` 字节即可，**不需要引擎**。
+⇒ **选定引擎后立刻 `PinEngine(engineKey, dllAbs)`（S4-2），把选择钉死在本进程上。**
 
 **S4-7 兜底要分两档**（错误提示才有指导性）：
 `① / ②` 不过 ⇒ **「不是 Firebird 数据库」**；`③` ODS 不在表内 ⇒ **「是 Firebird，但版本 N.M 未覆盖」**。
@@ -372,7 +421,9 @@ if (plan == Copy) {
 }
 // 红线断言：开库前后各读一次文件头，ODS 必须不变
 var h0 = ReadHeader(target);
-var reply = FbHost(target, engineKey).Open(target, user, pwd, dialect: h0.Dialect);
+var dllAbs = Path.Combine(enginesRoot, EngineDir(engineKey), EngineDll(engineKey));  // 纪律①：绝对路径
+PinEngine(engineKey, dllAbs);                          // S4-2：钉死；第二次换引擎会抛，绝不静默加载
+var reply = OpenInProcess(target, user, pwd, dialect: h0.Dialect, clientLibrary: dllAbs);
 var h1 = ReadHeader(target);
 if ((h1.Major, h1.Minor) != (h0.Major, h0.Minor))
     throw new InvalidOperationException($"ODS changed {h0.Major}.{h0.Minor} -> {h1.Major}.{h1.Minor}");
@@ -386,22 +437,28 @@ if ((h1.Major, h1.Minor) != (h0.Major, h0.Minor))
 **S4-9 系统表过滤**（ODBC 踩过：agent 拿到类型却不按类型过滤 ⇒ 冒出 `MSys*`）：
 Firebird 侧对应的是 `RDB$*` 系统表 + 少量视图 ⇒ 按 `RDB$SYSTEM_FLAG` / 表名前缀滤掉，**并在源码里注释说明**。
 
-**S4-10 `build.ps1`（只编 x86，两个工程）**
+**S4-10 `build.ps1`（只编 x86，单工程）**
 
 ```powershell
 $ErrorActionPreference = "Stop"
-dotnet publish src/agent/agent.csproj   -c Release -r win-x86 --self-contained true -p:PublishSingleFile=true -o publish
-dotnet publish src/fbhost/fbhost.csproj -c Release -r win-x86 --self-contained true -p:PublishSingleFile=true -o publish
-Copy-Item "publish/dbx-agent-firebird-embedded.exe" "publish/agent.exe"  -Force
-Copy-Item "publish/dbx-fbhost.exe"                  "publish/fbhost.exe" -Force
+dotnet publish dbx-agent-firebird-embedded.csproj -c Release -r win-x86 `
+    --self-contained true -p:PublishSingleFile=true -o publish
+Copy-Item "publish/dbx-agent-firebird-embedded.exe" "publish/agent.exe" -Force
 # 三套引擎【整目录】拷进 publish —— 原生 DLL 不会被单文件打包
-foreach ($k in 'fb25_x86','fb30_x86','fb50_x86') {
-    Copy-Item "engines/$k/*" "publish/engines/$k/" -Recurse -Force
+# ⚠️ CI 上 engines/ 不存在（不进 git）⇒ 必须加守卫，否则 CI 直接红
+if (Test-Path "engines") {
+    foreach ($k in 'fb25_x86','fb30_x86','fb50_x86') {
+        Copy-Item "engines/$k/*" "publish/engines/$k/" -Recurse -Force
+    }
+} else {
+    Write-Host "engines/ not found - CI mode, skipping engine copy"
 }
 ```
 
 - 🚨 **绝不 AnyCPU**：native DLL 位宽绑定，AnyCPU 被 x64 DBX 加载仍会 P/Invoke x64。
-- 产物 `publish/` 即 `data/agents/drivers/firebird-embedded/` 的内容（`agent.exe` + `fbhost.exe` + `engines/`），解包约 **90 MB**。
+- 产物 `publish/` 即 `data/agents/drivers/firebird-embedded/` 的内容（`agent.exe` + `engines/`），解包约 **90 MB**。
+- 引擎根定位：`enginesRoot = Path.Combine(AppContext.BaseDirectory, "engines")`
+  （单文件 exe 下 `AppContext.BaseDirectory` = exe 所在目录 ✅）。
 
 **S4-11 引擎来源（可复现）**：从 firebirdsql.org 取三个 **Win32(x86)** 包，解出后**整目录**放 `engines/`：
 
@@ -421,19 +478,16 @@ foreach ($k in 'fb25_x86','fb30_x86','fb50_x86') {
 1. 加两步（紧跟现有两个 ODBC agent 构建步骤之后）：
 
 ```yaml
-      - name: Build Firebird Embedded agent + fbhost (32-bit)
+      - name: Build Firebird Embedded agent (32-bit)
         working-directory: agents/drivers/firebird-embedded
         shell: pwsh
         run: ./build.ps1
 ```
-   ⚠️ `build.ps1` 里那三行**引擎拷贝会失败**（仓库里没有 `engines/`）⇒ **两种处理**：
-   - **推荐**：`build.ps1` 里引擎拷贝加 `if (Test-Path ...)` 守卫 ⇒ CI 只产两个 exe，本地打包时才有引擎。
-   - 或 CI 里跳过引擎步骤（单独一个只编 exe 的步骤）。
+   ✅ 引擎拷贝的 `Test-Path` 守卫**已写进 S4-10 的 `build.ps1`** ⇒ CI 只产 `agent.exe`，本地打包时才有引擎。
 
 2. `Upload artifacts` 的 `path:` 追加：
 ```yaml
             agents/drivers/firebird-embedded/publish/agent.exe
-            agents/drivers/firebird-embedded/publish/fbhost.exe
 ```
 
 3. **保留** `Typecheck frontend` 步骤（`build-odbc.yml:53-59` 那段注释就是为「穷举表漏键」踩坑后加的）—— F1/F2 靠它兜底。
@@ -452,8 +506,9 @@ foreach ($k in 'fb25_x86','fb30_x86','fb50_x86') {
    ```
    `Build-DBX-Win7-OfflinePackage.ps1` 同加（Win7 版**无颜色**，两包目录**勿互拷**；且需验证 Win7 上 .NET 8 自包含 exe 能否跑）。
 2. 本机部署（复用既有的 `odbc-build-output/deploy.py`：幂等、`.bak.exe` 备份语义、覆盖占用时退避重试）：
-   目标 `D:\ProgramData\DBX\agents\drivers\firebird-embedded\{agent.exe, fbhost.exe, engines\...}`。
+   目标 `D:\ProgramData\DBX\agents\drivers\firebird-embedded\{agent.exe, engines\...}`。
    ⚠️ 引擎目录 89 MB，**首次部署慢**；`deploy.py` 目前的文件清单需扩展为「目录级同步」。
+   ⚠️ `engines\` 里的 DLL 是**只读数据不是运行中的 exe** ⇒ 直接覆盖即可；只有 `agent.exe` 被占用时才走退避重试。
 
 ---
 
@@ -496,6 +551,7 @@ foreach ($k in 'fb25_x86','fb30_x86','fb50_x86') {
 | 24 | **CDP 验证硬约束** | ①命令结束整棵进程树被 Job Object 连坐杀 ②CI 产物里 `el.__vueParentComponent` **不存在** ⇒ 读不到 `setupState` ③启动 DBX 必须走 `schtasks` | 走 `schtasks`；验证一律**纯 DOM 路径**；抓 Vue 渲染异常必须**挂 console 钩子** | 验证期 |
 | 25 | **中文 Windows `tasklist` 输出是 GBK** | `UnicodeDecodeError`，且**线程内异常导致脚本后半段整块丢失**（假失败） | `r.stdout.decode('gbk','replace')`；取 PID 用 `/FO CSV`（MSYS `ps` 的 PID ≠ Windows PID） | 写采样脚本时 |
 | 26 | **CDP 脏运行态污染交互** | 双击无反应（`hasFocus` 正常、监听器在） | CDP 实验前**先重启 DBX 取干净基线** | 验证期 |
+| 27 | ★ **（本方案新引入）单 exe 下没有进程兜底**：同进程加载第二个引擎必炸（`err=127`），且**加载失败后无法清理**（ALC/`Free` 都无效） | 一个进程里 `Engine12` 静默挂在另一版本的 `fbclient` 上 ⇒ **查询结果不可信** | **S4-2 引擎钉死**：首次决定引擎后永不变更；需要不同引擎 ⇒ **报错**；加载失败 ⇒ 标记不可用 + 提示断开重连 | 写 agent 时（**必修**） |
 
 ---
 
@@ -506,7 +562,7 @@ foreach ($k in 'fb25_x86','fb30_x86','fb50_x86') {
 | 层 | 手段 | 判据 |
 |---|---|---|
 | **协议** | 裸 spawn `agent.exe` 直发 JSON-RPC（`odbc-build-output/agent_rpc_probe.py`，**改 `--exe` 参数即可复用**） | `handshake` 返回 v2 + 数组；`open_session` → `list_tables` 有行 |
-| **引擎调度** | 对同一份库文件依次跑 fb25/fb30/fb50 三套 `fbhost.exe` | 只有 ODS 匹配的那个成功；另两个报 `unsupported on-disk structure` |
+| **引擎调度** | 起**独立**的 `agent.exe` 分别连三种 ODS 的库（`agent_rpc_probe.py --exe`） | 各自都能选对引擎；把 ODS 10 的库交给只应认 ODS 13 的进程会失败 |
 | **参数链路** | 从 DBX 真连，看 agent 收到的 `host` | **决定性判据**：让路径指向一个不存在的 `.fdb` ⇒ 报 Firebird 的「文件打不开」**而非**「未提供路径」⇒ 证明 `host` 送达 |
 | **UI 渲染** | CDP 连运行中的 WebView2 | 纯 DOM：表单出现**文件路径输入框 + 浏览按钮**；右键菜单**有项** |
 | **端到端** | 真连客户库 `病例.g_b`（ODS 10.0 / dialect 1） | 能列出表；`SELECT 7/2` 得 **3.5**（证明 Dialect=1 写进去了） |
@@ -524,7 +580,7 @@ cd "$SRC"
 
 ### 5.3 agent 本地迭代（分钟级，**不占 CI**）
 
-1. `build.ps1` → `publish/{agent.exe, fbhost.exe}`
+1. `build.ps1` → `publish/{agent.exe, engines/}`
 2. `agent_rpc_probe.py --exe publish/agent.exe …` 打协议层
 3. 通过后再覆盖到 `D:\ProgramData\DBX\agents\drivers\firebird-embedded\`
 
@@ -536,8 +592,9 @@ cd "$SRC"
 |---|---|
 | 文件路径真的到了 agent | 路径指向不存在的文件 ⇒ 报 Firebird **文件级**错误，而非"缺参数" |
 | Dialect 真的写进去了 | 客户库上 `SELECT 7/2` = **3.5**（不写 Dialect 会是 **3**） |
-| 引擎选对了 | 对 ODS 10.0 的库，只有 fb25 能开；fb30/fb50 报 `unsupported on-disk structure` |
-| 一引擎一进程真的成立 | 同时开 fb25 与 fb50 两个连接 ⇒ 任务管理器里**两个 `fbhost.exe`**（对应昨天实测：agent 是连接级进程） |
+| 引擎选对了 | 对 ODS 10.0 的库，只有 fb25 能开；在**独立进程**里用 fb30/fb50 试会报 `unsupported on-disk structure` |
+| **一进程一引擎真的成立** | 同时开 ODS10（`病例.g_b`）与 ODS13 两个连接 ⇒ 是两个 `agent.exe`，且**各自模块列表里只有自己那套引擎的 DLL**（`Get-Process -Module` / Process Explorer 核对 `fbembed.dll` vs `engine13.dll`） |
+| ★★ **引擎钉死真的生效** | 用 `agent_rpc_probe.py` 在**同一个** agent 进程里先后请求两个不同 ODS 的库 ⇒ **第二次必须报错，绝不能成功**（成功 = 静默混版 = 最危险，且不可观测） |
 | 没污染原文件 | 开库前后 `sha256` 对比；**但注意引擎只跑 `SELECT` 也会改 mtime/hash**（引擎必然写原文件）⇒ 判据应为"**ODS 不变**"而非"文件不变" |
 
 ---
@@ -547,12 +604,13 @@ cd "$SRC"
 | # | 项 | 状态 | 处理 |
 |---|---|---|---|
 | **N1** | fb30/fb50 的 `ServerMode = SuperClassic` 落地方式（`firebird.conf` vs provider 的 `ServerType`）与生效性 | **未实测** | S4 首个可运行版本上实测；同步测「与客户 **Classic/SuperClassic** 服务共存」。**机制内核已明：冲突只看各方 `ServerMode`，与谁先打开无关；任一方为 `Super` ⇒ 只有一方能开** |
-| **N2** | `fbhost.exe` 骨架 + IPC（**主工作量**） | 未开始 | 见 S4 |
+| **N2** | ⚠️ **单 exe 下引擎加载失败后 agent 自己无法恢复**（不能重启自己，也不能卸载已进进程的 native 模块） | **已接受**（2026-09-18 架构决策） | 报错 + 提示「断开该连接后重连」；实测 `disconnect` **立即杀 agent.exe** ⇒ 重连即得干净进程。**若真机发现频繁出现，再引入 `fbhost.exe` 子进程池**（届时只需替换引擎访问实现，其余代码不动） |
 | **N3** | 离线包体积（引擎 89 MB，两包各 +90 MB） | 未决 | 先量化；可选精简（去 `tzdata`/多余 `plugins`/`icudt*`） |
 | **N4** | Win7 上 .NET 8 自包含 exe 可跑性 | 未验 | 与 Win7 离线包一起验 |
 | **N5** | x86 agent 的 2 GB 地址空间上限（大库/大结果集） | 未评估 | 首版观察；必要时再议 x64 引擎分支 |
 | **N6** | `list_databases` 在 `singleDatabase: true` 下的预期行为 | 未确认 | 照抄 access/odbc 的行为，真机确认树形态（是否出现数据库层级） |
 | **N7** | 上游 MCP（0.4.89）**看不见 `odbc32`**（静默丢弃未知 `db_type`）⇒ 新增 `firebird-embedded` **同样看不见** | 已确认 | **自研类型的功能验证只能走桌面程序**；若需 MCP 支持要同步改 MCP server 的已知类型表 |
+| **N8** | ⚠️ **本方案押注「agent 是连接级进程」**——这是**上游实现细节、不是契约**。若上游改成 `agent_key` 级进程池（多连接共享一个 `agent.exe`），「一进程一引擎」前提即失效 | 未验（当前实测为连接级：两个同 `db_type` 连接各起独立进程） | `PinEngine` 会以**明确报错**形式暴露（而不是静默混版）；届时引入 `fbhost.exe` 子进程池即可恢复隔离 |
 
 ---
 
@@ -607,15 +665,16 @@ grep -rn "Odbc32" --include=*.rs --include=*.ts --include=*.vue --include=*.yaml
 ## 8. 施工顺序速查（贴墙用）
 
 ```
-S0 准备（分支/废弃草稿/目录）
+S0 准备（分支 / 废弃草稿 / 目录；放 engines/fb25|fb30|fb50）
  └─ S1 yaml ×2（firebird-embedded.yaml + catalog.yaml）+ 跑生成器
      └─ S2 Rust 5 处（R1 R2 R3 编译红 / R4 ★静默算错 / R5）
          └─ S3 前端 4 处（F1 F2 菜单 / F3 超时 / F4 文件路径）
              └─ ★ 本地预检：sync --check + vue-tsc 0 error
                  └─ ★ push 一次 → 等 CI（≈60 min）→ 产物下载核对
                      └─ S4 agent 本体（本地 build.ps1，分钟级，与 CI 并行）
+                         ├─ S4-2 ★引擎钉死 —— 先写这条，它是唯一红线
                          ├─ 协议层：agent_rpc_probe.py
-                         ├─ 引擎层：fb25/fb30/fb50 三分支
+                         ├─ 引擎层：三种 ODS 各起独立 agent.exe 验
                          └─ 真机：病例.g_b（ODS 10.0 / dialect 1）
                              └─ S6 离线包 + 部署（.bak.exe 回滚点 + 引擎目录级同步）
 ```
