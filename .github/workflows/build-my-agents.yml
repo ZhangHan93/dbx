@@ -129,10 +129,14 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
-      - name: Setup Rust (nightly, win7 target, build-std)
+      # win7 是 Tier-2 target，nightly 不为它发布预编译 rust-std。
+      # 若在这里声明 targets: x86_64-win7-windows-msvc，rustup 会因找不到
+      # rust-std-x86_64-win7-windows-msvc 直接失败（已踩坑，run 35337830090）。
+      # 正确做法：只装 nightly + rust-src，靠 CARGO_BUILD_STD=std 从源码现编 std。
+      - name: Setup Rust (nightly, build-std from source)
         uses: dtolnay/rust-toolchain@nightly
         with:
-          targets: x86_64-win7-windows-msvc
+          components: rust-src
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
