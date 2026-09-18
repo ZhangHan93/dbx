@@ -57,6 +57,7 @@ export const DATABASE_PROPERTY_EDITING_MATRIX = {
   teradata: { deferred: "database properties need product-specific handling" },
   vertica: { deferred: "schema properties need product-specific handling" },
   firebird: { deferred: "database files are managed through connection provisioning" },
+  "firebird-embedded": { deferred: "file-backed; the database file is managed through the connection form" },
   exasol: { deferred: "schema properties need product-specific handling" },
   opengauss: { database: ["databaseComment"], schema: ["schemaComment"] },
   "oceanbase-oracle": { deferred: "Oracle-mode schemas are users; use a dedicated user workflow" },

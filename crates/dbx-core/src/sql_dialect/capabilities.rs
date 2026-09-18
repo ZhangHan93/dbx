@@ -136,6 +136,12 @@ pub fn pagination_strategy(database_type: Option<DatabaseType>, context: Paginat
         Some(DatabaseType::Iris) => TablePaginationStrategy::IrisTop,
         Some(DatabaseType::Informix) => TablePaginationStrategy::InformixFirst,
         Some(DatabaseType::Firebird) => TablePaginationStrategy::FirebirdRows,
+        // Firebird Embedded speaks the same SQL dialect as remote Firebird, so it needs
+        // the `ROWS n TO m` clause. Without this arm the variant silently falls through
+        // to the `LimitOffset` catch-all, dbx-core injects `LIMIT 100`, and Firebird
+        // rejects the statement with a syntax error — a failure that looks exactly like
+        // "nothing was changed".
+        Some(DatabaseType::FirebirdEmbedded) => TablePaginationStrategy::FirebirdRows,
         Some(DatabaseType::OceanbaseOracle) => TablePaginationStrategy::Rownum,
         Some(DatabaseType::Questdb) => TablePaginationStrategy::QuestDbLimit,
         _ => TablePaginationStrategy::LimitOffset,

@@ -51,6 +51,7 @@ const SCHEMA_FIRST_QUALIFIER_TYPES = new Set<DatabaseType>([
   "oceanbase-oracle",
   "dameng",
   "firebird",
+  "firebird-embedded",
   "exasol",
   "teradata",
   "vertica",

@@ -321,6 +321,7 @@ macro_rules! agent_connection_pool_database_type {
             | DatabaseType::Access
             | DatabaseType::Odbc
             | DatabaseType::Odbc32
+            | DatabaseType::FirebirdEmbedded
     };
 }
 

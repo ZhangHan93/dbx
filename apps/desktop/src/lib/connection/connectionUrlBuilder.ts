@@ -127,7 +127,7 @@ function normalizedDriverProfile(config: ConnectionUrlCopyConfig): string {
 
 function isLocalFileUrlCopyConnection(config: ConnectionUrlCopyConfig): boolean {
   const dbType = config.db_type;
-  return dbType === "sqlite" || dbType === "duckdb" || dbType === "access" || (dbType === "h2" && Number(config.port) === 0);
+  return dbType === "sqlite" || dbType === "duckdb" || dbType === "access" || dbType === "firebird-embedded" || (dbType === "h2" && Number(config.port) === 0);
 }
 
 function explicitConnectionString(config: ConnectionUrlCopyConfig): string {

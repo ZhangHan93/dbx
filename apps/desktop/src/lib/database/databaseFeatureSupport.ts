@@ -311,6 +311,7 @@ const HAVING_ALIAS_REJECTED_DATABASE_TYPES: ReadonlySet<string> = new Set([
   "xugu",
   "informix",
   "firebird",
+  "firebird-embedded",
   "exasol",
   "trino",
   "prestosql",

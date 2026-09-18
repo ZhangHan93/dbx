@@ -505,7 +505,7 @@ function formatXuguStorageDetailValue(key: string, value: string): string {
 }
 
 function isLocalFileConnection(config: Pick<ConnectionConfig, "db_type" | "port">): boolean {
-  return config.db_type === "sqlite" || config.db_type === "duckdb" || config.db_type === "access" || (config.db_type === "h2" && config.port === 0);
+  return config.db_type === "sqlite" || config.db_type === "duckdb" || config.db_type === "access" || config.db_type === "firebird-embedded" || (config.db_type === "h2" && config.port === 0);
 }
 
 function redactedConnectionString(value: string): string {

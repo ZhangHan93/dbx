@@ -166,7 +166,8 @@ pub(super) fn capabilities_for(
             | DatabaseType::Uxdb
             | DatabaseType::Vastbase
             | DatabaseType::Kingbase
-            | DatabaseType::Firebird,
+            | DatabaseType::Firebird
+            | DatabaseType::FirebirdEmbedded,
         ) => {
             let mut caps = TableStructureCapabilities {
                 dialect: StructureDialect::Postgres,

@@ -90,6 +90,9 @@ const assetIcons: Record<string, string> = {
   teradata: "teradata",
   vertica: "vertica.webp",
   firebird: "firebird",
+  // Keys here are normalized by `normalizedType` (lowercase, `-`/whitespace -> `_`),
+  // so the hyphenated dbType must be spelled with an underscore to ever match.
+  firebird_embedded: "firebird",
   exasol: "exasol",
   gbase: "gbase.png",
   gbase8a: "gbase.png",

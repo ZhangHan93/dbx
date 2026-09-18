@@ -73,6 +73,7 @@ const NAVICAT_STYLE_TABLE_DATA_TYPES = new Set<DatabaseType>([
   "teradata",
   "vertica",
   "firebird",
+  "firebird-embedded",
   "exasol",
   "opengauss",
   "questdb",

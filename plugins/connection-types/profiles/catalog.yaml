@@ -276,6 +276,13 @@ profiles:
     port: 3050
     user: SYSDBA
     category: sql
+  - id: firebird-embedded
+    dbType: firebird-embedded
+    label: Firebird Embedded
+    icon: firebird
+    port: 0
+    user: SYSDBA
+    category: sql
   - id: exasol
     dbType: exasol
     label: Exasol

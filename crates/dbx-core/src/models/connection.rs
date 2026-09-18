@@ -1068,6 +1068,11 @@ impl ConnectionConfig {
                 format!("{}?mode=rwc", self.host)
             }
             DatabaseType::Access => self.host.clone(),
+
+            // Firebird Embedded is file-backed like Access: the `.fdb` path is carried
+            // in `host`, so the connection URL is that path verbatim. Both the redacted
+            // and the credentialed variants share this arm.
+            DatabaseType::FirebirdEmbedded => self.host.clone(),
             DatabaseType::Redis => {
                 let scheme = if self.ssl { "rediss" } else { "redis" };
                 let fragment = self.redis_tls_insecure_fragment();
@@ -1235,6 +1240,11 @@ impl ConnectionConfig {
                 format!("{}?mode=rwc", self.host)
             }
             DatabaseType::Access => self.host.clone(),
+
+            // Firebird Embedded is file-backed like Access: the `.fdb` path is carried
+            // in `host`, so the connection URL is that path verbatim. Both the redacted
+            // and the credentialed variants share this arm.
+            DatabaseType::FirebirdEmbedded => self.host.clone(),
             DatabaseType::Redis => {
                 let scheme = if self.ssl { "rediss" } else { "redis" };
                 let fragment = self.redis_tls_insecure_fragment();

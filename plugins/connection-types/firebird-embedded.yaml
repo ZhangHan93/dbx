@@ -1,0 +1,34 @@
+schemaVersion: 1
+order: 773
+dbType: firebird-embedded
+rustVariant: FirebirdEmbedded
+label: Firebird Embedded
+dialect: Firebird
+runtimeMode: agent
+mcpMode: bridge
+agentKey: firebird-embedded
+driverStoreVisible: false
+singleConnectionPool: true
+metadataConnectionScoped: false
+skipTcpProbe: true
+localFile: true
+traits:
+  singleDatabase: true
+supportLevel: browse
+capabilities:
+  queryExecution: true
+  metadataBrowse: true
+  objectBrowser: true
+  objectSource: false
+  schemaSearch: false
+  diagram: false
+  tableDataEdit: false
+  tableStructureEdit: false
+  tableImport: false
+  dataTransfer: false
+  sqlFileExecution: true
+  databaseCreate: false
+  fieldLineage: false
+  sqlExplain: false
+  userAdmin: false
+  driverManagement: false

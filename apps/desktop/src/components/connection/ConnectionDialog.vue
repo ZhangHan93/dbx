@@ -2420,7 +2420,7 @@ function applyProfile(val: string, preserveConnectionFields = false) {
     if (profile.host) {
       form.value.host = profile.host;
     }
-    if (profile.type === "sqlite" || profile.type === "duckdb" || profile.type === "access") {
+    if (profile.type === "sqlite" || profile.type === "duckdb" || profile.type === "access" || profile.type === "firebird-embedded") {
       form.value.host = "";
     }
     if (profile.type === "sqlite") {
@@ -3189,6 +3189,7 @@ const jdbcUsernamePlaceholder = computed(() => (form.value.driver_profile === "d
 const filePathPlaceholder = computed(() => {
   if (form.value.db_type === "duckdb") return "/path/to/database.duckdb or :memory:";
   if (form.value.db_type === "access") return "/path/to/database.accdb";
+  if (form.value.db_type === "firebird-embedded") return "/path/to/database.fdb";
   if (form.value.db_type === "h2") return "/path/to/database.mv.db";
   return "/path/to/database.db or :memory:";
 });
@@ -3367,7 +3368,7 @@ const zookeeperAuthScheme = computed<ZooKeeperAuthScheme>({
   },
 });
 const canUseTransportLayers = computed(() => {
-  if (form.value.db_type === "access" || isCloudflareD1Connection(form.value) || isH2FileMode.value || (form.value.db_type === "oracle" && form.value.oracle_connection_type === "tns")) {
+  if (form.value.db_type === "access" || form.value.db_type === "firebird-embedded" || isCloudflareD1Connection(form.value) || isH2FileMode.value || (form.value.db_type === "oracle" && form.value.oracle_connection_type === "tns")) {
     return false;
   }
   if (form.value.db_type === "sqlite") {
@@ -6107,7 +6108,7 @@ async function browseKafkaKerberosFile(target: "keytab" | "krb5") {
 async function browseDbFilePath() {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const filters = form.value.db_type === "duckdb" ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }] : form.value.db_type === "access" ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }] : form.value.db_type === "h2" ? [{ name: "H2", extensions: ["db"] }] : undefined;
+    const filters = form.value.db_type === "duckdb" ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }] : form.value.db_type === "access" ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }] : form.value.db_type === "h2" ? [{ name: "H2", extensions: ["db"] }] : form.value.db_type === "firebird-embedded" ? [{ name: "Firebird Database", extensions: ["fdb", "gdb"] }] : undefined;
     const selected = await open({
       title: "Select Database File",
       multiple: false,

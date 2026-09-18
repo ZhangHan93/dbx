@@ -81,6 +81,7 @@ export const DATABASE_TYPES = [
   "jdbc",
   "odbc",
   "odbc32",
+  "firebird-embedded",
   "spark",
   "plugin",
 ] as const;

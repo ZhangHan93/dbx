@@ -781,10 +781,10 @@ pub fn profile_for(db_type: DatabaseType) -> DdlDialectProfile {
         // PostgreSQL-shaped DDL, but not the PostgreSQL `DROP TABLE` grammar:
         // Firebird has neither CASCADE nor IF EXISTS; Vertica and Exasol are kept off
         // CASCADE so the set stays aligned with the frontend preview list.
-        Firebird | Vertica | Exasol => {
+        Firebird | FirebirdEmbedded | Vertica | Exasol => {
             let mut profile = postgres_family(db_type);
             profile.drop_table_supports_cascade = false;
-            profile.drop_table_supports_if_exists = db_type != Firebird;
+            profile.drop_table_supports_if_exists = !matches!(db_type, Firebird | FirebirdEmbedded);
             profile
         }
 

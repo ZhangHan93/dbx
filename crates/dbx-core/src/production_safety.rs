@@ -523,6 +523,7 @@ fn schema_first_qualifier_type(db_type: &DatabaseType) -> bool {
             | DatabaseType::OceanbaseOracle
             | DatabaseType::Dameng
             | DatabaseType::Firebird
+            | DatabaseType::FirebirdEmbedded
             | DatabaseType::Exasol
             | DatabaseType::Teradata
             | DatabaseType::Vertica

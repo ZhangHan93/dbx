@@ -3989,6 +3989,7 @@ fn is_postgres_family_ddl(db_type: DatabaseType) -> bool {
             | DatabaseType::OpenGauss
             | DatabaseType::Kwdb
             | DatabaseType::Firebird
+            | DatabaseType::FirebirdEmbedded
             | DatabaseType::Vertica
             | DatabaseType::Exasol
             | DatabaseType::Uxdb

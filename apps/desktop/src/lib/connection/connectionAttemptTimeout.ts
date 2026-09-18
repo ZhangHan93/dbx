@@ -21,6 +21,10 @@ const DRIVER_STARTUP_FLOOR_TYPES = new Set<DatabaseType>([
   "teradata",
   "vertica",
   "firebird",
+  // firebird-embedded 走自研 native agent（self-contained 单文件 exe），与 odbc / odbc32 同理：
+  // 首次冷启动要解压并加载 .NET runtime，属于「驱动启动慢」。给 30s 下限，否则默认 10s 会让
+  // UI 侧先判定超时，而 agent 侧连接其实仍在推进。
+  "firebird-embedded",
   "exasol",
   "oceanbase-oracle",
   "gbase",

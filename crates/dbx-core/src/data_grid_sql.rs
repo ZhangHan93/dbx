@@ -3645,6 +3645,7 @@ fn uses_keyless_row_predicate(database_type: Option<DatabaseType>) -> bool {
                 | DatabaseType::Teradata
                 | DatabaseType::Vertica
                 | DatabaseType::Firebird
+                | DatabaseType::FirebirdEmbedded
                 | DatabaseType::Exasol
                 | DatabaseType::OpenGauss
                 | DatabaseType::Questdb

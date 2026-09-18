@@ -28,7 +28,7 @@ export function isLocalFileTypeDb(dbType: DatabaseType | string): boolean {
  */
 export function connectionFilePath(config: Pick<ConnectionConfig, "db_type" | "host" | "connection_string">): string | null {
   const dbType = config.db_type;
-  if (dbType === "sqlite" || dbType === "duckdb" || dbType === "access") {
+  if (dbType === "sqlite" || dbType === "duckdb" || dbType === "access" || dbType === "firebird-embedded") {
     const host = (config.host ?? "").trim();
     if (!host || host === ":memory:") return null;
     return host;

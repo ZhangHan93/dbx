@@ -214,6 +214,11 @@ export function connectionUrlPlaceholder(dbType: DatabaseType, driverProfile?: s
     case "access":
       return "jdbc:ucanaccess:///absolute/path/to/database.accdb";
 
+    // Firebird Embedded is file-backed: the `.fdb` path is carried in `host`, so the
+    // form shows the same file-path input as the other local-file drivers.
+    case "firebird-embedded":
+      return "/absolute/path/to/database.fdb";
+
     case "mongodb":
       return "mongodb://user:password@host:port/database";
 

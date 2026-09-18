@@ -57,6 +57,7 @@ export const DATABASE_NAMESPACE_CREATION_MATRIX = {
   teradata: { database: "schema" },
   vertica: { database: "schema" },
   firebird: { deferred: "database files are created through connection provisioning" },
+  "firebird-embedded": { deferred: "file-backed; the database file is selected in the connection form" },
   exasol: { database: "schema" },
   opengauss: { connection: "database", database: "schema" },
   "oceanbase-oracle": { deferred: "Oracle-mode schemas are users; use a dedicated user workflow" },
