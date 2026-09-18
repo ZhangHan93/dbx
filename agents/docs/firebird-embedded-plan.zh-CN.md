@@ -627,7 +627,7 @@ if (Test-Path "engines") {
             agents/drivers/firebird-embedded/publish/agent.exe
 ```
 
-3. **保留** `Typecheck frontend` 步骤（`build-odbc.yml:53-59` 那段注释就是为「穷举表漏键」踩坑后加的）—— F1/F2 靠它兜底。
+3. **保留** `Typecheck frontend` 步骤（`build-my-agents.yml:53-59` 那段注释就是为「穷举表漏键」踩坑后加的）—— F1/F2 靠它兜底。
 
 **CI 只做一次**：S1+S2+S3 一起推。**agent 改动走本地 `build.ps1`，不占 CI**。
 ⚠️ `build-my-agents.yml` **无 `concurrency` 组** ⇒ 连推两次会有两个 run 并行（互不阻塞，无需 cancel）。⚠️ **无 `cargo test`** ⇒ CI 绿 ≠ 单测过。
