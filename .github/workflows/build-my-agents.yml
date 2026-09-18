@@ -155,7 +155,7 @@ jobs:
           # win7 target 的 std 不在 nightly 预编译包里，需从源码 build-std
           CARGO_BUILD_STD: std
         run: |
-          pnpm tauri build --no-bundle --release --features custom-protocol --target x86_64-win7-windows-msvc --config src-tauri/tauri.webview2-win7-fixed.conf.json
+          pnpm tauri build --no-bundle --features custom-protocol --target x86_64-win7-windows-msvc --config src-tauri/tauri.webview2-win7-fixed.conf.json
 
       - name: Upload win7 dbx.exe
         uses: actions/upload-artifact@v4
