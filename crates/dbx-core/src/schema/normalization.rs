@@ -299,6 +299,7 @@ mod tests {
             db::TableInfo {
                 name: "USERS".to_string(),
                 table_type: "TABLE".to_string(),
+                valid: None,
                 comment: None,
                 parent_schema: None,
                 parent_name: None,
@@ -306,6 +307,7 @@ mod tests {
             db::TableInfo {
                 name: "BIN$abc123==$0".to_string(),
                 table_type: "TABLE".to_string(),
+                valid: None,
                 comment: None,
                 parent_schema: None,
                 parent_name: None,

@@ -1447,6 +1447,7 @@ impl DbxBackend for WebBackend {
                     Some(TableInfo {
                         name,
                         table_type: "COLLECTION".to_string(),
+                        valid: None,
                         comment: None,
                         parent_schema: None,
                         parent_name: None,

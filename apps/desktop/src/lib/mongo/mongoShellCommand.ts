@@ -160,6 +160,13 @@ function diagnoseMongoCommand(source: string): string | null {
   }
 
   const tail = source.slice(closeIndex + 1).trim();
+  if (tail && method === "find") {
+    const chainProblem = describeUnsupportedFindChain(tail);
+    if (chainProblem) return chainProblem;
+  }
+  if (tail && (method === "findOne" || method === "countDocuments" || method === "count" || method === "distinct")) {
+    return `${method}() returns a result, not a cursor, so nothing can be chained after it: "${tail.length > 40 ? `${tail.slice(0, 40)}…` : tail}".`;
+  }
   if (tail) return `Unexpected text after ${method}(...): "${tail.length > 40 ? `${tail.slice(0, 40)}…` : tail}".`;
   if (method === "bulkWrite" && args[0]) {
     const operations = normalizeJsonArgument(args[0]);
@@ -211,6 +218,13 @@ export interface MongoFindCommand {
   sort?: string;
   collation?: string;
 }
+
+export interface MongoFindExplainCommand extends MongoFindCommand {
+  verbosity: MongoExplainVerbosity;
+}
+
+export type MongoExplainVerbosity = "queryPlanner" | "executionStats" | "allPlansExecution";
+const EXPLAIN_VERBOSITIES: readonly MongoExplainVerbosity[] = ["queryPlanner", "executionStats", "allPlansExecution"];
 
 export interface MongoFindPaginationPlan {
   pageOffset: number;
@@ -277,6 +291,7 @@ type MongoWriteKind = "runCommand" | "insert" | "update" | "replace" | "bulkWrit
 
 export type MongoCommand =
   | ({ kind: "find" } & MongoFindCommand)
+  | ({ kind: "findExplain" } & MongoFindExplainCommand)
   | ({ kind: "findOne" } & MongoFindOneCommand)
   | MongoVersionCommand
   | MongoShowDatabasesCommand
@@ -355,8 +370,11 @@ export function parseMongoFindCommand(input: string): MongoFindCommand | null {
   }
 
   const chain = source.slice(findCloseIndex + 1).trim();
-  if (chain && !chain.startsWith(".")) return null;
-  if (findChainedMethodCallIndex(chain, "count") >= 0) return null;
+  // Every chained call must be one the editor executes; dropping an unknown one
+  // (`.hint()`, `.forEach()`, `.explain()`) would run a different query than written.
+  const calls = listChainedCalls(chain);
+  if (!calls || calls.some((call) => !FIND_CHAIN_METHODS.has(call.name) || (isNoopCursorMethod(call.name) && call.args.trim()))) return null;
+  if (calls.some((call) => call.name === "count")) return null;
 
   const sortArg = readChainedCallArgument(chain, "sort");
   let sort: string | undefined;
@@ -582,6 +600,35 @@ function parseCollectionCountCommand(source: string, method: "countDocuments" | 
     filter,
     mode: method === "countDocuments" ? "accurate" : "legacy",
   };
+}
+
+/**
+ * `find(...)…explain([verbosity])`: the query plan for a find, with explain as the
+ * final chain call. Everything before it is parsed exactly as the find would be.
+ */
+export function parseMongoFindExplainCommand(input: string): MongoFindExplainCommand | null {
+  const source = input.trim().replace(/;$/, "").trim();
+  const target = parseFindTarget(source);
+  if (!target) return null;
+  const findOpenIndex = source.indexOf("(", target.findCallIndex);
+  const findCloseIndex = findMatchingParen(source, findOpenIndex);
+  if (findCloseIndex < 0) return null;
+
+  const chain = source.slice(findCloseIndex + 1).trim();
+  const calls = listChainedCalls(chain);
+  const last = calls?.[calls.length - 1];
+  if (!calls || last?.name !== "explain") return null;
+
+  const verbosityArg = last.args.trim();
+  let verbosity: MongoExplainVerbosity = "queryPlanner";
+  if (verbosityArg) {
+    const literal = /^(["'])([^"']*)\1$/.exec(verbosityArg)?.[2];
+    if (!literal || !EXPLAIN_VERBOSITIES.includes(literal as MongoExplainVerbosity)) return null;
+    verbosity = literal as MongoExplainVerbosity;
+  }
+
+  const find = parseMongoFindCommand(source.slice(0, findCloseIndex + 1) + chain.slice(0, last.index));
+  return find ? { ...find, verbosity } : null;
 }
 
 function parseFindCountCommand(source: string): MongoCountDocumentsCommand | null {
@@ -877,6 +924,10 @@ export function parseMongoCommand(input: string): ParsedMongoCommand | null {
       // while mapping to DBX's countDocuments-compatible result path.
       const count = parseMongoCountDocumentsCommand(source);
       return count ? { kind: "countDocuments", ...count } : null;
+    },
+    (source) => {
+      const explain = parseMongoFindExplainCommand(source);
+      return explain ? { kind: "findExplain", ...explain } : null;
     },
     (source) => {
       const find = parseMongoFindCommand(source);
@@ -1552,6 +1603,69 @@ function readChainedCallArgument(source: string, name: string): string | undefin
     match = pattern.exec(source);
   }
   return undefined;
+}
+
+/** Cursor methods the editor executes after `find()`. `toArray` / `pretty` change nothing and are dropped. */
+const FIND_CHAIN_METHODS = new Set(["sort", "skip", "limit", "collation", "count", "toArray", "pretty"]);
+
+function isNoopCursorMethod(name: string): boolean {
+  return name === "toArray" || name === "pretty";
+}
+
+interface ChainedCall {
+  name: string;
+  /** Raw text between the parentheses. */
+  args: string;
+  /** Offset of the `.` within the chain text. */
+  index: number;
+}
+
+/**
+ * Tokenise `.name(args).name(args)…`. Returns null when the chain is not a sequence
+ * of calls, e.g. a property access such as `.count` without parentheses or trailing text.
+ */
+export function listChainedCalls(chain: string): ChainedCall[] | null {
+  const calls: ChainedCall[] = [];
+  let index = 0;
+  while (index < chain.length) {
+    const rest = chain.slice(index);
+    if (!rest.trim()) break;
+    const match = /^\s*\.\s*([A-Za-z_$][\w$]*)\s*\(/.exec(rest);
+    if (!match) return null;
+    const openIndex = index + match[0].length - 1;
+    const closeIndex = findMatchingParen(chain, openIndex);
+    if (closeIndex < 0) return null;
+    calls.push({ name: match[1]!, args: chain.slice(openIndex + 1, closeIndex), index: index + match[0].indexOf(".") });
+    index = closeIndex + 1;
+  }
+  return calls;
+}
+
+/** Why a `find()` chain was rejected, for the parse-failure diagnostics. */
+function describeUnsupportedFindChain(chain: string): string | null {
+  const calls = listChainedCalls(chain);
+  if (!calls) return null;
+  const offending = calls.find((call) => !FIND_CHAIN_METHODS.has(call.name) || (isNoopCursorMethod(call.name) && call.args.trim()));
+  if (!offending) return null;
+  const supported = "Supported after find(): sort, skip, limit, collation, count, explain, toArray, pretty.";
+  switch (offending.name) {
+    case "explain": {
+      const verbosity = offending.args.trim();
+      if (calls[calls.length - 1] !== offending) return "find().explain() must be the final chain method.";
+      return `find().explain() verbosity must be "queryPlanner", "executionStats" or "allPlansExecution"${verbosity ? `, got ${verbosity}` : ""}.`;
+    }
+    case "itcount":
+    case "size":
+      return `find().${offending.name}() is not supported; use find().count() or countDocuments() to count results. ${supported}`;
+    case "forEach":
+    case "map":
+      return `find().${offending.name}() runs JavaScript, which the editor does not execute; run the find and read the results instead.`;
+    case "toArray":
+    case "pretty":
+      return `find().${offending.name}() takes no arguments.`;
+    default:
+      return `find().${offending.name}() is not supported yet. ${supported}`;
+  }
 }
 
 function hasSingleEmptyChainedCall(source: string, name: string): boolean {
