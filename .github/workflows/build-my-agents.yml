@@ -114,8 +114,12 @@ jobs:
 
   build-win7:
     name: Build Windows 7-compatible dbx.exe (win7-target)
-    runs-on: windows-latest
+    runs-on: windows-2022
     timeout-minutes: 120
+    env:
+      CARGO_INCREMENTAL: "0"
+      # win7 必须静态链接 CRT，否则目标机缺 msvcp*.dll 起不来
+      RUSTFLAGS: -C debuginfo=line-tables-only -C target-feature=+crt-static
 
     steps:
       - name: Checkout
@@ -129,33 +133,38 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
 
-      # win7 是 Tier-2 target，nightly 不为它发布预编译 rust-std。
-      # 若在这里声明 targets: x86_64-win7-windows-msvc，rustup 会因找不到
-      # rust-std-x86_64-win7-windows-msvc 直接失败（已踩坑，run 35337830090）。
-      # 正确做法：只装 nightly + rust-src，靠 CARGO_BUILD_STD=std 从源码现编 std。
-      - name: Setup Rust (nightly, build-std from source)
+      # 抄上游 ci.yml/windows-win7-bundle：必须用固定日期 nightly（浮动 nightly 可能已移除
+      # win7 target），只装 rust-src，由 -Z build-std 从源码现编 win7 的 std
+      # （nightly 不为 x86_64-win7-windows-msvc 这个 Tier-2 target 发预编译 std）。
+      - name: Setup Rust (nightly-2026-07-22 + rust-src, build-std from source)
         uses: dtolnay/rust-toolchain@nightly
         with:
+          toolchain: nightly-2026-07-22
           components: rust-src
-
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: 8.0.x
 
       - name: Install frontend dependencies
         run: pnpm install --no-frozen-lockfile
 
-      - name: Typecheck frontend
-        run: pnpm typecheck
-
-      - name: Build Tauri dbx.exe (win7 target)
+      - name: Prepare Win7-compatible WebView2 loader
         shell: pwsh
-        env:
-          # win7 target 的 std 不在 nightly 预编译包里，需从源码 build-std
-          CARGO_BUILD_STD: std
+        run: ./.github/scripts/prepare-webview2-win7-loader.ps1
+
+      - name: Prepare WebView2 109 fixed runtime
+        shell: pwsh
+        run: ./.github/scripts/prepare-webview2-win7-runtime.ps1
+
+      - name: Build frontend
+        run: pnpm build
+
+      # 关键：用 cargo build 直编，绕过 Tauri CLI 对未安装 target 的预校验
+      # （Tauri CLI 会先 rustup target list 校验，win7 target 未安装即报 does not exist；
+      #  直接 cargo build + -Z build-std 会从 rust-src 现编 std，无需 target 预装）。
+      # 第 3 次尝试 run 35360190275 正是死在 Tauri CLI 的该预校验上。
+      - name: Build DBX for Windows 7 (cargo build, bypass Tauri target precheck)
+        shell: pwsh
         run: |
-          pnpm tauri build --no-bundle --features custom-protocol --target x86_64-win7-windows-msvc --config src-tauri/tauri.webview2-win7-fixed.conf.json
+          $env:TAURI_CONFIG = Get-Content src-tauri/tauri.webview2-win7-fixed.conf.json -Raw
+          cargo build --package dbx --release --features custom-protocol --target x86_64-win7-windows-msvc -Z build-std=std,panic_abort
 
       - name: Upload win7 dbx.exe
         uses: actions/upload-artifact@v4
