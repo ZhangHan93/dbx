@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net48</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>dbx-agent-odbc</AssemblyName>
@@ -15,7 +15,14 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!--
+      System.Data.Odbc 走 NuGet 包（含 net462 / netstandard2.0 资产，net48 可消费）：
+      net48 虽自带该 assembly，但 SDK 风格工程不会自动引用，框架 <Reference> 在本机缺
+       targeting pack 时会解析失败；用 NuGet 包最稳，net8 / net48 都认。
+      net48 框架不含 System.Text.Json，需补 netstandard2.0 版供 JSON 解析。
+    -->
     <PackageReference Include="System.Data.Odbc" Version="8.0.0" />
+    <PackageReference Include="System.Text.Json" Version="8.0.0" />
   </ItemGroup>
 
 </Project>

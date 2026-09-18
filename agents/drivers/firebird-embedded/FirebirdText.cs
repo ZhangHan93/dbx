@@ -12,16 +12,16 @@ using System.Text;
 //
 // 还原方法（方案 §4.6 实测给出的配方）
 // -----------------------------------
-//   byte[] raw = Encoding.Latin1.GetBytes(str);   // 拿回原始存储字节
+//   byte[] raw = Encoding.GetEncoding(28591).GetBytes(str);   // 拿回原始存储字节（Latin1/ISO-8859-1；.NET Framework 无 Encoding.Latin1）
 //   string gbk = Encoding.GetEncoding("GBK").GetString(raw);
 //
 // ⚠️ 只在「库字符集 = NONE」时才做这件事。UTF8 / WIN1252 等库由 provider 正常解码，
 //    再套一层 Latin1 往返反而会**把正确的中文弄坏**。所以本类由 FirebirdSession 用
 //    `RDB$DATABASE.RDB$CHARACTER_SET_NAME` 探到的字符集来开关（见 Program.cs Open）。
 //
-// ⚠️ .NET Core 起非 Unicode 代码页（936/GBK）默认不可用，必须显式注册
-//    `CodePagesEncodingProvider`，否则 `Encoding.GetEncoding(936)` 直接抛
-//    `ArgumentException: 'GBK' is not a supported encoding name`。已在 Main 里注册。
+// ⚠️ .NET Framework 4.8 原生自带 GBK(936) 等 CodePages，`Encoding.GetEncoding(936)`
+//    直接可用，无需（也无法）注册 `CodePagesEncodingProvider`（该类型是 .NET Core 专属、
+//    在 Framework 上不存在）。本类仅 `Register()` 取一次 `_gbk` 即可。
 // ============================================================================
 
 internal static class FirebirdText
@@ -32,14 +32,13 @@ internal static class FirebirdText
     static Encoding? _gbk;
     static bool _registered;
 
-    /// <summary>注册 CodePages 提供程序并取到 GBK。失败也不致命（还原会退化成原样返回）。</summary>
+    /// <summary>取到 GBK(936)。.NET Framework 4.8 原生可用，失败也不致命（还原会退化成原样返回）。</summary>
     public static void Register()
     {
         if (_registered) return;
         _registered = true;
         try
         {
-            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
             _gbk = Encoding.GetEncoding(936);
         }
         catch
@@ -78,7 +77,7 @@ internal static class FirebirdText
         }
         if (asciiOnly) return raw;
 
-        byte[] bytes = Encoding.Latin1.GetBytes(raw);
+        byte[] bytes = Encoding.GetEncoding(28591).GetBytes(raw);  // Latin1/ISO-8859-1；Framework 无 Encoding.Latin1
 
         try
         {

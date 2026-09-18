@@ -805,7 +805,13 @@ internal sealed class OdbcSession
     object CloseQuerySession(JsonElement p)
     {
         string sessionId = OdbcRuntimeServer.Str(p, "sessionId") ?? "";
-        if (_cursors.Remove(sessionId, out var c)) c.Dispose();
+        // Dictionary 在 net48 无 Remove(key, out value)（.NET 8 才加、且仅 ConcurrentDictionary 有），
+        // 用 TryGetValue + Remove 兼容 net48 / net8
+        if (_cursors.TryGetValue(sessionId, out var c))
+        {
+            _cursors.Remove(sessionId);
+            c.Dispose();
+        }
         return new { ok = true };
     }
 

@@ -62,15 +62,16 @@ jobs:
         working-directory: agents/drivers/odbc
         shell: pwsh
         run: |
-          dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -o publish
-          Rename-Item publish/dbx-agent-odbc.exe agent.exe
+          # net48 framework-dependent：去掉 --self-contained / -p:PublishSingleFile（Framework 不支持单文件）
+          dotnet publish -c Release -r win-x64 -o publish
+          Get-ChildItem publish/dbx-agent-odbc.* | Rename-Item -NewName { $_.Name -replace 'dbx-agent-odbc','agent' }
 
       - name: Build ODBC agent (32-bit)
         working-directory: agents/drivers/odbc
         shell: pwsh
         run: |
-          dotnet publish -c Release -r win-x86 --self-contained true -p:PublishSingleFile=true -o publish-x86
-          Rename-Item publish-x86/dbx-agent-odbc.exe agent.exe
+          dotnet publish -c Release -r win-x86 -o publish-x86
+          Get-ChildItem publish-x86/dbx-agent-odbc.* | Rename-Item -NewName { $_.Name -replace 'dbx-agent-odbc','agent' }
 
       # Firebird Embedded agent. x86 ONLY - all three bundled engines (fb25/fb30/fb50) are
       # Win32/x86 and native DLL bitness is absolute, so there is no x64/x86 pair here.
@@ -107,6 +108,54 @@ jobs:
           retention-days: 14
           path: |
             target/release/dbx.exe
-            agents/drivers/odbc/publish/agent.exe
-            agents/drivers/odbc/publish-x86/agent.exe
-            agents/drivers/firebird-embedded/publish/agent.exe
+            agents/drivers/odbc/publish
+            agents/drivers/odbc/publish-x86
+            agents/drivers/firebird-embedded/publish
+
+  build-win7:
+    name: Build Windows 7-compatible dbx.exe (win7-target)
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Rust (nightly, win7 target, build-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-win7-windows-msvc
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Install frontend dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Typecheck frontend
+        run: pnpm typecheck
+
+      - name: Build Tauri dbx.exe (win7 target)
+        shell: pwsh
+        env:
+          # win7 target 的 std 不在 nightly 预编译包里，需从源码 build-std
+          CARGO_BUILD_STD: std
+        run: |
+          pnpm tauri build --no-bundle --release --features custom-protocol --target x86_64-win7-windows-msvc --config src-tauri/tauri.webview2-win7-fixed.conf.json
+
+      - name: Upload win7 dbx.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbx-win7-x64
+          retention-days: 14
+          path: target/x86_64-win7-windows-msvc/release/dbx.exe

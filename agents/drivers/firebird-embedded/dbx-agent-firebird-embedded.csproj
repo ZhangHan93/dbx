@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net48</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AssemblyName>dbx-agent-firebird-embedded</AssemblyName>
@@ -26,13 +26,15 @@
       provider 是纯托管的，P/Invoke 按需触发 ⇒ 引用它并不会在启动时就碰引擎。
       ⚠️ 版本钉死 10.3.4：ClientLibrary 属性与 NONE 字符集的 Latin1 往返行为
          都是在 10.3.4 上实测的，别改成浮动版本。
+      10.3.4 已确认兼容 net48（netstandard2.0 资产），字符集/NONE 行为不丢。
     -->
     <PackageReference Include="FirebirdSql.Data.FirebirdClient" Version="10.3.4" />
     <!--
-      GBK(936) 在 .NET Core 上默认不可用，NONE 字符集老库（病例.g_b）的中文还原要靠它。
-      见 FirebirdText.cs。
+      net48 框架不含 System.Text.Json（net8 是内置的），需补 netstandard2.0 版。
+      GBK(936) 在 .NET Framework 4.8 原生可用（自带 CodePages），故不再引用
+      System.Text.Encoding.CodePages；见 FirebirdText.cs。
     -->
-    <PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
+    <PackageReference Include="System.Text.Json" Version="8.0.0" />
   </ItemGroup>
 
 </Project>

@@ -1189,7 +1189,12 @@ internal sealed class FirebirdSession
     object CloseQuerySession(JsonElement p)
     {
         string sessionId = FirebirdRuntimeServer.Str(p, "sessionId") ?? "";
-        if (_cursors.Remove(sessionId, out var cursor)) cursor.Dispose();
+        // Dictionary 在 net48 无 Remove(key, out value)（.NET 8 才加），用 TryGetValue + Remove 兼容。
+        if (_cursors.TryGetValue(sessionId, out var cursor))
+        {
+            _cursors.Remove(sessionId);
+            cursor.Dispose();
+        }
         return new { ok = true };
     }
 

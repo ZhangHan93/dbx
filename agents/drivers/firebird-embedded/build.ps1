@@ -1,4 +1,4 @@
-# Build the Firebird Embedded agent as a 32-bit single-file self-contained executable.
+# Build the Firebird Embedded agent as a 32-bit framework-dependent net48 executable.
 #
 # x86 ONLY, and only one RID.
 #   All three engines (fb25/fb30/fb50) are Win32/x86, and native DLL bitness is hard:
@@ -21,10 +21,12 @@ $ErrorActionPreference = "Stop"
 
 Push-Location $PSScriptRoot
 try {
-    dotnet publish dbx-agent-firebird-embedded.csproj -c Release -r win-x86 `
-        --self-contained true -p:PublishSingleFile=true -o publish
+    # net48 framework-dependent：去掉 --self-contained / -p:PublishSingleFile（Framework 不支持单文件）
+    # 先清掉上次产物，避免残留的 agent.exe（旧版单文件 net8）被一并打进包。
+    if (Test-Path "publish") { Remove-Item -Recurse -Force publish }
+    dotnet publish dbx-agent-firebird-embedded.csproj -c Release -r win-x86 -o publish
 
-    Copy-Item "publish/dbx-agent-firebird-embedded.exe" "publish/agent.exe" -Force
+    Get-ChildItem "publish/dbx-agent-firebird-embedded.*" | Rename-Item -NewName { $_.Name -replace 'dbx-agent-firebird-embedded','agent' }
 
     # Copy the engines whole - native DLLs plus plugins/intl cannot be packed into the
     # single file, and they must sit in engines/ next to agent.exe (EnginePin.EngineRoot).

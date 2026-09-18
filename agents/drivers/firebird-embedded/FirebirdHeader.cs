@@ -67,7 +67,15 @@ internal static class FirebirdHeaderReader
                 FileShare.ReadWrite | FileShare.Delete);
 
             head = new byte[HeaderSize];
-            int read = stream.ReadAtLeast(head, HeaderSize, throwOnEndOfStream: false);
+            // ⚠️ net48 无 FileStream.ReadAtLeast（.NET 7 才加），这里手搓等价循环：
+            //   读满 HeaderSize 字节为止，遇 EOF 提前返回已读长度（throwOnEndOfStream:false 语义）。
+            int read = 0;
+            while (read < HeaderSize)
+            {
+                int n = stream.Read(head, read, HeaderSize - read);
+                if (n == 0) break;
+                read += n;
+            }
             if (read < MinimumUsefulSize)
                 return Reject($"file is too small to be a Firebird database ({read} bytes)");
         }
