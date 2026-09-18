@@ -376,7 +376,7 @@ cd "$SRC" && "$NODE" scripts/sync-connection-types.mjs
 **可选（不阻塞编译）**：
 
 - **R6** `crates/dbx-core/src/sql_dialect/table_select.rs:1084` —— 在 `#[test] fn odbc_table_preview_omits_dialect_specific_limit()` 的 `for database_type in [Odbc, Odbc32]` 里加一项，断言 Firebird 也不出现 `LIMIT`。
-  ⚠️ 它在 `#[test]` 里 ⇒ **不改也不会红**（`build-odbc.yml` 根本没有 `cargo test`）⇒ 但**期望值必须真机实测**，禁止手推（见 §4 坑 13）。
+  ⚠️ 它在 `#[test]` 里 ⇒ **不改也不会红**（`build-my-agents.yml` 根本没有 `cargo test`）⇒ 但**期望值必须真机实测**，禁止手推（见 §4 坑 13）。
 
 **不用改**（已核实，避免多余改动）：
 
@@ -610,7 +610,7 @@ if (Test-Path "engines") {
 
 ### S5 · CI（扩展既有 workflow，不新建）
 
-改 `.github/workflows/build-odbc.yml`（顺手可改名 `build-agents.yml`，但**改名会动到 `on.push.branches` 之外的东西，风险低、可选**）：
+改 `.github/workflows/build-my-agents.yml`（**已于 2026-09-18 由 `build-odbc.yml` 改名**：这个 workflow 现在产 dbx.exe + odbc x64/x86 + firebird-embedded 三个 agent，`build-odbc` 这个名字已经过时。⚠️ 改名必须与 `odbc-build-output/manage_fork_workflows.py` 的 `DEFAULT_KEEP` **同一次完成**，否则新 workflow 会被 `--apply` 当白名单外禁用 ⇒ **push 再也跑不起 CI 且毫无提示**）：
 
 1. 加两步（紧跟现有两个 ODBC agent 构建步骤之后）：
 
@@ -630,7 +630,7 @@ if (Test-Path "engines") {
 3. **保留** `Typecheck frontend` 步骤（`build-odbc.yml:53-59` 那段注释就是为「穷举表漏键」踩坑后加的）—— F1/F2 靠它兜底。
 
 **CI 只做一次**：S1+S2+S3 一起推。**agent 改动走本地 `build.ps1`，不占 CI**。
-⚠️ `build-odbc.yml` **无 `concurrency` 组** ⇒ 连推两次会有两个 run 并行（互不阻塞，无需 cancel）。⚠️ **无 `cargo test`** ⇒ CI 绿 ≠ 单测过。
+⚠️ `build-my-agents.yml` **无 `concurrency` 组** ⇒ 连推两次会有两个 run 并行（互不阻塞，无需 cancel）。⚠️ **无 `cargo test`** ⇒ CI 绿 ≠ 单测过。
 
 ### S6 · 离线包 + 部署
 
