@@ -1,0 +1,12 @@
+bin/
+obj/
+publish/
+*.user
+
+# 三套 Firebird x86 引擎（12 + 26 + 51 MB ≈ 89 MB）不进仓库。
+# 打包/部署时由 Build-DBX-*-OfflinePackage.ps1 / deploy.py 本地拷入。
+# 可复现来源见 agents/docs/firebird-embedded-plan.zh-CN.md S4-11。
+engines/
+
+# 引擎在运行期一定会写这两个文件（Firebird 本身的日志与锁文件），别当源码提交。
+firebird.log

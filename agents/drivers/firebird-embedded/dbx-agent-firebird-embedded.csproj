@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>dbx-agent-firebird-embedded</AssemblyName>
+    <RootNamespace>DbxAgentFirebirdEmbedded</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>false</InvariantGlobalization>
+    <TieredPgo>false</TieredPgo>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <!--
+      ⚠️ 绝不 AnyCPU：本 agent 必须与引擎 DLL 位宽一致（三套引擎都是 Win32/x86）。
+         x64 的 dbx.exe 拉起一个 AnyCPU exe 时会以 x64 运行，P/Invoke 到 x86 的
+         fbembed/fbclient 必然失败。位宽由 build.ps1 的 `-r win-x86` 钉死。
+    -->
+    <PlatformTarget>x86</PlatformTarget>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      单 exe 方案下 agent 自己就要用 FbConnection，所以必须引用 provider（与 ODBC 不同）。
+      provider 是纯托管的，P/Invoke 按需触发 ⇒ 引用它并不会在启动时就碰引擎。
+      ⚠️ 版本钉死 10.3.4：ClientLibrary 属性与 NONE 字符集的 Latin1 往返行为
+         都是在 10.3.4 上实测的，别改成浮动版本。
+    -->
+    <PackageReference Include="FirebirdSql.Data.FirebirdClient" Version="10.3.4" />
+    <!--
+      GBK(936) 在 .NET Core 上默认不可用，NONE 字符集老库（病例.g_b）的中文还原要靠它。
+      见 FirebirdText.cs。
+    -->
+    <PackageReference Include="System.Text.Encoding.CodePages" Version="8.0.0" />
+  </ItemGroup>
+
+</Project>

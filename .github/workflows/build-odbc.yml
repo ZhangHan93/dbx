@@ -72,6 +72,31 @@ jobs:
           dotnet publish -c Release -r win-x86 --self-contained true -p:PublishSingleFile=true -o publish-x86
           Rename-Item publish-x86/dbx-agent-odbc.exe agent.exe
 
+      # Firebird Embedded agent. x86 ONLY - all three bundled engines (fb25/fb30/fb50) are
+      # Win32/x86 and native DLL bitness is absolute, so there is no x64/x86 pair here.
+      # build.ps1 carries the engines/ copy behind a Test-Path guard because engines/ is
+      # ~89 MB and deliberately not in git: CI produces agent.exe alone and the engines are
+      # copied in at packaging time.
+      # The PE assertion is not decorative - flipping PlatformTarget to AnyCPU/x64 builds
+      # and runs fine, then fails at the first P/Invoke into an x86 fbclient.
+      - name: Build Firebird Embedded agent (32-bit)
+        working-directory: agents/drivers/firebird-embedded
+        shell: pwsh
+        run: |
+          # -ExecutionPolicy Bypass is explicit: the runner's pwsh shell does not go through
+          # `-ExecutionPolicy Bypass`, so a Restricted/RemoteSigned machine policy would kill
+          # this step at the very first line with an unhelpful error.
+          pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1
+
+          $exe = Get-Item publish/agent.exe
+          $bytes = [System.IO.File]::ReadAllBytes($exe.FullName)
+          $lfanew = [System.BitConverter]::ToUInt32($bytes, 0x3C)          # e_lfanew
+          $machine = [System.BitConverter]::ToUInt16($bytes, $lfanew + 4)  # IMAGE_FILE_HEADER.Machine
+          if ($machine -ne 0x014C) {
+            throw ("agent.exe is not x86 (PE machine 0x{0:X4}, expected 0x014C)" -f $machine)
+          }
+          Write-Output ("agent.exe: {0:N0} bytes, PE machine 0x{1:X4} (x86) OK" -f $exe.Length, $machine)
+
       - name: Build Tauri (dbx.exe)
         run: pnpm tauri build --no-bundle
 
@@ -84,3 +109,4 @@ jobs:
             target/release/dbx.exe
             agents/drivers/odbc/publish/agent.exe
             agents/drivers/odbc/publish-x86/agent.exe
+            agents/drivers/firebird-embedded/publish/agent.exe

@@ -88,6 +88,12 @@ function sqlStatementSpans(sql: string, dialectId: string): Array<{ start: numbe
 export function quoteTableIdentifier(databaseType: DatabaseType | undefined, name: string): string {
   if ((databaseType === "gaussdb" || databaseType === "opengauss") && isExplicitlyQuotedSqlIdentifier(name)) return name;
   if (databaseType === "iotdb") return name;
+  // Firebird Embedded: an agent process may serve a SQL-dialect-1 database, where the double
+  // quote is a *string* delimiter and `FROM "T"` is a syntax error (measured: "Token unknown").
+  // Dialect 1 has no quoted-identifier concept at all, and Firebird stores unquoted names in
+  // upper case, so leaving identifiers bare is correct for dialect 1 and harmless for dialect 3.
+  // Dialect-aware quoting comes from the driver-reported quote (see quoteTableDataIdentifier).
+  if (databaseType === "firebird-embedded") return name;
   // JDBC connections use the driver-reported identifier quote string
   // (DatabaseMetaData.getIdentifierQuoteString()) — pass through unquoted.
   if (databaseType === "jdbc") return name;
@@ -124,7 +130,7 @@ export function quoteTableDataIdentifier(databaseType: DatabaseType | undefined,
     return `${identifierQuote}${name.replaceAll(identifierQuote, identifierQuote + identifierQuote)}${identifierQuote}`;
   }
   if ((databaseType === "gaussdb" || databaseType === "opengauss" || databaseType === "postgres") && identifierQuote != null) return quoteGaussDbJdbcIdentifier(name, identifierQuote);
-  if ((databaseType === "kingbase" || databaseType === "informix" || databaseType === "spanner") && identifierQuote != null) {
+  if ((databaseType === "kingbase" || databaseType === "informix" || databaseType === "spanner" || databaseType === "firebird-embedded") && identifierQuote != null) {
     if (!identifierQuote) return name;
     return `${identifierQuote}${name.replaceAll(identifierQuote, identifierQuote + identifierQuote)}${identifierQuote}`;
   }
