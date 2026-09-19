@@ -21,7 +21,7 @@ vi.mock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => true }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 vi.mock("@tauri-apps/plugin-process", () => ({ relaunch: mocks.relaunch }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
-const settings = reactive({ updateDownloadSource: "official", ignoredUpdateVersion: "", updateNotificationsEnabled: true, autoDownloadUpdates: true });
+const settings = reactive({ updateDownloadSource: "official", ignoredUpdateVersion: "", updateNotificationsEnabled: true, autoDownloadUpdates: true, autoUpdateApp: true });
 vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: settings, updateEditorSettingsAndPersist: mocks.persist }) }));
 const info = { current_version: "1.0.0", latest_version: "1.1.0", update_available: true, portable_mode: false, manual_update_only: false, release_name: "v1.1.0", release_url: "https://example.com", release_notes: "Changes" };
 const cache = { cache_id: "cached", version: "1.1.0", portable_mode: false, release_url: "https://example.com", release_notes: "Changes", downloaded_at: 1 };
@@ -59,6 +59,7 @@ beforeEach(() => {
   settings.ignoredUpdateVersion = "";
   settings.updateNotificationsEnabled = true;
   settings.autoDownloadUpdates = true;
+  settings.autoUpdateApp = true;
   mocks.checkForUpdates.mockResolvedValue(info);
   mocks.downloadUpdate.mockResolvedValue(cache);
   mocks.getDownloadedUpdate.mockResolvedValue(null);
@@ -74,7 +75,7 @@ afterEach(() => {
 // 不再发起真实检查，下列依赖完整更新生命周期的用例不再成立，整组跳过。
 describe.skip("silent update lifecycle", () => {
   it("checks and shows a badge without downloading when automatic downloads are disabled", async () => {
-    settings.autoDownloadUpdates = false;
+    settings.autoUpdateApp = false;
     const updater = mount();
     await updater.initialize();
     await flush();
@@ -91,7 +92,7 @@ describe.skip("silent update lifecycle", () => {
     expect(mocks.installDownloadedUpdate).not.toHaveBeenCalled();
   });
   it("surfaces a newer release instead of a stale package with automatic downloads disabled", async () => {
-    settings.autoDownloadUpdates = false;
+    settings.autoUpdateApp = false;
     mocks.getDownloadedUpdate.mockResolvedValue(cache);
     mocks.checkForUpdates.mockResolvedValue({ ...info, latest_version: "1.2.0", release_name: "v1.2.0" });
     const updater = mount();
@@ -110,7 +111,7 @@ describe.skip("silent update lifecycle", () => {
     expect(updater.updateDownloaded.value).toBe(true);
   });
   it("preserves a prepared package with automatic downloads disabled", async () => {
-    settings.autoDownloadUpdates = false;
+    settings.autoUpdateApp = false;
     mocks.getDownloadedUpdate.mockResolvedValue(cache);
     const updater = mount();
     await updater.initialize();
@@ -123,11 +124,11 @@ describe.skip("silent update lifecycle", () => {
     expect(mocks.installDownloadedUpdate).toHaveBeenCalledWith(cache.cache_id, cache.version);
   });
   it("starts a silent download when the preference is enabled", async () => {
-    settings.autoDownloadUpdates = false;
+    settings.autoUpdateApp = false;
     const updater = mount();
     await updater.initialize();
     await flush();
-    settings.autoDownloadUpdates = true;
+    settings.autoUpdateApp = true;
     await vi.waitFor(() => expect(updater.updateDownloaded.value).toBe(true));
     expect(mocks.downloadUpdate).toHaveBeenCalledOnce();
     expect(updater.showUpdateDialog.value).toBe(false);
@@ -139,23 +140,23 @@ describe.skip("silent update lifecycle", () => {
     const updater = mount();
     const checking = updater.checkUpdates({ silent: true });
     await vi.waitFor(() => expect(mocks.downloadUpdate).toHaveBeenCalledOnce());
-    settings.autoDownloadUpdates = false;
+    settings.autoUpdateApp = false;
     await vi.waitFor(() => expect(updater.phase.value).toBe("idle"));
     await checking;
     expect(mocks.cancelUpdateDownload).toHaveBeenCalledOnce();
     expect(updater.hasUpdateAvailable.value).toBe(true);
   });
   it("does not cancel a manually started background download when the preference changes", async () => {
-    settings.autoDownloadUpdates = false;
+    settings.autoUpdateApp = false;
     const updater = mount();
     await updater.checkUpdates();
     const pending = deferred<typeof cache>();
     mocks.downloadUpdate.mockReturnValue(pending.promise);
     const downloading = updater.downloadUpdateInBackground();
     await flush();
-    settings.autoDownloadUpdates = true;
+    settings.autoUpdateApp = true;
     await nextTick();
-    settings.autoDownloadUpdates = false;
+    settings.autoUpdateApp = false;
     await flush();
     expect(mocks.cancelUpdateDownload).not.toHaveBeenCalled();
     updater.showUpdateDialog.value = false;
@@ -174,13 +175,13 @@ describe.skip("silent update lifecycle", () => {
     expect(mocks.installDownloadedUpdate).not.toHaveBeenCalled();
     expect(mocks.relaunch).not.toHaveBeenCalled();
   });
-  it("shows no badge until a download finishes, and closing does not cancel", async () => {
+  it("keeps the cloud icon available while downloading, and closing does not cancel", async () => {
     const pending = deferred<typeof cache>();
     mocks.downloadUpdate.mockReturnValue(pending.promise);
     const updater = mount();
     const checking = updater.checkUpdates();
     await flush();
-    expect(updater.hasUpdateAvailable.value).toBe(false);
+    expect(updater.hasUpdateAvailable.value).toBe(true);
     updater.showUpdateDialog.value = false;
     pending.resolve(cache);
     await checking;
@@ -247,15 +248,23 @@ describe.skip("silent update lifecycle", () => {
     expect(mocks.discardDownloadedUpdate).not.toHaveBeenCalled();
     expect(updater.updateDownloaded.value).toBe(true);
   });
-  it("hides ready badge when notifications disabled but preserves manual installation", async () => {
+  it("keeps a ready update available when automatic app updates are disabled", async () => {
     mocks.getDownloadedUpdate.mockResolvedValue(cache);
     const updater = mount();
     await updater.initialize();
-    settings.updateNotificationsEnabled = false;
+    settings.autoUpdateApp = false;
     await flush();
-    expect(updater.hasUpdateAvailable.value).toBe(false);
+    expect(updater.hasUpdateAvailable.value).toBe(true);
     expect(updater.updateDownloaded.value).toBe(true);
     expect(mocks.discardDownloadedUpdate).not.toHaveBeenCalled();
+  });
+  it("shows a remote app update without downloading it when automatic app updates are disabled", async () => {
+    settings.autoUpdateApp = false;
+    const updater = mount();
+    await updater.checkUpdates({ silent: true });
+    expect(updater.hasUpdateAvailable.value).toBe(true);
+    expect(updater.updateDownloaded.value).toBe(false);
+    expect(mocks.downloadUpdate).not.toHaveBeenCalled();
   });
   it("ignores progress belonging to another version or download attempt", async () => {
     const pending = deferred<typeof cache>();
@@ -368,7 +377,7 @@ describe.skip("silent update lifecycle", () => {
     expect(updater.updateDownloaded.value).toBe(false);
   });
 
-  it("resumes after notifications are reenabled while cancellation is pending", async () => {
+  it("resumes after automatic app updates are reenabled while cancellation is pending", async () => {
     const pendingDownload = deferred<typeof cache>();
     const pendingCancel = deferred<void>();
     mocks.downloadUpdate.mockReturnValueOnce(pendingDownload.promise);
@@ -376,9 +385,9 @@ describe.skip("silent update lifecycle", () => {
     const updater = mount();
     await updater.initialize();
     await vi.waitFor(() => expect(mocks.downloadUpdate).toHaveBeenCalledTimes(1));
-    settings.updateNotificationsEnabled = false;
+    settings.autoUpdateApp = false;
     await nextTick();
-    settings.updateNotificationsEnabled = true;
+    settings.autoUpdateApp = true;
     await nextTick();
     pendingDownload.reject(new Error("cancelled"));
     pendingCancel.resolve();
