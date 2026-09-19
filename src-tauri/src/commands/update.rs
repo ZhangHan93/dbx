@@ -30,6 +30,28 @@ const MAX_PORTABLE_ARCHIVE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_PORTABLE_SIGNATURE_BYTES: usize = 64 * 1024;
 const IS_WINDOWS_7_TARGET: bool = cfg!(target_vendor = "win7");
 
+// ── DBX fork 自研落点（FORK_ 前缀，合并冲突时秒定位）──────────────────
+// 本分支由 CI 重新构建，应用内在线更新（指向上游 t8y2/dbx）永远拉不到 fork 的
+// 构建物，触发即覆盖自研 agent。另：fork 常部署在内网，联网检查会卡顿或告警。
+// 规格：零联网 / 零徽章 / 误触即提示。设计见工作区 DBX-禁用更新-设计方案-20260919.md。
+const FORK_UPDATES_DISABLED: bool = true;
+const FORK_RELEASE_URL: &str = "https://github.com/ZhangHan93/dbx";
+
+/// fork 自锚定 UpdateInfo：不联网、永远「无更新」，并带 manual_update_only 纵深防御。
+fn fork_local_update_info() -> UpdateInfo {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    UpdateInfo {
+        current_version: current_version.clone(),
+        latest_version: current_version,
+        update_available: false,
+        portable_mode: crate::data_dir::is_portable_mode(),
+        manual_update_only: true,
+        release_name: "DBX 自开发分支".to_string(),
+        release_url: FORK_RELEASE_URL.to_string(),
+        release_notes: String::new(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpdateDownloadSource {
@@ -357,6 +379,10 @@ pub async fn check_for_updates(
     locale: Option<String>,
     source: Option<dbx_core::DownloadSource>,
 ) -> Result<UpdateInfo, String> {
+    if FORK_UPDATES_DISABLED {
+        // fork 落点：零 HTTP、永返回「无更新」（以下上游逻辑编译期保留，运行时不可达）
+        return Ok(fork_local_update_info());
+    }
     let locale = locale.unwrap_or_else(|| "zh-CN".to_string());
     let release = dbx_core::update::fetch_latest_release(&locale, source.unwrap_or_default()).await?;
     let current_version = env!("CARGO_PKG_VERSION");
@@ -367,7 +393,8 @@ pub async fn check_for_updates(
 }
 
 fn requires_manual_update(is_windows_7_target: bool) -> bool {
-    is_windows_7_target
+    // fork 落点：恒 true ⇒ check_for_updates / restore_cached / download_update 三调用点一次覆盖
+    FORK_UPDATES_DISABLED || is_windows_7_target
 }
 
 #[tauri::command]

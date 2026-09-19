@@ -9,6 +9,7 @@ import { currentLocale } from "@/i18n";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { formatAiInlineMarkdownFragment, handleAiMarkdownLinkClick } from "@/lib/ai/aiMarkdown";
 import { changelogLangFromLocale, changelogReleaseUrl, changelogWebsiteUrl, createLatestRequestGuard, fetchChangelog, type ChangelogItem, type ChangelogLang, type ChangelogRelease } from "@/lib/app/changelog";
+import { FORK_UPDATES_DISABLED } from "@/lib/updates/forkUpdateGuard";
 
 const PAGE_SIZE = 5;
 
@@ -102,6 +103,7 @@ function loadMore() {
 }
 
 async function load(force = false) {
+  if (FORK_UPDATES_DISABLED) return; // fork 落点：更新日志走 R2 CDN（15s 超时），内网会卡顿/告警
   const lang = changelogLang.value;
   const requestId = loadRequest.begin();
   loading.value = true;

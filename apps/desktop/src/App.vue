@@ -30,6 +30,7 @@ import { useComponentUpdates, type ComponentUpdateCategory } from "@/composables
 import { driverStoreUpdateBadgeCount, showMcpUpdateBadge } from "@/lib/updates/updateBadges";
 import { markPendingComponentUpdatesAfterAppUpdate, resolveUpdateAllAction, runPendingComponentUpdatePlan, takePendingComponentUpdatesAfterAppRestart, type PendingComponentUpdatePlan } from "@/lib/updates/componentUpdateOrchestration";
 import { isUpdatePreviewMockEnabled } from "@/lib/updates/updatePreviewMock";
+import { FORK_NO_ONLINE_UPDATE_NOTICE, FORK_UPDATES_DISABLED } from "@/lib/updates/forkUpdateGuard";
 import { useExportTracker } from "@/composables/useExportTracker";
 import { useFileDrop } from "@/composables/useFileDrop";
 import { useLargeSqlFileStreamingFallback } from "@/composables/useLargeSqlFileFallback";
@@ -236,7 +237,6 @@ const {
   isIgnoringUpdate,
   activeTaskCount: activeUpdateTaskCount,
   hasUpdateAvailable,
-  updatesDisabled,
   openUrl,
   checkUpdates,
   openLatestRelease,
@@ -1192,6 +1192,11 @@ function openPluginConnectionDialog(pluginId: string, providerId: string) {
   showConnectionDialog.value = true;
 }
 async function checkAllUpdates() {
+  if (FORK_UPDATES_DISABLED) {
+    // fork 落点：设置页「检查更新」误触 → 只提示，不联网
+    toast(FORK_NO_ONLINE_UPDATE_NOTICE, 5000);
+    return;
+  }
   if (manualCheckingAllUpdates.value) return;
   manualCheckingAllUpdates.value = true;
   const startedAt = Date.now();
@@ -1210,6 +1215,11 @@ function openDriverStoreFromUpdate(target?: DriverStoreTab) {
 }
 
 function handleToolbarUpdateClick() {
+  if (FORK_UPDATES_DISABLED) {
+    // fork 落点：工具栏更新图标 / 设置页「打开更新中心」共用本函数 ⇒ 一处覆盖两个误触入口
+    toast(FORK_NO_ONLINE_UPDATE_NOTICE, 5000);
+    return;
+  }
   showUpdateDialog.value = true;
   if (!toolbarHasUpdateAvailable.value && !checkingAllUpdates.value) void checkAllUpdates();
 }
@@ -3753,6 +3763,7 @@ function openDriverStoreFromEvent(event: Event) {
 }
 
 function runUpdateNotificationChecks() {
+  if (FORK_UPDATES_DISABLED) return; // fork 落点：通道 B（驱动/JDBC/MCP/插件）唯一的自动联网入口
   void refreshAgentDriverUpdateCount();
   void refreshMcpUpdateStatus();
   void componentUpdates.refresh();
@@ -4348,7 +4359,6 @@ onUnmounted(() => {
           v-model:open="showUpdateDialog"
           :update-info="updateInfo"
           :update-check-message="updateCheckMessage"
-          :updates-disabled="updatesDisabled"
           :checking-updates="checkingUpdates"
           :update-check-failed="updateCheckFailed"
           :update-download-source="settingsStore.editorSettings.updateDownloadSource"

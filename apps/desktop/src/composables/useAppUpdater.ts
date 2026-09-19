@@ -10,11 +10,6 @@ import { shouldBlockAppUpdate } from "@/lib/app/appUpdateTaskGuard";
 import { uuid } from "@/lib/common/utils";
 import { isUpdatePreviewMockEnabled, previewAppUpdateInfo } from "@/lib/updates/updatePreviewMock";
 
-// DBX fork 专属：本分支由 CI 重新构建发布，应用内在线更新通道（指向 t8y2/dbx 上游）
-// 永远拉不到 fork 的构建物，触发即覆盖自研能力。故禁用自动探测与在线更新，
-// 仅保留手动入口用于提示用户改走 CI。
-const FORK_UPDATE_DISABLED = true;
-
 interface UseAppUpdaterOptions {
   getActiveTaskCount?: () => number;
   prepareForUpdate?: () => Promise<() => void>;
@@ -133,7 +128,6 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   const showUpdateDialog = ref(false);
   const downloadProgress = ref<number | null>(null);
   const isIgnoringUpdate = ref(false);
-  const updatesDisabled = ref(FORK_UPDATE_DISABLED);
   const checkingUpdates = computed(() => phase.value === "checking");
   const isDownloadingUpdate = computed(() => phase.value === "downloading");
   const updateDownloaded = computed(() => downloaded.value !== null);
@@ -217,13 +211,6 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     return t("updates.installFailed", { error: message });
   }
   async function checkUpdates(checkOptions: { silent?: boolean } = {}) {
-    if (FORK_UPDATE_DISABLED) {
-      if (checkOptions.silent) return;
-      showUpdateDialog.value = true;
-      updateCheckFailed.value = false;
-      updateCheckMessage.value = "此分支暂不支持在线更新，请通过 CI 重新构建获取新版本";
-      return;
-    }
     if (disposed || isIgnoringUpdate.value) return;
     if (!checkOptions.silent) showUpdateDialog.value = true;
     // A downloaded-but-uninstalled update keeps the app in the ready phase; checks
@@ -441,7 +428,6 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
     if (updateReady.value) await performInstall(true);
   }
   async function initialize() {
-    if (FORK_UPDATE_DISABLED) return;
     if (initialized || disposed) return;
     initialized = true;
     if (isTauriRuntime()) {
@@ -498,7 +484,6 @@ export function useAppUpdater(options: UseAppUpdaterOptions = {}) {
   onScopeDispose(dispose);
   return {
     phase,
-    updatesDisabled,
     checkingUpdates,
     updateInfo,
     updateCheckMessage,

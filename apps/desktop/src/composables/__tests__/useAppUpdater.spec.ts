@@ -71,9 +71,7 @@ afterEach(() => {
   app?.unmount();
   vi.useRealTimers();
 });
-// DBX fork: 在线更新已在 useAppUpdater 中禁用（FORK_UPDATE_DISABLED），checkUpdates
-// 不再发起真实检查，下列依赖完整更新生命周期的用例不再成立，整组跳过。
-describe.skip("silent update lifecycle", () => {
+describe("silent update lifecycle", () => {
   it("checks and shows a badge without downloading when automatic downloads are disabled", async () => {
     settings.autoUpdateApp = false;
     const updater = mount();
