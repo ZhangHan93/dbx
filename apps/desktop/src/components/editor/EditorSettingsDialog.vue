@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { HISTORY_RETENTION_LIMITS, useHistoryRetentionSetting } from "@/composables/useHistoryRetentionSetting";
 import { ref, watch, shallowRef, computed, onMounted, onUnmounted, nextTick } from "vue";
 import type { Ref } from "vue";
 import type { EditorView as EditorViewType } from "@codemirror/view";
@@ -17,6 +18,7 @@ import {
   Copy,
   Download,
   ExternalLink,
+  FolderOpen,
   Eye,
   Filter,
   Globe,
@@ -174,7 +176,7 @@ import {
   type WebDavConfig,
 } from "@/lib/backend/api";
 import { eventToModifierOnlyShortcut, eventToShortcut } from "@/lib/editor/keyboardShortcuts";
-import { SHORTCUT_DEFINITIONS, countShortcutConflictPairs, findCrossScopeShortcutConflicts, findShortcutConflict, isReservedShortcut, normalizeShortcutSettings, type ShortcutActionId, type ShortcutDefinition, type ShortcutScope } from "@/lib/editor/shortcutRegistry";
+import { SHORTCUT_DEFINITIONS, countShortcutConflictPairs, findCrossScopeShortcutConflicts, findShortcutConflict, isReservedShortcut, normalizeShortcutSettings, resolveCapturedShortcutEdit, type ShortcutActionId, type ShortcutDefinition, type ShortcutScope } from "@/lib/editor/shortcutRegistry";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
 import { COLUMN_NAME_COPY_SEPARATOR_LABELS, COLUMN_NAME_COPY_SEPARATOR_OPTIONS, isColumnNameCopySeparator, type ColumnNameCopySeparator } from "@/lib/dataGrid/dataGridColumnNameCopy";
@@ -293,6 +295,8 @@ import { buildConnectionGroupIdPathMap, connectionGroupDestinationRows, connecti
 const { t, locale } = useI18n();
 const { toast } = useToast();
 const settingsStore = useSettingsStore();
+const historyRetention = useHistoryRetentionSetting();
+const { draft: editHistoryRetentionLimit, loaded: historyRetentionLoaded, loading: historyRetentionLoading, saving: historyRetentionSaving, loadError: historyRetentionLoadError } = historyRetention;
 const connectionStore = useConnectionStore();
 const hasSqlServerConnection = computed(() => connectionStore.connections.some((connection) => effectiveDatabaseTypeForConnection(connection) === "sqlserver"));
 const savedSqlStore = useSavedSqlStore();
@@ -1839,6 +1843,7 @@ watch(
   (open) => {
     if (open) {
       syncEditorSettingsDraftFromStore();
+      void historyRetention.load();
       editShowTrayIcon.value = settingsStore.desktopSettings.show_tray_icon;
       editQuitOnClose.value = settingsStore.desktopSettings.quit_on_close;
       editIconTheme.value = settingsStore.desktopSettings.icon_theme;
@@ -1847,6 +1852,7 @@ watch(
       editDuckDbWorkerProcessIsolation.value = settingsStore.desktopSettings.duckdb_worker_process_isolation;
       editSidebarTablePageSize.value = settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE;
     } else {
+      historyRetention.discard();
       clearThemePalettePreview();
       clearUiFontFamilyPreview();
       restoreLocaleOptionPreview();
@@ -2035,10 +2041,11 @@ const hasBlockingShortcutConflicts = computed(() => {
 });
 const hasBlockingFormatterConfig = computed(() => activeSettingsTab.value === "formatter" && !sqlFormatterConfigValid.value);
 const hasBlockingQueryResultRowLimit = computed(() => editQueryResultMaxRowsEnabled.value && editQueryResultMaxRows.value < editPageSize.value);
-const hasApplyBlocker = computed(() => hasBlockingShortcutConflicts.value || hasBlockingFormatterConfig.value || hasBlockingQueryResultRowLimit.value);
+const hasApplyBlocker = computed(() => historyRetention.invalid.value || historyRetentionSaving.value || hasBlockingShortcutConflicts.value || hasBlockingFormatterConfig.value || hasBlockingQueryResultRowLimit.value);
 
 function hasChanges(): boolean {
   return (
+    historyRetention.changed.value ||
     hasImportedSettingsPendingApply.value ||
     hasEditorDraftChanges.value ||
     editShowTrayIcon.value !== settingsStore.desktopSettings.show_tray_icon ||
@@ -2054,6 +2061,7 @@ function hasChanges(): boolean {
 
 async function persistSettings() {
   if (hasApplyBlocker.value) return;
+  await historyRetention.save();
   const editorSettingsPatch = editorSettingsPatchFromDraft(currentEditorSettingsDraft(), editEditorSettingsBase.value);
   const sidebarObjectDisplayChanged = editorSettingsPatch.sidebarObjectDisplay !== undefined && editorSettingsPatch.sidebarObjectDisplay !== settingsStore.editorSettings.sidebarObjectDisplay;
   const sidebarTablePageSizeChanged = editSidebarTablePageSize.value !== (settingsStore.desktopSettings.sidebar_table_page_size ?? DEFAULT_SIDEBAR_TABLE_PAGE_SIZE);
@@ -2065,6 +2073,9 @@ async function persistSettings() {
     // result back into the input so an out-of-range draft doesn't keep
     // reporting unsaved changes after a successful apply.
     editRedisDatabaseDisplayLimit.value = settingsStore.editorSettings.redisDatabaseDisplayLimit;
+    // 同理：落盘口径可能改写键位（跨平台默认键、保留键回退），草稿要跟着回到
+    // 落盘值，避免面板卡在“未保存”无法应用（#9881）。
+    editShortcuts.value = normalizeShortcutSettings(settingsStore.editorSettings.shortcuts);
   }
   if (pendingBackgroundImageCleanup) {
     const cleanupPath = pendingBackgroundImageCleanup;
@@ -2227,6 +2238,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editSidebarCopyTableNameIncludeSchema.value = DEFAULT_EDITOR_SETTINGS.sidebarCopyTableNameIncludeSchema;
     editToolbarItems.value = { ...DEFAULT_EDITOR_SETTINGS.toolbarItems };
   } else if (tab === "data") {
+    historyRetention.reset();
     editShowColumnCommentsInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader;
     editShowColumnTypesInHeader.value = DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader;
     editDataGridShowTransposeFieldMetadata.value = DEFAULT_EDITOR_SETTINGS.dataGridShowTransposeFieldMetadata;
@@ -2284,6 +2296,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
 }
 
 function resetAllDefaults() {
+  historyRetention.reset();
   // Same contract as resetDefaultsForTab: a full reset also exits any
   // in-progress shortcut capture (#9066).
   editingShortcutId.value = null;
@@ -2688,7 +2701,19 @@ function onShortcutKeydown(actionId: ShortcutActionId, event: KeyboardEvent) {
     editingShortcutId.value = null;
     return;
   }
-  onShortcutChange(actionId, shortcut);
+  // 草稿必须正好等于落盘值：否则“未保存”状态永远消不掉，#9881 里
+  // 「应用」点了没反应、「应用并关闭」每次都弹未保存确认。
+  const captured = resolveCapturedShortcutEdit(actionId, shortcut, editShortcuts.value);
+  if (captured.rejectedByPlatformDefault) {
+    toast(t("settings.shortcutPlatformDefault"), 3000);
+    editingShortcutId.value = null;
+    return;
+  }
+  if (captured.changed) {
+    editShortcuts.value = captured.shortcuts;
+  } else {
+    onShortcutChange(actionId, shortcut);
+  }
   editingShortcutId.value = null;
 }
 
@@ -2729,10 +2754,14 @@ function cancelShortcutEdit() {
 function resetShortcut(actionId: ShortcutActionId) {
   const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === actionId);
   if (!definition) return;
-  editShortcuts.value = {
+  // The static definition default is the macOS literal for a few actions
+  // (selection-occurrence), so the reset must go through the same persisted
+  // normalization as capture — otherwise Windows drafts a key that can never
+  // save and silently flips to the platform default on apply.
+  editShortcuts.value = normalizeShortcutSettings({
     ...editShortcuts.value,
     [actionId]: definition.defaultShortcut,
-  };
+  });
 }
 
 function clearShortcut(actionId: ShortcutActionId) {
@@ -2761,6 +2790,28 @@ function setTabSortMode(value: TabSortMode) {
 
 function setSidebarActivation(value: "single" | "double") {
   editSidebarActivation.value = value;
+}
+
+// Custom AI skill root (read-only SKILL.md discovery; desktop-only, prd 09-21-public-skill-loader).
+const customSkillRootDraft = ref("");
+watch(
+  () => settingsStore.desktopSettings.custom_ai_skill_root,
+  (value) => {
+    customSkillRootDraft.value = value ?? "";
+  },
+  { immediate: true },
+);
+async function commitCustomSkillRoot() {
+  const trimmed = customSkillRootDraft.value.trim();
+  if ((settingsStore.desktopSettings.custom_ai_skill_root ?? "") === trimmed) return;
+  await settingsStore.updateDesktopSettings({ custom_ai_skill_root: trimmed || null });
+}
+async function pickCustomSkillRoot() {
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({ directory: true, multiple: false, title: t("settings.aiSkillRoot") });
+  if (typeof selected !== "string" || !selected) return;
+  customSkillRootDraft.value = selected;
+  await settingsStore.updateDesktopSettings({ custom_ai_skill_root: selected });
 }
 
 const activeSettingsTab = ref("appearance");
@@ -7405,6 +7456,21 @@ onUnmounted(() => {
 
             <!-- Data Tab -->
             <section v-else-if="activeSettingsTab === 'data'" data-settings-search-id="data" :class="['flex flex-col gap-5 py-2', settingsSearchTargetClass('data')]">
+              <div data-settings-search-id="history-retention" :class="['space-y-2', settingsSearchTargetClass('history-retention')]">
+                <Label for="history-retention-limit">{{ t("settings.historyRetentionLimit") }}</Label>
+                <p class="text-xs text-muted-foreground">{{ t("settings.historyRetentionDescription") }}</p>
+                <Select :model-value="String(editHistoryRetentionLimit)" :disabled="!historyRetentionLoaded || historyRetentionSaving" @update:model-value="(value) => (editHistoryRetentionLimit = Number(value))">
+                  <SelectTrigger id="history-retention-limit" class="w-40"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem v-for="limit in HISTORY_RETENTION_LIMITS" :key="limit" :value="String(limit)">{{ limit === 0 ? t("settings.historyRetentionUnlimited") : String(limit) }}</SelectItem>
+                  </SelectContent>
+                </Select>
+                <p v-if="historyRetentionLoading" class="text-xs text-muted-foreground">{{ t("common.loading") }}</p>
+                <div v-if="historyRetentionLoadError" class="flex items-center gap-2 text-xs text-destructive" role="alert">
+                  <span>{{ t("settings.historyRetentionLoadFailed", { error: historyRetentionLoadError }) }}</span>
+                  <Button type="button" variant="outline" size="sm" @click="historyRetention.load">{{ t("common.retry") }}</Button>
+                </div>
+              </div>
               <div data-settings-search-id="data-grid-filter-view" :class="['overflow-hidden rounded-md border bg-muted/20', settingsSearchTargetClass('data-grid-filter-view')]">
                 <div class="space-y-3 p-3">
                   <div class="flex items-start justify-between gap-4">
@@ -8896,6 +8962,26 @@ LIMIT 100;</pre
                     </p>
                   </div>
                   <Switch id="ai-restore-last-conversation" :model-value="settingsStore.restoreLastConversation" @update:model-value="(value) => settingsStore.setRestoreLastConversation(Boolean(value))" />
+                </div>
+              </div>
+
+              <!-- Custom skill directory (list mode, global, desktop-only) -->
+              <div v-if="aiConfigListMode === 'list' && !isWeb" class="space-y-3">
+                <Separator />
+                <div class="settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="flex items-center justify-between gap-4">
+                    <div class="space-y-1">
+                      <Label for="ai-custom-skill-root">{{ t("settings.aiSkillRoot") }}</Label>
+                      <p class="text-xs text-muted-foreground">{{ t("settings.aiSkillRootDesc") }}</p>
+                    </div>
+                    <Switch id="ai-custom-skill-root" :model-value="settingsStore.desktopSettings.custom_ai_skill_root_enabled === true" @update:model-value="(value) => settingsStore.updateDesktopSettings({ custom_ai_skill_root_enabled: Boolean(value) })" />
+                  </div>
+                  <div class="flex items-center gap-2">
+                    <Input v-model="customSkillRootDraft" :placeholder="t('settings.aiSkillRootPath')" :disabled="settingsStore.desktopSettings.custom_ai_skill_root_enabled !== true" class="h-8 flex-1 font-mono text-xs" @blur="commitCustomSkillRoot" @keydown.enter="commitCustomSkillRoot" />
+                    <Button variant="outline" size="sm" class="h-8 shrink-0 px-2" :disabled="settingsStore.desktopSettings.custom_ai_skill_root_enabled !== true" :aria-label="t('settings.aiSkillRootBrowse')" @click="pickCustomSkillRoot">
+                      <FolderOpen class="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
                 </div>
               </div>
 

@@ -184,7 +184,7 @@
         # ------------------------------------------------------------------ #
         packages.dbx-desktop = pkgs.stdenv.mkDerivation (finalAttrs: {
           pname = "dbx-desktop";
-          version = "0.6.18";
+          version = "0.6.19";
 
           src = pkgs.lib.cleanSource ./.;
 

@@ -519,6 +519,7 @@ async fn main() {
         .route("/schema/constraints", get(routes::schema::list_constraints))
         .route("/schema/partitions", get(routes::schema::list_partitions))
         .route("/schema/table-partition-status", get(routes::schema::get_table_partition_status))
+        .route("/schema/table-partitioning", get(routes::schema::get_table_partitioning))
         .route("/schema/invalid-indexes", get(routes::schema::list_invalid_indexes))
         .route("/schema/subpartitions", get(routes::schema::list_subpartitions))
         .route("/schema/functions", get(routes::schema::list_functions))
@@ -604,6 +605,8 @@ async fn main() {
         .route("/query/build-view-ddl-sql", post(routes::query::build_view_ddl_sql))
         .route("/query/build-table-structure-change-sql", post(routes::query::build_table_structure_change_sql))
         .route("/query/build-table-owner-change-sql", post(routes::query::build_table_owner_change_sql))
+        .route("/query/build-table-partition-operation-sql", post(routes::query::build_table_partition_operation_sql))
+        .route("/query/build-create-partitioned-table-sql", post(routes::query::build_create_partitioned_table_sql))
         .route(
             "/query/preview-sqlite-table-structure-change",
             post(routes::query::preview_sqlite_table_structure_change),
@@ -1136,6 +1139,11 @@ async fn main() {
         .route(
             "/app-settings/max-agent-turns",
             get(routes::app_settings::load_max_agent_turns).put(routes::app_settings::save_max_agent_turns),
+        )
+        .route(
+            "/app-settings/history-retention-limit",
+            get(routes::app_settings::load_history_retention_limit)
+                .put(routes::app_settings::save_history_retention_limit),
         )
         .route(
             "/app-settings/max-retries",

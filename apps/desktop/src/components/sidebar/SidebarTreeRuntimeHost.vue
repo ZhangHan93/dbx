@@ -967,8 +967,8 @@ async function toggle(requestId = beginNavigationRequest()) {
         await connectionStore.loadMongoDatabases(node.connectionId);
       } else if (config?.db_type === "dynamodb") {
         await connectionStore.loadDynamoDbTables(node.connectionId);
-      } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch" || config?.db_type === "meilisearch") {
-        // Expand: list indices (like other db types list databases).
+      } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch" || config?.db_type === "meilisearch" || config?.db_type === "solr") {
+        // Expand: list indices/cores (like other db types list databases).
         await connectionStore.loadElasticsearchIndices(node.connectionId);
       } else if (config?.db_type === "milvus") {
         await connectionStore.loadMilvusDatabases(node.connectionId);
@@ -1826,6 +1826,8 @@ async function openServerDashboard() {
     connectionStore.activeConnectionId = node.connectionId;
     if (currentDatabaseType() === "nacos") {
       queryStore.openNacosDashboard(node.connectionId);
+    } else if (currentDatabaseType() === "solr") {
+      queryStore.openSolrAdmin(node.connectionId);
     } else if (connectionSupportsXuguServerDashboard(connectionStore.getConfig(node.connectionId))) {
       queryStore.openXuguDashboard(node.connectionId);
     } else if (connectionSupportsPgServerDashboard(connectionStore.getConfig(node.connectionId))) {
@@ -2188,7 +2190,7 @@ async function openSidebarMultiTableDdlTab(targets: Array<TreeNode & { connectio
     async (ddl, target) => {
       const formatDialect = sqlFormatDialectForDbType(databaseTypeForNode(target));
       const formatted = await formatSqlForDisplay(ddl, formatDialect, settingsStore.editorSettings.sqlFormatter);
-      return formatSidebarDdlTemplateForDisplay(formatted, formatDialect, databaseTypeForNode(target), settingsStore.editorSettings.generateSqlIncludeDatabaseName, settingsStore.editorSettings.generateSqlQuoteIdentifiers, target.catalog);
+      return formatSidebarDdlTemplateForDisplay(formatted, formatDialect, databaseTypeForNode(target), settingsStore.editorSettings.generateSqlIncludeDatabaseName, target.database, settingsStore.editorSettings.generateSqlQuoteIdentifiers, target.catalog);
     },
   );
   connectionStore.activeConnectionId = tabTarget.connectionId;
@@ -4686,7 +4688,7 @@ const canOpenSqlFileExecution = computed(() => {
 const canExportAllDatabases = computed(() => {
   if (activeNode.value.type !== "connection" || !activeNode.value.connectionId) return false;
   const dbType = connectionStore.getConfig(activeNode.value.connectionId)?.db_type;
-  return !["redis", "mongodb", "dynamodb", "elasticsearch", "easysearch", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos", "plugin"].includes(dbType || "");
+  return !["redis", "mongodb", "dynamodb", "elasticsearch", "easysearch", "solr", "meilisearch", "qdrant", "milvus", "weaviate", "chromadb", "etcd", "zookeeper", "consul", "mq", "nacos", "plugin"].includes(dbType || "");
 });
 
 const canOpenScheduledBackups = computed(() => {
@@ -5597,7 +5599,11 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
     }
     if (
       node.connectionId &&
-      (currentDatabaseType() === "nacos" || connectionSupportsXuguServerDashboard(connectionStore.getConfig(node.connectionId)) || connectionSupportsServerDashboard(connectionStore.getConfig(node.connectionId)) || connectionSupportsPgServerDashboard(connectionStore.getConfig(node.connectionId)))
+      (currentDatabaseType() === "nacos" ||
+        currentDatabaseType() === "solr" ||
+        connectionSupportsXuguServerDashboard(connectionStore.getConfig(node.connectionId)) ||
+        connectionSupportsServerDashboard(connectionStore.getConfig(node.connectionId)) ||
+        connectionSupportsPgServerDashboard(connectionStore.getConfig(node.connectionId)))
     ) {
       items.push({ label: t("contextMenu.serverDashboard"), action: openServerDashboard, icon: Gauge });
     }

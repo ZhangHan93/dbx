@@ -129,6 +129,7 @@ const DamengJobAdmin = defineAsyncComponent(() => import("@/components/admin/Dam
 
 const DamengUserAdmin = defineAsyncComponent(() => import("@/components/admin/DamengUserAdmin.vue"));
 const DamengRoleAdmin = defineAsyncComponent(() => import("@/components/admin/DamengRoleAdmin.vue"));
+const SolrAdmin = defineAsyncComponent(() => import("@/components/solr/SolrAdmin.vue"));
 const PluginFilesystemTab = defineAsyncComponent(() => import("@/components/plugins/PluginFilesystemTab.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
@@ -139,7 +140,7 @@ import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGr
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { canCancelQueryExecution, isActiveResultLoading, queryExecutionLabelKey } from "@/lib/sql/queryExecutionState";
-import { sqlErrorEditorOffset, logSqlErrorPosition } from "@/lib/sql/errorPosition";
+import { sqlErrorDisplayPosition, sqlErrorEditorOffset, logSqlErrorPosition } from "@/lib/sql/errorPosition";
 import {
   databaseDisplayNameForTab,
   executionSummaryItems,
@@ -170,6 +171,7 @@ import { elasticsearchJsonResponseForResult } from "@/lib/elasticsearch/elastics
 import { elasticsearchProfileBodyForResult, parseElasticsearchProfile } from "@/lib/elasticsearch/elasticsearchProfile";
 import * as api from "@/lib/backend/api";
 import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
+import { queryResultExportBaseName } from "@/lib/export/saveTextFile";
 import { applyMongoGridChangesToDocument, applyMongoGridChangesToDocumentBaseline, buildMongoUpdateDocument, formatMongoShellLiteral, serializeMongoDocumentId, type MongoInputValue } from "@/lib/mongo/mongoDocumentValues";
 import type { DataGridSortMode } from "@/lib/dataGrid/dataGridSort";
 import { isDataGridToolbarCompact, type DataGridReloadIntent } from "@/lib/dataGrid/dataGridToolbar";
@@ -349,8 +351,14 @@ const activeResultExecutionTarget = computed(() => queryStore.activeResultExecut
 const activeResultConnection = computed(() => (activeResultExecutionTarget.value ? connectionStore.getConfig(activeResultExecutionTarget.value.connectionId) : props.activeConnection));
 const activeResultConnectionId = computed(() => activeResultExecutionTarget.value?.connectionId ?? props.activeTab.connectionId);
 // Row/column locate only makes sense for SQL editor tabs: data/preview tabs have
-// no user statement to map the backend position onto.
-const activeResultErrorPosition = computed(() => (props.activeTab.mode === "query" ? props.activeTab.result?.error?.errorPosition : undefined));
+// no user statement to map the backend position onto. Engines without a typed
+// position (Oracle) report it in the error text, so the label falls back to the
+// same resolver the jump uses — the button never appears when clicking it could
+// not move the caret.
+const activeResultErrorPosition = computed(() => {
+  if (props.activeTab.mode !== "query") return undefined;
+  return sqlErrorDisplayPosition(activeResultErrorOffsetOptions());
+});
 const activeResultDatabase = computed(() => activeResultExecutionTarget.value?.database ?? props.activeTab.database);
 const activeResultSchema = computed(() => activeResultExecutionTarget.value?.schema ?? props.activeTab.schema);
 const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(activeResultConnection.value));
@@ -413,6 +421,10 @@ function decreaseTableFontSize() {
 function increaseTableFontSize() {
   setTableFontSize(tableFontSize.value + 1);
 }
+
+/** Export file base name for the query result grid: the result's label (nearby
+ *  comment or `schema.table`) names exports, matching the result tab (#9894). */
+const activeQueryResultExportBaseName = computed(() => queryResultExportBaseName(props.activeTab.result?.sourceLabel, props.activeTab.title));
 
 const activeTabDimension = computed(() => {
   const tab = props.activeTab;
@@ -499,7 +511,7 @@ const activeStatementExecutionMarkers = computed(() =>
 const activeElasticsearchJsonResponse = computed(() => elasticsearchJsonResponseForResult(activeEffectiveDatabaseType.value, activeResultSql.value, props.activeTab.result));
 /** Whether the active result is an Elasticsearch _source table that also has a raw JSON toggle. */
 const activeElasticsearchRawBody = computed(() => {
-  if (activeEffectiveDatabaseType.value !== "elasticsearch" && activeEffectiveDatabaseType.value !== "easysearch") return undefined;
+  if (activeEffectiveDatabaseType.value !== "elasticsearch" && activeEffectiveDatabaseType.value !== "easysearch" && activeEffectiveDatabaseType.value !== "solr") return undefined;
   return props.activeTab.result?.elasticsearch_raw_body;
 });
 /** ES `_search?profile=true` body extracted from the active result, when present. */
@@ -958,6 +970,24 @@ function onHandleViewTableData(target: SqlObjectNavigationTarget) {
   emit("viewTableData", props.activeTab.id, target);
 }
 
+/**
+ * The structure/DDL editor only owns the object identity, so build the
+ * navigation target from the active tab and reuse the same "view data" path as
+ * the SQL editor context menu (issue #6724).
+ */
+function onHandleStructureViewData() {
+  const tab = props.activeTab;
+  const meta = tab.tableMeta;
+  const tableName = tab.structureTableName || meta?.tableName;
+  if (!tableName) return;
+  emit("viewTableData", tab.id, {
+    name: tableName,
+    database: meta?.database || tab.database,
+    schema: meta?.schema || tab.schema,
+    type: tab.structureTableType === "view" ? "view" : "table",
+  });
+}
+
 function onHandleViewTableDdl(target: SqlObjectNavigationTarget) {
   emit("viewTableDdl", props.activeTab.id, target);
 }
@@ -1077,9 +1107,10 @@ function openPluginResultView(pluginId: string, contributionId: string, label: s
     context: {
       connectionId: props.activeTab.connectionId || "",
       database: props.activeTab.database || "",
-      sql: props.activeTab.sql,
+      sql: resultSqlForGrid(props.activeTab),
       result: { columns: result.columns, rows: cappedRows, truncated: result.rows.length > cappedRows.length },
     },
+    refreshContextOnReuse: true,
   });
 }
 
@@ -1376,6 +1407,17 @@ function focusErrorPosition(offset: number): boolean {
  * to a cross-surface event when this surface only renders the shared result pane
  * (the editor lives in another group).
  */
+function activeResultErrorOffsetOptions() {
+  const result = props.activeTab.result;
+  return {
+    editorSql: props.activeTab.sql,
+    result,
+    resultIndex: result?.statement_index ?? props.activeTab.activeResultIndex,
+    databaseType: activeEffectiveDatabaseType.value,
+    parameterOptions: activeSqlStatementParameterOptions.value,
+  };
+}
+
 function locateActiveResultError() {
   const result = props.activeTab.result;
   logSqlErrorPosition("locate:invoke", {
@@ -1389,13 +1431,7 @@ function locateActiveResultError() {
     editorLength: props.activeTab.sql.length,
     resultIsError: Boolean(result && isQueryExecutionErrorResult(result)),
   });
-  const mapped = sqlErrorEditorOffset({
-    editorSql: props.activeTab.sql,
-    result,
-    resultIndex: result?.statement_index ?? props.activeTab.activeResultIndex,
-    databaseType: activeEffectiveDatabaseType.value,
-    parameterOptions: activeSqlStatementParameterOptions.value,
-  });
+  const mapped = sqlErrorEditorOffset(activeResultErrorOffsetOptions());
   if (!mapped) {
     logSqlErrorPosition("locate:unavailable", {
       tabId: props.activeTab.id,
@@ -2128,7 +2164,7 @@ defineExpose({
                   }) => queryStore.buildQueryResultExportRequest(activeTab.id, options)
                 "
                 :all-export-results="allResultExportSheets"
-                :export-file-base-name="activeTab.title"
+                :export-file-base-name="activeQueryResultExportBaseName"
                 @update:order-by-input="(v: string) => (activeTab.orderByInput = v)"
                 @local-column-filters-change="(filters: Record<string, string[]>) => queryStore.updateDataGridLocalColumnFilters(activeTab.id, filters)"
                 @reload="(sql?: string, searchText?: string, whereInput?: string, orderBy?: string, limit?: number, offset?: number, intent?: DataGridReloadIntent) => emit('reload', activeTab.id, sql, searchText, whereInput, orderBy, limit, offset, intent)"
@@ -2792,6 +2828,7 @@ defineExpose({
           @saved="(commentChanged) => emit('structureEditorSaved', activeTab.id, commentChanged)"
           @close="emit('structureEditorClose', activeTab.id)"
           @open-settings="(initialTab, initialSection) => emit('openSettings', initialTab, initialSection)"
+          @view-data="onHandleStructureViewData"
         />
       </div>
     </template>
@@ -2829,6 +2866,12 @@ defineExpose({
     <template v-else-if="activeTab.mode === 'nacos-dashboard'">
       <div class="min-h-0 flex-1">
         <NacosDashboard :key="activeTab.id" :connection-id="activeTab.connectionId" />
+      </div>
+    </template>
+
+    <template v-else-if="activeTab.mode === 'solr-admin'">
+      <div class="min-h-0 flex-1">
+        <SolrAdmin :key="activeTab.id" :connection-id="activeTab.connectionId" />
       </div>
     </template>
 

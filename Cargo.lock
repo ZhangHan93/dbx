@@ -2019,7 +2019,7 @@ dependencies = [
 
 [[package]]
 name = "dbx"
-version = "0.6.18"
+version = "0.6.19"
 dependencies = [
  "anyhow",
  "axum",
@@ -2052,6 +2052,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2 0.10.9",
  "sys-locale",
  "sysinfo",
@@ -2099,7 +2100,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-cli"
-version = "0.4.91"
+version = "0.4.92"
 dependencies = [
  "async-trait",
  "dbx-core",
@@ -2251,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-mcp"
-version = "0.4.91"
+version = "0.4.92"
 dependencies = [
  "async-trait",
  "axum",
@@ -2363,7 +2364,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-web"
-version = "0.6.18"
+version = "0.6.19"
 dependencies = [
  "aes-gcm 0.10.3",
  "argon2",

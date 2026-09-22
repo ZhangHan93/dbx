@@ -1131,6 +1131,7 @@ impl ConnectionConfig {
             DatabaseType::Oracle => format!("oracle://{host}:{port}{db_part}"),
             DatabaseType::Elasticsearch
             | DatabaseType::Easysearch
+            | DatabaseType::Solr
             | DatabaseType::Meilisearch
             | DatabaseType::Hbase
             | DatabaseType::Qdrant
@@ -1321,6 +1322,7 @@ impl ConnectionConfig {
             }
             DatabaseType::Elasticsearch
             | DatabaseType::Easysearch
+            | DatabaseType::Solr
             | DatabaseType::Meilisearch
             | DatabaseType::Hbase
             | DatabaseType::Qdrant

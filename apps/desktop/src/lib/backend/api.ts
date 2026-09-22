@@ -220,6 +220,7 @@ export const listTriggers = forward("listTriggers");
 export const listConstraints = forward("listConstraints");
 export const listPartitions = forward("listPartitions");
 export const getTablePartitionStatus = forward("getTablePartitionStatus");
+export const getTablePartitioning = forward("getTablePartitioning");
 export const listInvalidIndexes = forward("listInvalidIndexes");
 export const listSubpartitions = forward("listSubpartitions");
 export const getTableDdl = forward("getTableDdl");
@@ -299,6 +300,8 @@ export const buildRoutineRenameObjectSourceStatements = forward("buildRoutineRen
 export const buildViewDdlSql = forward("buildViewDdlSql");
 export const buildTableStructureChangeSql = forward("buildTableStructureChangeSql");
 export const buildTableOwnerChangeSql = forward("buildTableOwnerChangeSql");
+export const buildTablePartitionOperationSql = forward("buildTablePartitionOperationSql");
+export const buildCreatePartitionedTableSql = forward("buildCreatePartitionedTableSql");
 export const previewSqliteTableStructureChange = forward("previewSqliteTableStructureChange");
 export const applySqliteTableStructureChange = forward("applySqliteTableStructureChange");
 export const buildCreateTableSql = forward("buildCreateTableSql");
@@ -351,6 +354,8 @@ export const loadMaxAgentTurns = forward("loadMaxAgentTurns");
 export const loadSqlFileUploadMaxBytes = forward("loadSqlFileUploadMaxBytes");
 export const saveSqlFileUploadMaxMb = forward("saveSqlFileUploadMaxMb");
 export const saveMaxAgentTurns = forward("saveMaxAgentTurns");
+export const loadHistoryRetentionLimit = forward("loadHistoryRetentionLimit");
+export const saveHistoryRetentionLimit = forward("saveHistoryRetentionLimit");
 export const loadMaxRetries = forward("loadMaxRetries");
 export const saveMaxRetries = forward("saveMaxRetries");
 export const completeAppClose = forward("completeAppClose");
@@ -409,6 +414,10 @@ export const savePromptTemplate = forward("savePromptTemplate");
 export const deletePromptTemplate = forward("deletePromptTemplate");
 export const getAiGlobalCustomInstructions = forward("getAiGlobalCustomInstructions");
 export const setAiGlobalCustomInstructions = forward("setAiGlobalCustomInstructions");
+
+// User Skills (read-only Codex-compatible SKILL.md library)
+export const listUserSkills = forward("listUserSkills");
+export const readUserSkills = forward("readUserSkills");
 
 // System
 export const listSystemFonts = forward("listSystemFonts");

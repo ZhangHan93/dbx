@@ -1328,6 +1328,15 @@ async function updateAllAvailable() {
       reportComponentUpdateResult(await componentUpdates.installCategories(categories));
       return;
     }
+    if (action === "defer-components") {
+      const remembered = await rememberComponentUpdatesForRestartedApp({ kind: "manual", categories });
+      if (remembered) {
+        toast(t("settings.updateRestartHint"), 6000);
+        return;
+      }
+      reportComponentUpdateResult(await componentUpdates.installCategories(categories));
+      return;
+    }
     if (action === "download-app") await downloadUpdateInBackground();
     if (updateDownloaded.value || updateReady.value) await rememberComponentUpdatesForRestartedApp({ kind: "manual", categories });
   } finally {
@@ -3209,7 +3218,7 @@ async function handleQuickOpenSelect(item: any) {
         await connectionStore.loadConsulRoot(item.connectionId);
       } else if (config?.db_type === "mongodb") {
         await connectionStore.loadMongoDatabases(item.connectionId);
-      } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch" || config?.db_type === "meilisearch") {
+      } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch" || config?.db_type === "meilisearch" || config?.db_type === "solr") {
         await connectionStore.openElasticsearchConnectionTree(item.connectionId);
       } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
         await connectionStore.loadVectorCollections(item.connectionId);
@@ -3236,7 +3245,7 @@ async function handleQuickOpenSelect(item: any) {
         await connectionStore.loadConsulRoot(item.connectionId);
       } else if (config?.db_type === "mongodb") {
         await connectionStore.loadMongoDatabases(item.connectionId);
-      } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch" || config?.db_type === "meilisearch") {
+      } else if (config?.db_type === "elasticsearch" || config?.db_type === "easysearch" || config?.db_type === "meilisearch" || config?.db_type === "solr") {
         await connectionStore.openElasticsearchConnectionTree(item.connectionId);
       } else if (config?.db_type === "qdrant" || config?.db_type === "milvus" || config?.db_type === "weaviate" || config?.db_type === "chromadb") {
         await connectionStore.loadVectorCollections(item.connectionId);
@@ -4337,6 +4346,7 @@ onUnmounted(() => {
                 @execute-redis-command="(command: string) => routeAiRedisCommand(command, true)"
                 @open-explain-plan="onAiOpenExplainPlan"
                 @toggle-maximize="toggleAiPanelMaximized"
+                @open-settings="activateSettingsPage"
                 @close="closeRightSidebarPanel('ai')"
               />
             </div>

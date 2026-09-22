@@ -11,7 +11,7 @@ import type { DeletedConnectionTabKeepMode } from "@/lib/tabs/deletedConnectionT
 import type { BatchSqlExecution, ConnectionConfig, DatabaseType, IndexInfo, NacosConfigEditorViewport, ObjectBrowserFilter, ObjectBrowserViewport, ObjectSource, ObjectSourceKind, QueryResult, QueryResultSourceColumnRef, QueryTab, TableInfoTab, TableStructureEditorTarget } from "@/types/database";
 import { orderPinnedFirst } from "@/lib/app/pinnedItems";
 import { canCancelQueryExecution } from "@/lib/sql/queryExecutionState";
-import { isSqlErrorPositionDebugEnabled, logSqlErrorPosition } from "@/lib/sql/errorPosition";
+import { isSqlErrorPositionDebugEnabled, logSqlErrorPosition, sqlErrorHasMessagePosition, sqlErrorMessageText } from "@/lib/sql/errorPosition";
 import { buildExplainSql, parseExplainResult, parseDamengExplainText, parseOracleExplainText, sqlServerExplainResult, type BuildExplainSqlResult, type ExplainPlanDatabaseType } from "@/lib/diagram/explainPlan";
 import { mysqlExplainCompatibilityHint } from "@/lib/diagram/mysqlExplainCompatibility";
 import { allEditableColumnsWriteable, allPrimaryKeysPresent, analyzeEditableQueryEditability, analyzeSelectStructureForDisplay, resolveMetadataColumnName, resolveSourceColumnsByOrdinal, sourceColumnsForResult, type EditableQueryInfo, type EditableQuerySource } from "@/lib/sql/sqlAnalysis";
@@ -55,7 +55,7 @@ import { tableOpenPageLimit } from "@/lib/table/tableOpenPageLimit";
 import { getCachedTableMetadata, loadTableColumns, loadTableIndexes, loadTableMetadata, tableMetadataToDataTabMeta, updateCachedTableMetadataType, type TableMetadataRequest } from "@/lib/metadata/tableMetadataCache";
 import { MetadataTaskLimiter } from "@/lib/metadata/metadataTaskLimiter";
 import { buildTableSelectSql, quoteTableDataIdentifier } from "@/lib/table/tableSelectSql";
-import { connectionObjectTreeNodeSchema, connectionQueryExecutionSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, gaussdbCountQueryDopHint, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
+import { connectionObjectTreeNodeSchema, connectionQueryExecutionSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection, gaussdbCountQueryDopHint, jdbcConnectionUsesDriverRowOffset, metadataSchemaForConnection } from "@/lib/database/jdbcDialect";
 import { frontendQueryTimeoutDelayMs, frontendQueryTimeoutSecsForSql, queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { queryResultNameFromPreamble, queryResultSourceLabel } from "@/lib/sql/queryResultSource";
 import { sqlServerCountUsesLocalTempTable } from "@/lib/query/queryResultCountSession";
@@ -212,6 +212,17 @@ interface OpenPendingObjectSourceTabOptions {
  * （`App.vue` 的 Ctrl+click 路径有一份少了 `JOB` 的旧副本，是既有不一致。）
  */
 const OBJECT_SOURCE_READ_ONLY_TYPES: readonly ObjectSourceKind[] = ["SEQUENCE", "TRIGGER", "TYPE", "TYPE_BODY", "JOB"];
+
+/**
+ * 「查看」与「编辑」拿到的文本本就不同的对象类型：OceanBase Oracle 的序列在查看态
+ * 展示原生 `CREATE SEQUENCE`（信息量更大），编辑态才是可执行的 `ALTER SEQUENCE`，
+ * 所以查看态不能落成可保存的源码 tab —— 否则 Ctrl+S 会把 `CREATE SEQUENCE` 当增量
+ * 修改执行。其余类型（存储过程/函数/视图等）查看态与编辑态文本一致，查看态沿用
+ * v0.6.17 行为，仍是带 objectSource 的可保存源码 tab。
+ */
+function isViewOnlySourceWithoutEditablePayload(initialEditing: boolean | undefined, objectType: ObjectSourceKind): boolean {
+  return initialEditing === false && objectType === "SEQUENCE";
+}
 
 interface UpdateExecutionTargetOptions {
   persistSavedSqlTarget?: boolean;
@@ -425,11 +436,12 @@ function annotateQueryResultSources(
  * The core returns per-statement error results for batches, but a
  * single-statement failure aborts the whole execute-multi command, leaving the
  * frontend to synthesize the error result here. Only annotated when the error
- * actually carries a position and the submission is a single statement (a
- * multi-statement thrown error's position cannot be attributed to one statement).
+ * actually carries a position — either typed (PostgreSQL) or parseable from the
+ * message text (Oracle's Agent offset) — and the submission is a single statement
+ * (a multi-statement thrown error's position cannot be attributed to one statement).
  */
 function annotateSingleStatementErrorResult(errorResult: QueryResult, sourceSql: string, databaseType: DatabaseType | undefined, sourceOffset: number | undefined, parameterOptions: SqlParameterOptions | undefined, executedSql: string | undefined): void {
-  if (!errorResult.error?.errorPosition) return;
+  if (!errorResult.error?.errorPosition && !sqlErrorHasMessagePosition(sqlErrorMessageText(errorResult))) return;
   if (splitSqlStatementRanges(sourceSql, databaseType, parameterOptions).length !== 1) return;
   annotateQueryResultSources([errorResult], sourceSql, undefined, databaseType, sourceOffset, parameterOptions, executedSql);
 }
@@ -2432,6 +2444,7 @@ export const useQueryStore = defineStore("query", () => {
       resultAutoSave: t.resultAutoSave,
       uiState: t.uiState,
       structureTableName: t.structureTableName,
+      structureTableType: t.structureTableType,
       structureDraft: t.structureDraft,
       objectBrowser: t.objectBrowser,
       objectSource: t.objectSource,
@@ -2739,18 +2752,17 @@ export const useQueryStore = defineStore("query", () => {
     // 两条弯路都要避开 —— 再建一个 pending tab 会让界面上多出一个转圈 tab，
     // 随后又被交接逻辑关掉；而只切过去不校验，会让重开看到的是旧 DDL
     // （改动前每次打开都会重新取源，源码 tab 没有其它刷新入口）。
-    const loaded =
-      options.initialEditing === false
-        ? undefined
-        : findMatchingObjectSourceTab({
-            connectionId: options.connectionId,
-            database: options.database,
-            title: options.title,
-            schema: options.schema,
-            catalog: options.catalog,
-            sql: "",
-            objectSource: { schema: options.schema, name: options.request.name, objectType: options.request.objectType, signature: options.request.signature },
-          });
+    const loaded = isViewOnlySourceWithoutEditablePayload(options.initialEditing, options.request.objectType)
+      ? undefined
+      : findMatchingObjectSourceTab({
+          connectionId: options.connectionId,
+          database: options.database,
+          title: options.title,
+          schema: options.schema,
+          catalog: options.catalog,
+          sql: "",
+          objectSource: { schema: options.schema, name: options.request.name, objectType: options.request.objectType, signature: options.request.signature },
+        });
     if (loaded) {
       loaded.sourceView = true;
       switchTab(loaded.id);
@@ -2885,7 +2897,7 @@ export const useQueryStore = defineStore("query", () => {
     // 加载期间 tab 被关掉（用户放弃）或连接被断开：静默丢弃，不重建、不写库
     const tab = tabs.value.find((candidate) => candidate.id === id);
     if (!tab?.sourceLoad) return;
-    const sourceIsEditable = loaded.initialEditing !== false && loaded.raw.editable !== false && (!OBJECT_SOURCE_READ_ONLY_TYPES.includes(loaded.resolvedType) || (loaded.databaseType === "oceanbase-oracle" && loaded.resolvedType === "SEQUENCE"));
+    const sourceIsEditable = !isViewOnlySourceWithoutEditablePayload(loaded.initialEditing, loaded.resolvedType) && loaded.raw.editable !== false && (!OBJECT_SOURCE_READ_ONLY_TYPES.includes(loaded.resolvedType) || (loaded.databaseType === "oceanbase-oracle" && loaded.resolvedType === "SEQUENCE"));
     if (sourceIsEditable) {
       const options: OpenObjectSourceTabOptions = {
         connectionId: loaded.connectionId,
@@ -3266,6 +3278,29 @@ export const useQueryStore = defineStore("query", () => {
     return registerOpenTab(tab);
   }
 
+  function openSolrAdmin(connectionId: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "solr-admin" && tab.connectionId === connectionId);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+
+    const conn = useConnectionStore().getConfig(connectionId);
+    const id = uuid();
+    const tab: QueryTab = {
+      id,
+      title: conn?.name ? `${conn.name} - ${t("solrAdmin.title")}` : t("solrAdmin.title"),
+      connectionId,
+      database: "",
+      sql: "",
+      isExecuting: false,
+      isCancelling: false,
+      isExplaining: false,
+      mode: "solr-admin",
+    };
+    return registerOpenTab(tab);
+  }
+
   function openDamengJobAdmin(connectionId: string) {
     const existing = tabs.value.find((tab) => tab.mode === "dameng-jobs" && tab.connectionId === connectionId);
     if (existing) {
@@ -3494,16 +3529,30 @@ export const useQueryStore = defineStore("query", () => {
     return typeof contextConnectionId === "string" ? contextConnectionId : "";
   }
 
-  function openPluginWorkbench(pluginId: string, contributionId: string, options: { title?: string; connectionId?: string; database?: string; context?: Record<string, unknown>; forceNew?: boolean } = {}) {
+  function pluginTabPluginId(tab: QueryTab): string | undefined {
+    if (tab.mode === "plugin-workbench") return tab.pluginWorkbench?.pluginId;
+    if (tab.mode === "plugin-filesystem") return tab.pluginFilesystem?.pluginId;
+    return undefined;
+  }
+
+  function openPluginWorkbench(pluginId: string, contributionId: string, options: { title?: string; connectionId?: string; database?: string; context?: Record<string, unknown>; forceNew?: boolean; refreshContextOnReuse?: boolean } = {}) {
     const contextConnectionId = typeof options.context?.connectionId === "string" ? options.context.connectionId : "";
     const connectionId = options.connectionId || contextConnectionId;
     if (!options.forceNew) {
       const existing = tabs.value.find((tab) => tab.mode === "plugin-workbench" && tab.pluginWorkbench?.pluginId === pluginId && tab.pluginWorkbench?.contributionId === contributionId && pluginTabConnectionId(tab) === connectionId);
       if (existing) {
-        // Reopening surfaces the existing tab as-is. Replacing the context
-        // here (openPluginConnection mints a fresh workbenchId per click)
-        // would deep-reload the plugin webview — a full flash plus losing
-        // the sidecar session binding on the old workbench id.
+        if (options.refreshContextOnReuse && options.context) {
+          existing.pluginWorkbench = {
+            ...existing.pluginWorkbench!,
+            context: snapshotPluginWorkbenchContext(options.context),
+          };
+        }
+        // Reopening normally surfaces the existing tab as-is. Replacing the
+        // context here by default (openPluginConnection mints a fresh
+        // workbenchId per click) would deep-reload the plugin webview — a full
+        // flash plus losing the sidecar session binding on the old workbench
+        // id. Stateless surfaces such as result-view can explicitly opt into
+        // a context refresh without changing the tab identity.
         // A tab created by an older build (or otherwise unregistered) may
         // still be ownerless; land it in the workspace or the group-rendered
         // tab strips can never show it.
@@ -3665,7 +3714,7 @@ export const useQueryStore = defineStore("query", () => {
     tab.structureInitialTabRequestId = (tab.structureInitialTabRequestId ?? 0) + 1;
   }
 
-  function openTableStructure(connectionId: string, database: string, schema?: string, tableName?: string, initialTab?: TableInfoTab, initialTarget?: TableStructureEditorTarget, catalog?: string) {
+  function openTableStructure(connectionId: string, database: string, schema?: string, tableName?: string, initialTab?: TableInfoTab, initialTarget?: TableStructureEditorTarget, catalog?: string, tableType?: "table" | "view") {
     const resolvedTableName = tableName || "";
     if (resolvedTableName) {
       const existing = tabs.value.find((tab) => tab.mode === "structure" && tab.connectionId === connectionId && tab.database === database && (tab.catalog || "") === (catalog || "") && (tab.schema || "") === (schema || "") && (tab.structureTableName || "") === resolvedTableName);
@@ -3691,6 +3740,7 @@ export const useQueryStore = defineStore("query", () => {
       isExplaining: false,
       mode: "structure",
       structureTableName: resolvedTableName,
+      structureTableType: tableType,
       structureInitialTab: initialTab,
       structureInitialTabRequestId: initialTab || initialTarget?.name ? 1 : undefined,
       structureInitialTarget: initialTarget?.name ? initialTarget : undefined,
@@ -3962,15 +4012,25 @@ export const useQueryStore = defineStore("query", () => {
 
   const pluginReleaseInFlight = new Set<string>();
   /**
-   * Closing the last plugin tab (workbench or filesystem) bound to a plugin
-   * connection ends that connection: the sidecar session has no remaining
-   * owner, so disconnecting tears the pool down and drops the sidebar's
-   * "connected" dot. Fire-and-forget; concurrent releases for the same
-   * connection coalesce, and a reopen racing the release wins.
+   * Closing the last plugin tab only releases a connection explicitly owned by
+   * the plugin that closed it. Workbench/filesystem tabs can borrow a Host-owned
+   * connection, so a connectionId reference alone is never enough to disconnect.
+   * Fire-and-forget; concurrent releases for the same connection coalesce, and
+   * a reopen racing the release wins.
    */
   function releasePluginConnectionsAfterClose(closedTabs: ReadonlyArray<QueryTab>) {
-    const connectionIds = new Set(closedTabs.filter((tab) => (tab.mode === "plugin-workbench" || tab.mode === "plugin-filesystem") && tab.connectionId).map((tab) => tab.connectionId));
-    for (const connectionId of connectionIds) {
+    const closedPluginTabsByConnection = new Map<string, Set<string>>();
+    for (const tab of closedTabs) {
+      if (tab.mode !== "plugin-workbench" && tab.mode !== "plugin-filesystem") continue;
+      const connectionId = pluginTabConnectionId(tab);
+      const pluginId = pluginTabPluginId(tab);
+      if (!connectionId || !pluginId) continue;
+      const pluginIds = closedPluginTabsByConnection.get(connectionId) ?? new Set<string>();
+      pluginIds.add(pluginId);
+      closedPluginTabsByConnection.set(connectionId, pluginIds);
+    }
+
+    for (const [connectionId, closedPluginIds] of closedPluginTabsByConnection) {
       if (pluginReleaseInFlight.has(connectionId)) continue;
       pluginReleaseInFlight.add(connectionId);
       void (async () => {
@@ -3978,8 +4038,12 @@ export const useQueryStore = defineStore("query", () => {
           // Yield one microtask so a same-tick reopen registers its
           // replacement plugin tab before we tear the connection down.
           await Promise.resolve();
-          if (tabs.value.some((tab) => (tab.mode === "plugin-workbench" || tab.mode === "plugin-filesystem") && tab.connectionId === connectionId)) return;
+          if (tabs.value.some((tab) => (tab.mode === "plugin-workbench" || tab.mode === "plugin-filesystem") && pluginTabConnectionId(tab) === connectionId)) return;
           const connectionStore = useConnectionStore();
+          const config = connectionStore.getConfig(connectionId);
+          // A connection reference is not ownership: only a plugin-backed
+          // connection closed by its owning plugin may be auto-released.
+          if (config?.db_type !== "plugin" || !config.plugin_id || !closedPluginIds.has(config.plugin_id)) return;
           // A user-initiated disconnect that closed these tabs already owns
           // the teardown — don't stack a second one on top of it.
           if (connectionStore.hasDisconnectInFlight(connectionId)) return;
@@ -4333,6 +4397,7 @@ export const useQueryStore = defineStore("query", () => {
       nacosNamespace: original.nacosNamespace,
       nacosNamespaceName: original.nacosNamespaceName,
       structureTableName: original.structureTableName,
+      structureTableType: original.structureTableType,
       structureDraft: original.structureDraft ? cloneTabDraft(original.structureDraft) : undefined,
       objectBrowser: original.objectBrowser ? { ...original.objectBrowser } : undefined,
       objectSource: original.objectSource ? { ...original.objectSource } : undefined,
@@ -4526,7 +4591,7 @@ export const useQueryStore = defineStore("query", () => {
       const orderBy = tab.orderByInput?.trim() || sortOrder;
       const limit = tab.resultPageLimit ?? tableOpenPageLimit(settingsStore.editorSettings.tableOpenPageSize);
       const offset = tab.resultPageOffset ?? 0;
-      const useDriverRowOffset = conn?.db_type === "jdbc" && effectiveDbType === "iris";
+      const useDriverRowOffset = jdbcConnectionUsesDriverRowOffset(conn, effectiveDbType);
 
       const sql = await buildTableSelectSql({
         databaseType: effectiveDbType,
@@ -6856,6 +6921,7 @@ export const useQueryStore = defineStore("query", () => {
                   database: currentDatabase,
                 });
                 const stats = await api.mongoCollectionStats(executionConnectionId, currentDatabase, mongoCommand.collection, mongoCommand.scale, executionId);
+                // SAFETY: The backend returns collection statistics as a JSON object; the API type is broader than the converter's record-shaped input.
                 allResults.push(markQueryResultRowsRaw(annotateMongoResult(mongoCollectionStatsToQueryResult(mongoCommand.metric, stats as unknown as Record<string, unknown>, performance.now() - commandStartedAt))));
                 mongoEditTarget = undefined;
                 queryExecutionLog("info", "mongo-collection-stats:done", {
@@ -7242,7 +7308,7 @@ export const useQueryStore = defineStore("query", () => {
         // connection-local state and avoid MySQL pool resets on every refresh.
         const dataTabMeta = tab.mode === "data" ? tableMetaForDataTab(tab) : undefined;
         const useTableDataPreview = canUseTableDataLargeValuePreview(effectiveDbType, dataTabMeta?.columns ?? [], dataTabMeta?.primaryKeys ?? []);
-        const useJdbcDriverRowOffset = tab.mode === "data" && conn?.db_type === "jdbc" && effectiveDbType === "iris";
+        const useJdbcDriverRowOffset = tab.mode === "data" && jdbcConnectionUsesDriverRowOffset(conn, effectiveDbType);
         const executionOptions = {
           ...(typeof pageLimit === "number"
             ? useAgentResultSession
@@ -8954,6 +9020,7 @@ export const useQueryStore = defineStore("query", () => {
     openPostgresDashboard,
     openXuguDashboard,
     openNacosDashboard,
+    openSolrAdmin,
     openDamengUsers,
     openDamengRoles,
     openDamengJobAdmin,

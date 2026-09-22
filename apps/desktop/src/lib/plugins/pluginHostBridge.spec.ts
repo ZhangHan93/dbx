@@ -731,6 +731,34 @@ describe("PluginHostBridge", () => {
     expect(closed).toContain("host.stream.chunk");
   });
 
+  it("injects a <base> and widens resource CSP sources for the plugin asset origin", () => {
+    const document = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, { baseUrl: "dbx-plugin://localhost/io.github.t8y2.s3/assets/" });
+    expect(document).toContain('<base href="dbx-plugin://localhost/io.github.t8y2.s3/assets/">');
+    expect(document).toContain("script-src 'unsafe-inline' blob: dbx-plugin:;");
+    expect(document).toContain("font-src data: blob: dbx-plugin:;");
+    // <base> leads the head injection so inlined CSS url() resolves against it.
+    expect(document.indexOf("<base ")).toBeLessThan(document.indexOf("<style>"));
+  });
+
+  it("allows the WebView2-mapped asset origin exactly", () => {
+    const document = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, { baseUrl: "http://dbx-plugin.localhost/io.github.t8y2.s3/assets/" });
+    expect(document).toContain("script-src 'unsafe-inline' blob: http://dbx-plugin.localhost;");
+    expect(document).toContain('<base href="http://dbx-plugin.localhost/io.github.t8y2.s3/assets/">');
+  });
+
+  it("rejects malformed asset base URLs without touching the CSP", () => {
+    const document = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, { baseUrl: "javascript:alert(1)" });
+    expect(document).not.toContain("<base ");
+    expect(document).toContain("script-src 'unsafe-inline' blob:;");
+  });
+
+  it("keeps the sandbox CSP untouched without an asset base URL", () => {
+    const document = pluginSandboxDocument("<html><head></head><body></body></html>");
+    expect(document).toContain("script-src 'unsafe-inline' blob:;");
+    expect(document).toContain("font-src data: blob:;");
+    expect(document).not.toContain("<base ");
+  });
+
   it("pre-seeds the current theme as the sandbox first paint", () => {
     const themed = pluginSandboxDocument("<html><head></head><body></body></html>", ["host.events"], { appearance: "dark", tokens: { "--color-background": "#131416", "--color-foreground": "rgb(215 215 219)" } });
     expect(themed).toContain("color-scheme: dark");
@@ -853,6 +881,83 @@ describe("PluginHostBridge", () => {
     } as MessageEvent);
     await vi.waitFor(() => expect(messages).toHaveLength(1));
     expect(messages[0]).toMatchObject({ id: "nocopy", error: "Host clipboard is unavailable" });
+  });
+
+  it("routes host.storage through the owning plugin, caps values, and needs the declared permission", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const storageGet = vi.fn().mockResolvedValue({ mode: "dark" });
+    const storageSet = vi.fn().mockResolvedValue(undefined);
+    const storageDelete = vi.fn().mockResolvedValue(undefined);
+    const send = (bridge: PluginHostBridge, id: string, method: string, params: unknown) => bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id, method, params } } as MessageEvent);
+
+    // No declared host.storage permission: every call is refused up front.
+    const denied = new PluginHostBridge(plugin(), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      storageGet,
+      storageSet,
+      storageDelete,
+    });
+    send(denied, "denied", "host.storageGet", { key: "theme" });
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(messages[0]).toMatchObject({ id: "denied", error: "Plugin has not declared permission 'host.storage'" });
+    expect(storageGet).not.toHaveBeenCalled();
+
+    const bridge = new PluginHostBridge(plugin(["host.storage"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      storageGet,
+      storageSet,
+      storageDelete,
+    });
+    bridge.sendInit();
+    expect((messages[1] as { capabilities?: { storage?: boolean } }).capabilities?.storage).toBe(true);
+
+    send(bridge, "get", "host.storageGet", { key: "theme" });
+    await vi.waitFor(() => expect(storageGet).toHaveBeenCalledWith("sample", "theme"));
+    await vi.waitFor(() => expect(messages[2]).toMatchObject({ id: "get", result: { mode: "dark" } }));
+
+    send(bridge, "set", "host.storageSet", { key: "theme", value: { mode: "light" } });
+    await vi.waitFor(() => expect(storageSet).toHaveBeenCalledWith("sample", "theme", { mode: "light" }));
+    await vi.waitFor(() => expect(messages[3]).toMatchObject({ id: "set", result: null }));
+
+    send(bridge, "delete", "host.storageDelete", { key: "theme" });
+    await vi.waitFor(() => expect(storageDelete).toHaveBeenCalledWith("sample", "theme"));
+
+    // `undefined` values normalize to null so the entry round-trips as JSON.
+    send(bridge, "nullish", "host.storageSet", { key: "empty", value: null });
+    await vi.waitFor(() => expect(storageSet).toHaveBeenLastCalledWith("sample", "empty", null));
+
+    send(bridge, "badkey", "host.storageGet", { key: "" });
+    send(bridge, "bigvalue", "host.storageSet", { key: "blob", value: "x".repeat(256 * 1024 + 1) });
+    await vi.waitFor(() => expect(messages).toHaveLength(8));
+    const byId = new Map(messages.map((message) => [(message as { id?: string }).id, message]));
+    expect(byId.get("badkey")).toMatchObject({ id: "badkey", error: "storage key is invalid" });
+    expect(String((byId.get("bigvalue") as { error?: string }).error)).toMatch(/value exceeds/);
+  });
+
+  it("does not advertise or serve host.storage without the host implementation", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const bridge = new PluginHostBridge(plugin(["host.storage"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+    });
+    bridge.sendInit();
+    expect((messages[0] as { capabilities?: { storage?: boolean } }).capabilities?.storage).toBe(false);
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "nostorage", method: "host.storageGet", params: { key: "theme" } },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages).toHaveLength(2));
+    expect(messages[1]).toMatchObject({ id: "nostorage", error: "Host storage is unavailable" });
   });
 
   it("rejects host.saveFile without payload or host support", async () => {

@@ -158,6 +158,40 @@ async function readPluginFileChunkById(pluginId: string, handleId: string, offse
   return { dataBase64: encodeBytesBase64(bytes), length: bytes.byteLength, eof: offset + bytes.byteLength >= file.size };
 }
 
+// --- Plugin UI storage bridge ---------------------------------------------
+// Native hosts persist to `plugin-data/<id>/ui-storage.json` through Rust; the
+// web host has no plugin-data tree, so entries fall back to the top document's
+// localStorage under a per-plugin prefix (same isolation, same JSON values).
+
+function webStorageKey(pluginId: string, key: string): string {
+  return `dbx-plugin-storage:${pluginId}:${key}`;
+}
+
+async function getPluginStorage(pluginId: string, key: string): Promise<unknown> {
+  if (isTauriRuntime()) {
+    const { getPluginUiStorage } = await tauriFileApi();
+    return getPluginUiStorage(pluginId, key);
+  }
+  const raw = localStorage.getItem(webStorageKey(pluginId, key));
+  return raw === null ? null : (JSON.parse(raw) as unknown);
+}
+
+async function setPluginStorage(pluginId: string, key: string, value: unknown): Promise<void> {
+  if (isTauriRuntime()) {
+    const { setPluginUiStorage } = await tauriFileApi();
+    return setPluginUiStorage(pluginId, key, value);
+  }
+  localStorage.setItem(webStorageKey(pluginId, key), JSON.stringify(value === undefined ? null : value));
+}
+
+async function deletePluginStorage(pluginId: string, key: string): Promise<void> {
+  if (isTauriRuntime()) {
+    const { deletePluginUiStorage } = await tauriFileApi();
+    return deletePluginUiStorage(pluginId, key);
+  }
+  localStorage.removeItem(webStorageKey(pluginId, key));
+}
+
 async function beginPluginFileSave(pluginId: string, request: { name?: string; contentType?: string; size?: number }): Promise<{ handleId: string; chunkBytes: number } | null> {
   if (isTauriRuntime()) {
     const { save } = await import("@tauri-apps/plugin-dialog");
@@ -355,6 +389,9 @@ function createBridge() {
       writeFileChunk: (pluginId, handleId, offset, bytes) => writePluginFileChunkById(pluginId, handleId, offset, bytes),
       finishFileSave: (pluginId, handleId) => finishPluginFileSave(pluginId, handleId),
       closeFileHandle: (pluginId, handleId) => closePluginFileHandleById(pluginId, handleId),
+      storageGet: (pluginId, key) => getPluginStorage(pluginId, key),
+      storageSet: (pluginId, key, value) => setPluginStorage(pluginId, key, value),
+      storageDelete: (pluginId, key) => deletePluginStorage(pluginId, key),
     },
     appLocale.value,
     currentBridgeTheme(),
@@ -424,13 +461,18 @@ function localUiAssetPath(source: string): string | undefined {
   }
 }
 
-async function inlineLocalUiAssets(html: string, pluginId: string): Promise<string> {
+async function inlineLocalUiAssets(html: string, pluginId: string): Promise<{ html: string; entryDirectory: string }> {
   const document = new DOMParser().parseFromString(html, "text/html");
   const resources = [...document.querySelectorAll("script[src], link[rel='stylesheet'][href]")];
+  // Dynamic-import chunks and CSS url() references live next to the entry
+  // script; its directory is the <base> the sandbox document needs to resolve
+  // them through the dbx-plugin scheme.
+  let entryDirectory = "";
   for (const resource of resources) {
     const source = resource.getAttribute(resource.tagName === "SCRIPT" ? "src" : "href");
     const path = source ? localUiAssetPath(source) : undefined;
     if (!path) continue;
+    if (!entryDirectory) entryDirectory = path.split("/").slice(0, -1).join("/");
     const asset = await api.readPluginUiAsset(pluginId, path);
     const content = new TextDecoder().decode(Uint8Array.from(atob(asset.dataBase64), (character) => character.charCodeAt(0)));
     if (resource.tagName === "SCRIPT") {
@@ -446,7 +488,19 @@ async function inlineLocalUiAssets(html: string, pluginId: string): Promise<stri
       resource.replaceWith(style);
     }
   }
-  return document.documentElement.outerHTML;
+  return { html: document.documentElement.outerHTML, entryDirectory };
+}
+
+/**
+ * Base URL prefix for lazy-loaded plugin UI assets. wry serves custom schemes
+ * natively on WKWebView/webkit2gtk but maps them onto http(s) subdomains on
+ * WebView2, so the host page's own protocol picks the form the webview will
+ * actually request. The web host has no plugin asset protocol.
+ */
+function pluginUiBaseUrl(pluginId: string, entryDirectory: string): string | undefined {
+  if (!isTauriRuntime()) return undefined;
+  const origin = location.protocol === "http:" || location.protocol === "https:" ? `${location.protocol}//dbx-plugin.localhost/${pluginId}/` : `dbx-plugin://localhost/${pluginId}/`;
+  return entryDirectory ? `${origin}${entryDirectory}/` : origin;
 }
 
 async function loadWorkbench() {
@@ -461,9 +515,11 @@ async function loadWorkbench() {
     const asset = await api.readPluginUiEntry(props.plugin.manifest.id);
     if (disposed || generation !== loadGeneration) return;
     const bytes = Uint8Array.from(atob(asset.dataBase64), (character) => character.charCodeAt(0));
-    const html = await inlineLocalUiAssets(new TextDecoder().decode(bytes), props.plugin.manifest.id);
+    const { html, entryDirectory } = await inlineLocalUiAssets(new TextDecoder().decode(bytes), props.plugin.manifest.id);
     if (disposed || generation !== loadGeneration) return;
-    source.value = pluginSandboxDocument(html, props.plugin.manifest.permissions, currentBridgeTheme());
+    source.value = pluginSandboxDocument(html, props.plugin.manifest.permissions, currentBridgeTheme(), {
+      baseUrl: pluginUiBaseUrl(props.plugin.manifest.id, entryDirectory),
+    });
     await nextTick();
     if (disposed || generation !== loadGeneration) return;
     createBridge();

@@ -149,6 +149,7 @@ export function connectionDisplayUrlScheme(connection: Pick<ConnectionConfig, "d
     case "elasticsearch":
     case "easysearch":
     case "meilisearch":
+    case "solr":
     case "qdrant":
     case "milvus":
     case "weaviate":
@@ -244,6 +245,9 @@ export function connectionUrlPlaceholder(dbType: DatabaseType, driverProfile?: s
 
     case "meilisearch":
       return "http://host:port/base/path";
+
+    case "solr":
+      return "http://user:password@host:8983";
 
     case "dameng":
       return "dm://user:password@host:port";

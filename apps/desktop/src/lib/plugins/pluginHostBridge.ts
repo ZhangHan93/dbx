@@ -78,6 +78,15 @@ export interface PluginFileWriteResult {
 /** Chunk size the host advertises for streamed saves; fits the bridge payload cap after base64. */
 export const PLUGIN_SAVE_CHUNK_BYTES = 1024 * 1024;
 
+/**
+ * Per-value cap for `host.storage` entries. The whole store is additionally
+ * capped by the native host; both bounds keep this a UI-state store — bulk
+ * data belongs to the sidecar's data directory.
+ */
+export const MAX_PLUGIN_STORAGE_VALUE_BYTES = 256 * 1024;
+/** Longest accepted `host.storage` key, mirroring the native host's bound. */
+export const MAX_PLUGIN_STORAGE_KEY_CHARS = 256;
+
 export interface PluginHostBridgeApi {
   invoke<T = unknown>(pluginId: string, method: string, params?: unknown, timeoutMs?: number): Promise<T>;
   notify(pluginId: string, method: string, params?: unknown): Promise<void>;
@@ -117,6 +126,10 @@ export interface PluginHostBridgeApi {
   finishFileSave?(pluginId: string, handleId: string): Promise<void>;
   /** Close any file handle, discarding unsaved state. */
   closeFileHandle?(pluginId: string, handleId: string): Promise<void>;
+  /** Persistent per-plugin key-value storage for sandboxed UIs; resolves null when the key is unset. */
+  storageGet?(pluginId: string, key: string): Promise<unknown>;
+  storageSet?(pluginId: string, key: string, value: unknown): Promise<void>;
+  storageDelete?(pluginId: string, key: string): Promise<void>;
 }
 
 interface PluginRequestMessage {
@@ -231,7 +244,11 @@ export class PluginHostBridge {
       permissions: [...(this.plugin.manifest.permissions || [])],
       // Additive capability advertisement: an older host omits `planApi`, and a
       // plugin must treat the absence as "unsupported" rather than probing.
-      capabilities: { downloadFile: !!this.api.downloadFile, planApi: !!this.api.getPlanCapabilities && !!this.api.explainPlan },
+      capabilities: {
+        downloadFile: !!this.api.downloadFile,
+        planApi: !!this.api.getPlanCapabilities && !!this.api.explainPlan,
+        storage: !!this.api.storageGet && !!this.api.storageSet && !!this.api.storageDelete,
+      },
       context: snapshotPluginWorkbenchContext(this.context),
     });
   }
@@ -440,6 +457,33 @@ export class PluginHostBridge {
       await this.api.closeFileHandle(this.plugin.manifest.id, requireHandleId(input.handleId));
       return null;
     }
+    if (method === "host.storageGet") {
+      this.requirePermission("host.storage");
+      if (!this.api.storageGet) throw new Error("Host storage is unavailable");
+      const input = requireRecord(params, "host.storageGet params");
+      return this.api.storageGet(this.plugin.manifest.id, requireStorageKey(input.key));
+    }
+    if (method === "host.storageSet") {
+      this.requirePermission("host.storage");
+      if (!this.api.storageSet) throw new Error("Host storage is unavailable");
+      const input = requireRecord(params, "host.storageSet params");
+      const key = requireStorageKey(input.key);
+      // Sized before the structured clone reaches the host implementation, so
+      // the native host and the web fallback enforce the same bound.
+      const bytes = new TextEncoder().encode(JSON.stringify(input.value ?? null)).byteLength;
+      if (bytes > MAX_PLUGIN_STORAGE_VALUE_BYTES) {
+        throw new Error(`host.storage value exceeds ${MAX_PLUGIN_STORAGE_VALUE_BYTES} bytes`);
+      }
+      await this.api.storageSet(this.plugin.manifest.id, key, input.value ?? null);
+      return null;
+    }
+    if (method === "host.storageDelete") {
+      this.requirePermission("host.storage");
+      if (!this.api.storageDelete) throw new Error("Host storage is unavailable");
+      const input = requireRecord(params, "host.storageDelete params");
+      await this.api.storageDelete(this.plugin.manifest.id, requireStorageKey(input.key));
+      return null;
+    }
     throw new Error(`Unsupported plugin host method '${method}'`);
   }
 
@@ -477,10 +521,26 @@ export function pluginNetworkOrigins(permissions: readonly string[] | undefined)
   return [...origins];
 }
 
-export function pluginSandboxDocument(html: string, permissions?: readonly string[], theme?: PluginBridgeTheme): string {
+export interface PluginSandboxOptions {
+  /**
+   * Base URL under which the workbench document may fetch further plugin UI
+   * assets (code-split chunks, fonts) — `dbx-plugin://localhost/<id>/assets/`
+   * on native custom schemes, `http(s)://dbx-plugin.localhost/<id>/assets/`
+   * where WebView2 maps the scheme to an http subdomain. Injected as the
+   * document `<base>` and allowed in the resource CSP directives. Omit on
+   * hosts without the plugin asset protocol (the web host).
+   */
+  baseUrl?: string;
+}
+
+export function pluginSandboxDocument(html: string, permissions?: readonly string[], theme?: PluginBridgeTheme, options?: PluginSandboxOptions): string {
   const networkOrigins = pluginNetworkOrigins(permissions);
   const connectSrc = networkOrigins.length > 0 ? `connect-src ${networkOrigins.join(" ")};` : "connect-src 'none';";
-  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline' blob:; img-src data: blob:; font-src data: blob:; ${connectSrc} media-src data: blob:;">`;
+  const assetSource = pluginAssetCspSource(options?.baseUrl);
+  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:${assetSource}; style-src 'unsafe-inline' blob:; img-src data: blob:${assetSource}; font-src data: blob:${assetSource}; ${connectSrc} media-src data: blob:${assetSource};">`;
+  // <base> must precede every relative URL the document resolves (inlined CSS
+  // url(), dynamic import specifiers), so it leads the injection.
+  const base = options?.baseUrl && assetSource ? `<base href="${escapeHtmlAttribute(options.baseUrl)}">` : "";
   const sdk = `<script>${pluginSdkSource(theme)}</script>`;
   const uiKit = `<style>${pluginUiKitCss()}</style>`;
   // Placed after the uiKit so the boot `color-scheme` wins the cascade: the
@@ -488,9 +548,26 @@ export function pluginSandboxDocument(html: string, permissions?: readonly strin
   // has loaded, and the uiKit's token fallbacks would otherwise paint the
   // first frame white on dark hosts.
   const bootTheme = pluginBootThemeCss(theme);
-  const injection = `${csp}${uiKit}${bootTheme ? `<style>${bootTheme}</style>` : ""}${sdk}`;
+  const injection = `${csp}${base}${uiKit}${bootTheme ? `<style>${bootTheme}</style>` : ""}${sdk}`;
   if (/<head(?:\s[^>]*)?>/i.test(html)) return html.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${injection}`);
   return `<!doctype html><html><head>${injection}</head><body>${html}</body></html>`;
+}
+
+/**
+ * CSP source expression for the plugin asset base URL: the exact origin for
+ * the http(s)-mapped form (WebView2), the whole scheme for the native custom
+ * scheme form. Only dbx-plugin shapes contribute a source — anything else is
+ * ignored (and suppresses the <base> too).
+ */
+function pluginAssetCspSource(baseUrl: string | undefined): string {
+  if (!baseUrl) return "";
+  const mapped = baseUrl.match(/^(https?:\/\/dbx-plugin\.localhost)(?:\/|$)/i);
+  if (mapped) return ` ${mapped[1].toLowerCase()}`;
+  return /^dbx-plugin:\/\//i.test(baseUrl) ? " dbx-plugin:" : "";
+}
+
+function escapeHtmlAttribute(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 /**
@@ -736,6 +813,13 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
         return request('host.saveFile', options, { transfer: bytes });
       },
       copy: (text) => request('host.copy', { text }),
+      // Persistent per-plugin key-value state; gate on capabilities.storage
+      // (older hosts omit it) and declare the host.storage permission.
+      storage: Object.freeze({
+        get: (key) => request('host.storageGet', { key }),
+        set: (key, value) => request('host.storageSet', { key, value: value === undefined ? null : value }),
+        delete: (key) => request('host.storageDelete', { key }),
+      }),
       fileTransfer: Object.freeze({
         pick: (options) => request('host.pickFiles', options || {}),
         read: (handleId, offset, length) => request('host.readFileChunk', { handleId, offset, length }),
@@ -901,6 +985,14 @@ function requireOffset(value: unknown): number {
 function requireChunkLength(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) throw new Error("length is invalid");
   return Math.min(8 * 1024 * 1024, Math.floor(value));
+}
+
+/** A `host.storage` key: bounded, non-empty, no control characters. */
+function requireStorageKey(value: unknown): string {
+  if (typeof value !== "string" || !value || value.length > MAX_PLUGIN_STORAGE_KEY_CHARS || /[\u0000-\u001f]/.test(value)) {
+    throw new Error("storage key is invalid");
+  }
+  return value;
 }
 
 function base64ToBytes(value: string): ArrayBuffer {

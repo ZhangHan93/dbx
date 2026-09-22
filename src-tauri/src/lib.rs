@@ -6,6 +6,7 @@ mod macos_app_delegate;
 #[cfg(target_os = "macos")]
 mod macos_escape_guard;
 mod models;
+mod plugin_ui_protocol;
 #[cfg(any(target_os = "windows", test))]
 mod startup_recovery;
 #[cfg(all(not(target_os = "windows"), not(test)))]
@@ -1461,7 +1462,10 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init());
+        .plugin(tauri_plugin_fs::init())
+        // Plugin workbench sandbox documents lazy-load their code-split chunks
+        // through this scheme; see plugin_ui_protocol.rs.
+        .register_asynchronous_uri_scheme_protocol(plugin_ui_protocol::PLUGIN_UI_SCHEME, plugin_ui_protocol::handle);
 
     let builder = if should_enable_single_instance(cfg!(debug_assertions)) {
         builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
@@ -1532,6 +1536,7 @@ pub fn run() {
     builder
         .manage(CloseBehaviorState::new())
         .manage(commands::plugin_file::PluginFileState::new())
+        .manage(commands::plugin_storage::PluginUiStorageState::new())
         .manage(AppLocaleState::new())
         .on_page_load(|webview, payload| {
             if payload.event() == PageLoadEvent::Started {
@@ -1785,10 +1790,14 @@ pub fn run() {
             commands::prompt_template::delete_prompt_template,
             commands::prompt_template::get_ai_global_custom_instructions,
             commands::prompt_template::set_ai_global_custom_instructions,
+            commands::user_skills::list_user_skills,
+            commands::user_skills::read_user_skills,
             commands::app_settings::load_desktop_settings,
             commands::app_settings::save_desktop_settings,
             commands::app_settings::load_max_agent_turns,
             commands::app_settings::save_max_agent_turns,
+            commands::app_settings::load_history_retention_limit,
+            commands::app_settings::save_history_retention_limit,
             commands::app_settings::load_max_retries,
             commands::app_settings::save_max_retries,
             commands::app_settings::set_app_locale,
@@ -1879,6 +1888,9 @@ pub fn run() {
             commands::plugin_file::plugin_file_read,
             commands::plugin_file::plugin_file_write,
             commands::plugin_file::plugin_file_close,
+            commands::plugin_storage::plugin_ui_storage_get,
+            commands::plugin_storage::plugin_ui_storage_set,
+            commands::plugin_storage::plugin_ui_storage_delete,
             commands::plugins::list_plugins,
             commands::plugins::list_plugin_trusted_keys,
             commands::plugins::save_plugin_trusted_key,
@@ -1958,6 +1970,7 @@ pub fn run() {
             commands::schema::list_constraints,
             commands::schema::list_partitions,
             commands::schema::get_table_partition_status,
+            commands::schema::get_table_partitioning,
             commands::schema::list_invalid_indexes,
             commands::schema::list_subpartitions,
             commands::schema::get_table_ddl,
@@ -2039,6 +2052,8 @@ pub fn run() {
             commands::query::preview_sqlite_table_structure_change,
             commands::query::apply_sqlite_table_structure_change,
             commands::query::build_create_table_sql,
+            commands::query::build_create_partitioned_table_sql,
+            commands::query::build_table_partition_operation_sql,
             commands::query::build_single_column_alter_sql,
             commands::query::analyze_editable_query_editability,
             commands::query::prepare_data_grid_save,
