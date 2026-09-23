@@ -444,6 +444,62 @@ jobs:
           "AWS_LC_SYS_STATIC=1" >> $env:GITHUB_ENV
           "AWS-LC cache hit: ${{ steps.aws-lc-cache.outputs.cache-hit }}" >> $env:GITHUB_STEP_SUMMARY
 
+      - name: Restore prebuilt Win7 OpenSSL
+        id: openssl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/win7-openssl-install
+          key: win7-openssl-v1-${{ runner.os }}-${{ env.WIN7_NIGHTLY_TOOLCHAIN }}-${{ hashFiles('Cargo.lock', '.github/fixtures/win7-openssl-cache/Cargo.lock') }}
+
+      - name: Build Win7 OpenSSL cache
+        if: steps.openssl-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+          $targetRoot = Join-Path $env:RUNNER_TEMP "win7-openssl-build"
+          $installRoot = Join-Path $env:RUNNER_TEMP "win7-openssl-install"
+          cargo build --locked --release `
+            --manifest-path .github/fixtures/win7-openssl-cache/Cargo.toml `
+            --target x86_64-win7-windows-msvc `
+            -Z build-std=std,panic_abort
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $install = Get-ChildItem $targetRoot -Directory -Recurse -Filter install |
+            Where-Object { $_.FullName -like "*openssl-build*" } |
+            Select-Object -First 1
+          if (!$install) {
+            Write-Error "OpenSSL did not create an install directory."
+            exit 1
+          }
+          New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
+          Copy-Item -Path (Join-Path $install.FullName "*") -Destination $installRoot -Recurse -Force
+          $timer.Stop()
+          "OpenSSL cache build: $([math]::Round($timer.Elapsed.TotalSeconds, 1)) seconds" >> $env:GITHUB_STEP_SUMMARY
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/win7-openssl-build
+
+      - name: Configure prebuilt Win7 OpenSSL
+        shell: pwsh
+        run: |
+          $installRoot = Join-Path $env:RUNNER_TEMP "win7-openssl-install"
+          if (!(Test-Path (Join-Path $installRoot "include/openssl/ssl.h"))) {
+            Write-Error "The OpenSSL cache does not contain ssl.h."
+            exit 1
+          }
+          if (!(Get-ChildItem (Join-Path $installRoot "lib") -Filter "*ssl*.lib")) {
+            Write-Error "The OpenSSL cache does not contain an SSL library."
+            exit 1
+          }
+          if (!(Get-ChildItem (Join-Path $installRoot "lib") -Filter "*crypto*.lib")) {
+            Write-Error "The OpenSSL cache does not contain a crypto library."
+            exit 1
+          }
+          "OPENSSL_DIR=$installRoot" >> $env:GITHUB_ENV
+          "OPENSSL_NO_VENDOR=1" >> $env:GITHUB_ENV
+          "OPENSSL_STATIC=1" >> $env:GITHUB_ENV
+          "OpenSSL cache hit: ${{ steps.openssl-cache.outputs.cache-hit }}" >> $env:GITHUB_STEP_SUMMARY
+
       - name: Prepare Win7-compatible WebView2 loader
         shell: pwsh
         run: ./.github/scripts/prepare-webview2-win7-loader.ps1
@@ -507,7 +563,7 @@ jobs:
       - name: Show sccache stats
         if: always()
         continue-on-error: true
-        run: ${SCCACHE_PATH} --show-stats
+        run: sccache --show-stats
 
       - name: Upload Windows 7 test installer
         uses: actions/upload-artifact@v6

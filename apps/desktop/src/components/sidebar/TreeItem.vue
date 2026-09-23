@@ -74,7 +74,7 @@ import { formatSidebarObjectStorage } from "@/lib/sidebar/sidebarDatabaseStorage
 import { effectiveRedisDatabaseIndex } from "@/lib/redis/redisDatabaseIndex";
 import { dataTabOpenModeFromTreeClick } from "@/lib/sidebar/dataTabOpenPolicy";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
-import { selectedTableVGroupMoveTargets, tableVGroupIdFromNodeId } from "@/lib/table/tableVGroup";
+import { isTableVGroupGroupableRowType, selectedTableVGroupMoveTargets, tableVGroupIdFromNodeId } from "@/lib/table/tableVGroup";
 import { findTreeNodeById } from "@/lib/sql/newQueryContext";
 import { resolveTableVGroupDropTarget, setTableVGroupDropTargetNodeId, tableVGroupDropTargetNodeId } from "@/lib/sidebar/sidebarTableVGroupDrag";
 import { connectionDisplayUrlScheme } from "@/lib/connection/connectionPresentation";
@@ -1375,9 +1375,10 @@ function tableReferenceDragPayload(): QueryEditorTableReferencePayload | null {
 
 function startTableReferenceDrag(payload: QueryEditorTableReferencePayload) {
   draggingTableReferencePayload = payload;
-  // 分组成员名单只收真实表：视图/物化视图投影不识别，入组会产生隐形脏数据。
+  // 分组成员名单按可分组行类型收集（表/视图/物化视图/过程/函数/触发器/序列等）；
+  // 无匹配容器的行由 scope 解析兜底拒绝，不会产生隐形脏数据。
   vgroupDragTableNames = selectedTableVGroupMoveTargets(activeNode.value, selectedTreeNodesInVisibleOrder())
-    .filter((node) => node.type === "table")
+    .filter((node) => isTableVGroupGroupableRowType(node.type))
     .map((node) => node.label);
   setActiveTableReferencePayload(payload);
   document.getSelection()?.removeAllRanges();
@@ -1402,7 +1403,8 @@ let vgroupDragTableNames: string[] = [];
 
 function tableVGroupDropTargetFor(payload: QueryEditorTableReferencePayload, event: MouseEvent) {
   if (!vgroupDragTableNames.length) return null;
-  return resolveTableVGroupDropTarget(event.clientX, event.clientY, connectionStore.treeNodes, payload);
+  // 拖拽源是树行（多选同类型），落点解析按行类别过滤跨类别容器。
+  return resolveTableVGroupDropTarget(event.clientX, event.clientY, connectionStore.treeNodes, { ...payload, objectType: activeNode.value.type });
 }
 
 function onTableReferenceMouseMove(event: MouseEvent) {
@@ -1431,7 +1433,7 @@ function onTableReferenceMouseUp(event: MouseEvent) {
     suppressNextTableReferenceClick = true;
     const dropTarget = tableVGroupDropTargetFor(payload, event);
     if (dropTarget) {
-      for (const tableName of vgroupDragTableNames) connectionStore.moveTableToVGroup(dropTarget.node, tableName, dropTarget.groupId);
+      for (const tableName of vgroupDragTableNames) connectionStore.moveTableToVGroup(dropTarget.node, tableName, dropTarget.groupId, activeNode.value.type);
     } else {
       const target = document.elementFromPoint(event.clientX, event.clientY);
       if (target instanceof Element && target.closest(`[data-query-editor-root], ${AI_ASSISTANT_TABLE_DROP_ROOT_SELECTOR}`)) {

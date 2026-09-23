@@ -489,6 +489,10 @@ export async function checkConnectionHealth(connectionId: string): Promise<void>
   return post("/api/connection/check-health", { connectionId });
 }
 
+export async function prewarmConnection(connectionId: string, database?: string, catalog?: string, clientSessionId?: string): Promise<void> {
+  return post("/api/connection/prewarm", { connectionId, database, catalog, clientSessionId });
+}
+
 export async function connectionIdentifierQuote(connectionId: string, database?: string): Promise<string | undefined> {
   const quote = await post<string | null>("/api/connection/identifier-quote", {
     connectionId,
@@ -1391,6 +1395,10 @@ export async function executeMulti(
     useTransaction?: boolean;
     continueOnError?: boolean;
     executionMode?: "simple";
+    /** MySQL auto-commit tabs: keep a transaction the user opened explicitly
+     *  (`BEGIN` / `START TRANSACTION`) open across executions until COMMIT /
+     *  ROLLBACK instead of rolling it back when the batch ends. */
+    preserveExplicitTransaction?: boolean;
   },
 ): Promise<QueryResult[]> {
   return postQueryWithDiagnostics(
@@ -1439,6 +1447,7 @@ export async function executeMultiWithProgress(
     useTransaction?: boolean;
     continueOnError?: boolean;
     executionMode?: "simple";
+    preserveExplicitTransaction?: boolean;
     executionId?: string;
   },
 ): Promise<QueryResult[]> {
@@ -5185,15 +5194,15 @@ export async function openPluginLocalFile(_pluginId: string, _path: string, _wri
   throw new Error("Plugin local file access is not available in the web backend");
 }
 
-export async function readPluginLocalFileChunk(_pluginId: string, _handleId: number, _offset: number, _length?: number): Promise<PluginLocalFileChunk> {
+export async function readPluginLocalFileChunk(_pluginId: string, _handleId: string, _offset: number, _length?: number): Promise<PluginLocalFileChunk> {
   throw new Error("Plugin local file access is not available in the web backend");
 }
 
-export async function writePluginLocalFileChunk(_pluginId: string, _handleId: number, _offset: number, _dataBase64: string): Promise<PluginLocalFileWriteResult> {
+export async function writePluginLocalFileChunk(_pluginId: string, _handleId: string, _offset: number, _dataBase64: string): Promise<PluginLocalFileWriteResult> {
   throw new Error("Plugin local file access is not available in the web backend");
 }
 
-export async function closePluginLocalFile(_pluginId: string, _handleId: number): Promise<void> {
+export async function closePluginLocalFile(_pluginId: string, _handleId: string): Promise<void> {
   throw new Error("Plugin local file access is not available in the web backend");
 }
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ArrowLeft, Minus, Square, Copy, X, Grip } from "@lucide/vue";
+import { ArrowLeft, Minus, Square, Copy, X, Grip, Pin, PinOff } from "@lucide/vue";
 import { useI18n } from "vue-i18n";
 import { useWindowControls } from "@/composables/useWindowControls";
 
@@ -17,7 +17,7 @@ const emit = defineEmits<{
 }>();
 
 const { t } = useI18n();
-const { isMac, isMaximized, minimize, toggleMaximize } = useWindowControls();
+const { isMac, isMaximized, isAlwaysOnTop, minimize, toggleMaximize, toggleAlwaysOnTop } = useWindowControls();
 
 let dragging = false;
 
@@ -72,6 +72,19 @@ async function handleDragEnd(event: PointerEvent) {
     <button type="button" class="mr-1 inline-flex h-7 items-center gap-1 rounded px-2 text-muted-foreground hover:bg-accent hover:text-foreground" :title="t('tabs.returnToMainWindow')" @pointerdown.stop @click="emit('return')">
       <ArrowLeft class="h-3.5 w-3.5" />
       <span>{{ t("tabs.returnToMainWindow") }}</span>
+    </button>
+    <button
+      type="button"
+      class="mr-1 inline-flex h-7 w-7 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+      :class="{ 'bg-accent text-foreground': isAlwaysOnTop }"
+      :title="isAlwaysOnTop ? t('toolbar.alwaysOnTopOff') : t('toolbar.alwaysOnTop')"
+      :aria-pressed="isAlwaysOnTop"
+      :aria-label="isAlwaysOnTop ? t('toolbar.alwaysOnTopOff') : t('toolbar.alwaysOnTop')"
+      @pointerdown.stop
+      @click="toggleAlwaysOnTop"
+    >
+      <Pin v-if="isAlwaysOnTop" class="h-3.5 w-3.5 fill-current" />
+      <PinOff v-else class="h-3.5 w-3.5" />
     </button>
     <template v-if="!isMac">
       <button type="button" class="inline-flex h-10 w-10 items-center justify-center hover:bg-foreground/10" :title="t('tabs.minimizeWindow')" @click="minimize"><Minus class="h-4 w-4" /></button>
