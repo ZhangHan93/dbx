@@ -5082,6 +5082,17 @@ fn sqlserver_native_function_sql(definition: &str, qualified_name: &str, is_modi
     Some(format!("{verb} {qualified_name}{};", &definition_after_verb[arguments_start..]))
 }
 
+/// PostgreSQL-family drivers read routines through `pg_get_functiondef`, which already
+/// returns a complete `CREATE OR REPLACE FUNCTION name(args) ...` statement. Keep that
+/// header verb and only swap in the target-qualified name.
+fn native_create_routine_sql(definition: &str, qualified_name: &str) -> Option<String> {
+    let trimmed = definition.trim().trim_end_matches(';').trim_end();
+    let prefix = Regex::new(r"(?i)^CREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\b").ok()?.find(trimmed)?;
+    let definition_after_verb = trimmed[prefix.end()..].trim_start();
+    let arguments_start = definition_after_verb.find('(')?;
+    Some(format!("{} {qualified_name}{};", prefix.as_str(), &definition_after_verb[arguments_start..]))
+}
+
 fn generate_create_table_sql(
     name: &str,
     columns: &[ColumnDiff],
@@ -6197,6 +6208,13 @@ fn generate_schema_sync_sql_inner(
                                     continue;
                                 }
                             }
+                            if db_type != DatabaseType::SqlServer {
+                                let name = qualified_name(&diff.name, db_type, schema);
+                                if let Some(sql) = native_create_routine_sql(&source.definition, &name) {
+                                    lines.push(sql);
+                                    continue;
+                                }
+                            }
                             let create_kw = if db_type == DatabaseType::SqlServer && diff.diff_type == "modified" {
                                 "ALTER FUNCTION"
                             } else if profile.create_function_or_replace {
@@ -6375,6 +6393,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             character_maximum_length: None,
+            metadata_capabilities: None,
             enum_values: None,
             character_set: None,
             collation: None,
@@ -9215,6 +9234,7 @@ mod tests {
                     numeric_precision: None,
                     numeric_scale: None,
                     character_maximum_length: None,
+                    metadata_capabilities: None,
                     enum_values: None,
                     character_set: None,
                     collation: None,
@@ -12411,6 +12431,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             character_maximum_length: None,
+            metadata_capabilities: None,
             enum_values: None,
             character_set: None,
             collation: None,
@@ -12428,6 +12449,7 @@ mod tests {
             numeric_precision: None,
             numeric_scale: None,
             character_maximum_length: None,
+            metadata_capabilities: None,
             enum_values: None,
             character_set: None,
             collation: None,
@@ -14082,6 +14104,51 @@ mod tests {
         assert!(sql.contains("DROP RULE IF EXISTS r1 ON"), "{sql}");
         assert!(sql.contains("OWNER TO app"), "{sql}");
         assert!(sql.contains("CASCADE"), "{sql}");
+    }
+
+    #[test]
+    fn postgres_function_sync_reuses_native_functiondef_header_once() {
+        let function = |arguments: &str, definition: &str| FunctionDiff {
+            diff_type: "added".into(),
+            name: "armor".into(),
+            source: Some(FunctionInfo {
+                name: "armor".into(),
+                function_type: "FUNCTION".into(),
+                data_type: "text".into(),
+                definition: definition.into(),
+                arguments: arguments.into(),
+            }),
+            target: None,
+            changes: vec![],
+        };
+        let diffs = [
+            function(
+                "bytea",
+                "CREATE OR REPLACE FUNCTION armor(bytea)\n RETURNS text\n LANGUAGE c\n IMMUTABLE PARALLEL SAFE STRICT\nAS '$libdir/pgcrypto', $function$pg_armor$function$\n",
+            ),
+            function(
+                "bytea, text[], text[]",
+                "CREATE OR REPLACE FUNCTION armor(bytea, text[], text[])\n RETURNS text\n LANGUAGE c\nAS '$libdir/pgcrypto', $function$pg_armor$function$\n",
+            ),
+        ];
+
+        let sql = generate_schema_sync_sql(
+            &[],
+            &diffs,
+            &[],
+            &[],
+            &[],
+            DatabaseType::Postgres,
+            Some("public"),
+            false,
+            None,
+            &[],
+        );
+
+        assert_eq!(sql.matches("CREATE OR REPLACE FUNCTION").count(), 2, "{sql}");
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION \"public\".\"armor\"(bytea)\n RETURNS text"), "{sql}");
+        assert!(sql.contains("CREATE OR REPLACE FUNCTION \"public\".\"armor\"(bytea, text[], text[])\n"), "{sql}");
+        assert!(sql.contains("$function$pg_armor$function$;"), "{sql}");
     }
 
     #[test]
