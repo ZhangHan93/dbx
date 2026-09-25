@@ -1,11 +1,13 @@
 // @vitest-environment happy-dom
 
 import { readFileSync } from "node:fs";
-import { nextTick } from "vue";
+import { createApp, defineComponent, h, nextTick } from "vue";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createPinia, setActivePinia } from "pinia";
 import { dispatch, findAll, findOne, hostText, mountComponent } from "./vueHostHarness";
 import type { DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
 
+const settingsMock = vi.hoisted(() => ({ store: null as any }));
 const mocks = vi.hoisted(() => ({
   editor: { create: vi.fn(), destroy: vi.fn(), setValue: vi.fn(), openSearch: vi.fn() },
   updateSettings: vi.fn(),
@@ -16,39 +18,15 @@ const mocks = vi.hoisted(() => ({
   toast: vi.fn(),
 }));
 
-vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
+vi.mock("vue-i18n", () => ({
+  useI18n: () => ({ t: (key: string) => key, locale: { value: "en" } }),
+  // DataGrid.vue's import graph reaches @/i18n, which builds a real i18n instance at module scope.
+  createI18n: () => ({ install: () => {}, global: { t: (key: string) => key, locale: { value: "en" } } }),
+}));
 vi.mock("@lucide/vue", async () => {
   const { createPassthroughStub } = await import("./vueHostHarness");
   const icon = createPassthroughStub("Icon", "i");
-  return {
-    Check: icon,
-    CaseSensitive: icon,
-    ChevronDown: icon,
-    ChevronUp: icon,
-    ChevronLeft: icon,
-    ChevronRight: icon,
-    ChevronsLeft: icon,
-    ChevronsRight: icon,
-    Download: icon,
-    Filter: icon,
-    Focus: icon,
-    FileDiff: icon,
-    Loader2: icon,
-    FileUp: icon,
-    Upload: icon,
-    Search: icon,
-    X: icon,
-    Code2: icon,
-    Copy: icon,
-    Eye: icon,
-    EyeOff: icon,
-    GripVertical: icon,
-    Info: icon,
-    Pencil: icon,
-    Plus: icon,
-    RotateCcw: icon,
-    Trash2: icon,
-  };
+  return new Proxy({}, { get: (_target, key) => (key === "__esModule" ? false : icon), has: () => true });
 });
 
 vi.mock("@/components/ui/button", async () => ({ Button: (await import("./vueHostHarness")).createPassthroughStub("Button", "button") }));
@@ -71,7 +49,7 @@ vi.mock("@/components/ui/dropdown-menu", async () => {
 });
 vi.mock("@/components/ui/popover", async () => {
   const { createPassthroughStub } = await import("./vueHostHarness");
-  return { Popover: createPassthroughStub("Popover"), PopoverContent: createPassthroughStub("PopoverContent"), PopoverTrigger: createPassthroughStub("PopoverTrigger") };
+  return { Popover: createPassthroughStub("Popover"), PopoverAnchor: createPassthroughStub("PopoverAnchor"), PopoverContent: createPassthroughStub("PopoverContent"), PopoverTrigger: createPassthroughStub("PopoverTrigger") };
 });
 vi.mock("@/components/ui/tooltip", async () => {
   const { createPassthroughStub } = await import("./vueHostHarness");
@@ -89,8 +67,24 @@ vi.mock("@/components/ui/LightTooltip.vue", async () => ({ default: (await impor
 vi.mock("@/components/grid/TemporalCellEditor.vue", async () => ({ default: (await import("./vueHostHarness")).createPassthroughStub("TemporalCellEditor") }));
 vi.mock("@/components/grid/DataGridValueTransform.vue", async () => ({ default: (await import("./vueHostHarness")).createPassthroughStub("DataGridValueTransform") }));
 vi.mock("@/composables/useCellDetailEditor", () => ({ useCellDetailEditor: () => mocks.editor }));
-vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: { value: false }, themePalette: { value: {} } }) }));
-vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: { cellDetailJsonFormatted: true, theme: "default", fontSize: 13, fontFamily: "monospace" }, updateEditorSettings: mocks.updateSettings }) }));
+vi.mock("@/composables/useTheme", async () => {
+  const { ref } = await import("vue");
+  // Real refs: DataGrid.vue both watches isDark and binds it to a Boolean prop.
+  const isDark = ref(false);
+  const themePalette = ref({});
+  return { useTheme: () => ({ isDark, themePalette }) };
+});
+vi.mock("@/stores/settingsStore", async () => {
+  const actual = await vi.importActual<typeof import("@/stores/settingsStore")>("@/stores/settingsStore");
+  const { reactive } = await import("vue");
+  // Reactive and complete: DataGrid.vue reads dozens of editor settings and must
+  // re-render when a test flips one.
+  settingsMock.store = {
+    editorSettings: reactive({ ...actual.DEFAULT_EDITOR_SETTINGS, cellDetailJsonFormatted: true, theme: "default", fontSize: 13, fontFamily: "monospace" }),
+    updateEditorSettings: mocks.updateSettings,
+  };
+  return { ...actual, useSettingsStore: () => settingsMock.store };
+});
 vi.mock("@/lib/dataGrid/geometryPreview", () => ({ isHexGeometry: () => false, renderWktOnCanvas: mocks.renderWkt }));
 vi.mock("@/lib/common/clipboard", () => ({ copyToClipboard: mocks.copyToClipboard }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
@@ -106,6 +100,7 @@ vi.mock("@/composables/useDataGridCellDetail", async () => {
 
 import DataGridCellDetailDialog from "@/components/grid/DataGridCellDetailDialog.vue";
 import DataGridCellDetailPanel from "@/components/grid/DataGridCellDetailPanel.vue";
+import DataGrid from "@/components/grid/DataGrid.vue";
 import DataGridColumnHeader from "@/components/grid/DataGridColumnHeader.vue";
 import DataGridCopyColumnNamesDialog from "@/components/grid/DataGridCopyColumnNamesDialog.vue";
 import DataGridFilterBuilder from "@/components/grid/DataGridFilterBuilder.vue";
@@ -288,7 +283,7 @@ describe("DataGridPagination", () => {
       onNextPage: nextPage,
       onLastPage: lastPage,
     });
-    const navigation = findAll(mounted.root, (node) => node.props["data-stub"] === "Button" && node.props.class === "h-5 w-5 shrink-0");
+    const navigation = findAll(mounted.root, (node) => node.props["data-stub"] === "Button" && node.props.class === "h-5 w-5 shrink-0" && node.props["aria-label"] !== "grid.loadAllAndGoToLastRow");
 
     expect(navigation.map((node) => node.props.disabled)).toEqual([true, true, true, true]);
     navigation.forEach((node) => dispatch(node, "click"));
@@ -298,7 +293,7 @@ describe("DataGridPagination", () => {
     expect(lastPage).not.toHaveBeenCalled();
 
     await mounted.setProps({ currentPage: 2, canGoNextPage: true, canJumpLastPage: true });
-    const enabledNavigation = findAll(mounted.root, (node) => node.props["data-stub"] === "Button" && node.props.class === "h-5 w-5 shrink-0");
+    const enabledNavigation = findAll(mounted.root, (node) => node.props["data-stub"] === "Button" && node.props.class === "h-5 w-5 shrink-0" && node.props["aria-label"] !== "grid.loadAllAndGoToLastRow");
     expect(enabledNavigation.map((node) => node.props.disabled)).toEqual([false, false, false, false]);
     enabledNavigation.forEach((node) => dispatch(node, "click"));
     expect(firstPage).toHaveBeenCalledOnce();
@@ -307,7 +302,7 @@ describe("DataGridPagination", () => {
     expect(lastPage).toHaveBeenCalledOnce();
 
     await mounted.setProps({ loading: true });
-    const busyNavigation = findAll(mounted.root, (node) => node.props["data-stub"] === "Button" && node.props.class === "h-5 w-5 shrink-0");
+    const busyNavigation = findAll(mounted.root, (node) => node.props["data-stub"] === "Button" && node.props.class === "h-5 w-5 shrink-0" && node.props["aria-label"] !== "grid.loadAllAndGoToLastRow");
     expect(busyNavigation.map((node) => node.props.disabled)).toEqual([true, true, true, true]);
     expect(findOne(mounted.root, (node) => node.props["aria-label"] === "grid.jumpToPage").props.disabled).toBe(true);
   });
@@ -374,6 +369,36 @@ describe("DataGridPagination", () => {
     });
 
     expect(findAll(mounted.root, (node) => node.props["data-stub"] === "Button" && node.props.class === "h-5 w-5 shrink-0")).toHaveLength(0);
+  });
+
+  it("loads all paginated rows and moves to the last row", async () => {
+    const loadAllRows = vi.fn();
+    const mounted = mountComponent(DataGridPagination, {
+      selectionSummary: null,
+      selectionSummarySumText: "",
+      loading: false,
+      infiniteScrollEnabled: false,
+      infiniteScrollAllLoaded: false,
+      canLoadAllRows: true,
+      pageSize: 100,
+      customPageSizeInput: "",
+      pageSizeMenuItems: [],
+      exportMenuItems: [],
+      currentPage: 1,
+      canGoNextPage: true,
+      canJumpLastPage: true,
+      onLoadAllRows: loadAllRows,
+    });
+    const loadAllButton = findOne(mounted.root, (node) => node.props["aria-label"] === "grid.loadAllAndGoToLastRow");
+
+    expect(loadAllButton.props.disabled).toBe(false);
+    dispatch(loadAllButton, "click");
+    expect(loadAllRows).toHaveBeenCalledOnce();
+
+    await mounted.setProps({ loading: true });
+    expect(findOne(mounted.root, (node) => node.props["aria-label"] === "grid.loadAllAndGoToLastRow").props.disabled).toBe(true);
+    await mounted.setProps({ loading: false, canLoadAllRows: false });
+    expect(findOne(mounted.root, (node) => node.props["aria-label"] === "grid.loadAllAndGoToLastRow").props.disabled).toBe(true);
   });
 });
 
@@ -1837,5 +1862,46 @@ describe("DataGridCopyColumnNamesDialog", () => {
     findOne(mounted.root, (node) => node.props["data-stub"] === "Select").props["onUpdate:modelValue"]("bogus");
     await nextTick();
     expect(previewText(mounted)).toBe("id\ttype");
+  });
+});
+
+describe("DataGrid column header tooltips", () => {
+  // The rest of this file drives leaf components through the host renderer, but
+  // DataGrid.vue touches the DOM directly (querySelector/observers), so this
+  // case mounts it into happy-dom instead.
+  function mountDataGrid() {
+    setActivePinia(createPinia());
+    const host = document.createElement("div");
+    document.body.appendChild(host);
+    const app = createApp(defineComponent({ setup: () => () => h(DataGrid, { result: { columns: ["id", "name"], rows: [[1, "a"]] } }) }));
+    app.mount(host);
+    return {
+      host,
+      // `disabled` is not one of Vue's special boolean attributes, so binding it
+      // on the LightTooltip stub's <div> renders the literal "true"/"false".
+      headerTooltipsDisabled: () => [...host.querySelectorAll('[data-grid-column-index] [data-stub="LightTooltip"]')].map((node) => node.getAttribute("disabled") === "true"),
+      destroy() {
+        app.unmount();
+        host.remove();
+      },
+    };
+  }
+
+  it("follows the showColumnHeaderTooltips preference", async () => {
+    const grid = mountDataGrid();
+    await nextTick();
+
+    expect(settingsMock.store.editorSettings.showColumnHeaderTooltips).toBe(true);
+    expect(grid.headerTooltipsDisabled()).toEqual([false, false]);
+
+    settingsMock.store.editorSettings.showColumnHeaderTooltips = false;
+    await nextTick();
+    expect(grid.headerTooltipsDisabled()).toEqual([true, true]);
+
+    settingsMock.store.editorSettings.showColumnHeaderTooltips = true;
+    await nextTick();
+    expect(grid.headerTooltipsDisabled()).toEqual([false, false]);
+
+    grid.destroy();
   });
 });

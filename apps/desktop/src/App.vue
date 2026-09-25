@@ -2,12 +2,17 @@
 import { blockingDesktopAiRunsForUpdate } from "@/lib/ai/desktopAiRunRegistry";
 import { setupUpdatePreparation, prepareUpdateWithDraftRecovery, isUpdatePreparationActive } from "@/lib/app/updatePreparation";
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent, provide } from "vue";
+import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
+import { checkStartupAuthentication, type StartupAuthentication } from "@/lib/startup/startupAuthentication";
+import { markStartupPhase } from "@/lib/startup/startupTiming";
+import { clearStartupPreloadRetry } from "@/lib/startup/startupPreloadRecovery";
 import { useI18n } from "vue-i18n";
 import { FileText } from "@lucide/vue";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import AppToolbar from "@/components/layout/AppToolbar.vue";
 import AppTabBar from "@/components/layout/AppTabBar.vue";
 import { createGroupTabBarPortal, GROUP_TAB_BAR_PORTAL } from "@/components/layout/groupTabBarPortal";
+import PluginShortcutBar from "@/components/plugins/PluginShortcutBar.vue";
 import AppSidebar from "@/components/layout/AppSidebar.vue";
 import SqlEditorWorkspace from "@/components/layout/SqlEditorWorkspace.vue";
 import { EDITOR_TOOLBAR_ACTIONS } from "@/components/layout/editorToolbarActions";
@@ -145,7 +150,7 @@ import { buildHistoryAiAnalysisPrompt } from "@/lib/history/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates } from "@/lib/connection/agentDriverUpdateBadge";
 import type { DriverStoreFocus, DriverStoreTab } from "@/lib/connection/agentDriverInstallHint";
 import { safeLocalStorageGet, safeLocalStorageSet } from "@/lib/backend/safeStorage";
-import { apiUrl, webPath } from "@/lib/common/webPath";
+import { webPath } from "@/lib/common/webPath";
 import { shouldBlockAppNativeSelectAll } from "@/lib/common/clipboard";
 import { APP_FONT_SANS_CSS_VAR, DATA_GRID_FONT_FAMILY_CSS_VAR, DEFAULT_DATA_GRID_FONT_FAMILY, DEFAULT_MONO_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY, FONT_MONO_CSS_VAR } from "@/lib/app/appFonts";
 import { DATA_GRID_TYPE_COLOR_KEYS, dataGridTypeColorCssVar, resolveActiveDataGridTypeColors } from "@/lib/dataGrid/dataGridTypeColorScheme";
@@ -215,6 +220,7 @@ type AiAssistantHandle = {
 type AuxiliarySearchSurface = "ai" | "history" | "sqlLibrary" | null;
 
 const { t, locale: appLocale } = useI18n();
+const startupProps = defineProps<{ startupAuthentication?: StartupAuthentication }>();
 const connectionStore = useConnectionStore();
 const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
@@ -362,9 +368,9 @@ const { mcpUpdateAvailable, refreshMcpUpdateStatus, handleMcpStatusChanged, appl
 const drawDesktopWindowFrame = shouldDrawDesktopWindowFrame(isMacOS(), isDesktop, isWindows());
 const UPDATE_CHECK_INTERVAL_MS = 60 * 60 * 1000;
 let updateCheckTimer: ReturnType<typeof setInterval> | undefined;
-const needsAuth = ref(!isDesktop);
-const authenticated = ref(isDesktop);
-const setupRequired = ref(false);
+const needsAuth = ref(!isDesktop && (startupProps.startupAuthentication?.required ?? true));
+const authenticated = ref(isDesktop || (startupProps.startupAuthentication?.authenticated ?? false));
+const setupRequired = ref(!isDesktop && (startupProps.startupAuthentication?.setup_required ?? false));
 
 const showConnectionDialog = ref(false);
 const connectionDialogPrefill = ref<ConnectionDeepLinkDraft | null>(null);
@@ -1269,11 +1275,12 @@ async function checkAllUpdates() {
     toast(FORK_NO_ONLINE_UPDATE_NOTICE, 5000);
     return;
   }
-  if (manualCheckingAllUpdates.value) return;
+  if (manualCheckingAllUpdates.value || componentUpdates.updating.value) return;
   manualCheckingAllUpdates.value = true;
   const startedAt = Date.now();
   try {
-    const [, componentRefresh] = await Promise.allSettled([checkUpdates({ silent: true }), componentUpdates.refresh()]);
+    // A user-triggered check must replace any in-flight background snapshot that may predate the update.
+    const [, componentRefresh] = await Promise.allSettled([checkUpdates({ silent: true }), componentUpdates.refresh({ force: true })]);
     if (componentRefresh.status === "fulfilled" && componentRefresh.value) syncToolbarComponentUpdateState();
     const remaining = 500 - (Date.now() - startedAt);
     if (remaining > 0) await new Promise((resolve) => setTimeout(resolve, remaining));
@@ -1294,7 +1301,7 @@ function handleToolbarUpdateClick() {
     return;
   }
   showUpdateDialog.value = true;
-  if (!checkingAllUpdates.value) void checkAllUpdates();
+  void checkAllUpdates();
 }
 
 function syncToolbarComponentUpdateState() {
@@ -3876,10 +3883,13 @@ async function initApp() {
   console.log("[STARTUP] initApp begin");
   const restoreOpenTabs = async () => {
     await settingsStore.initEditorSettings();
+    markStartupPhase("settings-ready");
     console.log(`[STARTUP]   settingsStore.initEditorSettings: ${(performance.now() - t0).toFixed(0)}ms`);
     await connectionStore.initFromDisk();
+    markStartupPhase("connections-ready");
     console.log(`[STARTUP]   connectionStore.initFromDisk: ${(performance.now() - t0).toFixed(0)}ms`);
     await queryStore.initOpenTabs({ validConnectionIds: connectionStore.connections.map((connection) => connection.id) });
+    markStartupPhase("tabs-restored");
     console.log(`[STARTUP]   queryStore.initOpenTabs: ${(performance.now() - t0).toFixed(0)}ms`);
   };
 
@@ -3985,6 +3995,8 @@ function runUpdateNotificationChecks() {
 }
 
 onMounted(async () => {
+  clearStartupPreloadRetry();
+  markStartupPhase("app-mounted");
   console.log("[STARTUP] onMounted begin");
   const mountStart = performance.now();
   if (isDetachedWindowContext) {
@@ -4034,14 +4046,15 @@ onMounted(async () => {
     true,
   );
   if (!isDesktop) {
-    try {
-      const res = await fetch(apiUrl("/api/auth/check"));
-      const data = await res.json();
-      needsAuth.value = data.required;
-      authenticated.value = data.authenticated;
-      setupRequired.value = data.setup_required;
-    } catch {
-      /* server unreachable */
+    if (!startupProps.startupAuthentication) {
+      try {
+        const data = await checkStartupAuthentication();
+        needsAuth.value = data.required;
+        authenticated.value = data.authenticated;
+        setupRequired.value = data.setup_required;
+      } catch {
+        /* server unreachable */
+      }
     }
     if (needsAuth.value && !authenticated.value) {
       history.replaceState(null, "", webPath("/login"));
@@ -4166,6 +4179,7 @@ onUnmounted(() => {
         />
 
         <div :class="isDetachedWindowContext ? 'flex-1 flex min-h-0' : isClassicLayout ? 'app-layout-classic flex-1 flex min-h-0' : 'app-panel-gutter flex-1 flex min-h-0 gap-1 p-1'">
+          <PluginShortcutBar v-if="!isDetachedWindowContext && !isZenMode && settingsStore.editorSettings.pluginShortcuts.enabled && settingsStore.editorSettings.pluginShortcuts.position.startsWith('left-')" :position="settingsStore.editorSettings.pluginShortcuts.position" />
           <AppSidebar
             v-if="!isDetachedWindowContext"
             v-show="sidebarOpen && !isZenMode"
@@ -4348,7 +4362,7 @@ onUnmounted(() => {
                     @format-error="toast(t('toolbar.formatSqlFailed'))"
                     @save-sql="(tabId: string) => void openSaveSqlDialog(tabId)"
                     @reload="(tabId: string, sql: any, searchText: any, whereInput: any, orderBy: any, limit: any, offset: any, intent: any) => onReloadData(tabId, sql, searchText, whereInput, orderBy, limit, offset, intent)"
-                    @paginate="(tabId: string, offset: number, limit: number, whereInput?: string, orderBy?: string) => onPaginate(tabId, offset, limit, whereInput, orderBy)"
+                    @paginate="(tabId: string, offset: number, limit: number, whereInput?: string, orderBy?: string, appendResult?: boolean) => onPaginate(tabId, offset, limit, whereInput, orderBy, appendResult)"
                     @sort="(tabId: string, column: string, columnIndex: number, direction: 'asc' | 'desc' | null, whereInput?: string, mode?: DataGridSortMode) => onSort(tabId, column, columnIndex, direction, whereInput, mode)"
                     @execute-sql="(tabId: string, sql: string) => onExecuteSql(tabId, sql)"
                     @click-table="(_tabId: string, target: SqlObjectNavigationTarget) => onClickTable(target)"
@@ -4383,9 +4397,13 @@ onUnmounted(() => {
                       }
                     "
                     @structure-editor-saved="
-                      (tabId: string, commentChanged: boolean) => {
+                      (tabId: string, commentChanged: boolean, createdTableName?: string) => {
                         const tab = queryStore.tabs.find((candidate) => candidate.id === tabId);
                         if (!tab) return;
+                        if (createdTableName) {
+                          tab.structureTableName = createdTableName;
+                          tab.title = t('structureEditor.editTabTitle', { tableName: createdTableName });
+                        }
                         onStructureEditorSaved(
                           async () => {
                             await onReloadData(tabId);
@@ -4399,6 +4417,7 @@ onUnmounted(() => {
                             tableName: tab.structureTableName || '',
                           },
                           commentChanged,
+                          !!createdTableName,
                         );
                       }
                     "
@@ -4513,6 +4532,7 @@ onUnmounted(() => {
               <SqlFilePanel @close="closeRightSidebarPanel('sqlFile')" />
             </div>
           </div>
+          <PluginShortcutBar v-if="!isDetachedWindowContext && !isZenMode && settingsStore.editorSettings.pluginShortcuts.enabled && settingsStore.editorSettings.pluginShortcuts.position.startsWith('right-')" :position="settingsStore.editorSettings.pluginShortcuts.position" />
         </div>
 
         <AppDialogs

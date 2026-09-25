@@ -726,6 +726,7 @@ enum LocaleFamily {
     Spanish,
     Italian,
     Portuguese,
+    Russian,
     Turkish,
 }
 
@@ -758,6 +759,8 @@ fn locale_family(locale: &str) -> LocaleFamily {
         LocaleFamily::Italian
     } else if is_language("pt") {
         LocaleFamily::Portuguese
+    } else if is_language("ru") {
+        LocaleFamily::Russian
     } else {
         LocaleFamily::English
     }
@@ -774,6 +777,7 @@ fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
         LocaleFamily::Italian => ("Mostra DBX", "Esci da DBX"),
         LocaleFamily::Turkish => ("DBX'i Göster", "DBX'ten Çık"),
         LocaleFamily::Portuguese => ("Mostrar DBX", "Sair do DBX"),
+        LocaleFamily::Russian => ("Показать DBX", "Выйти из DBX"),
         LocaleFamily::English => ("Show DBX", "Quit DBX"),
     }
 }
@@ -791,6 +795,7 @@ fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
         LocaleFamily::Italian => "Copia informazioni",
         LocaleFamily::Turkish => "Destek bilgilerini kopyala",
         LocaleFamily::Portuguese => "Copiar informações",
+        LocaleFamily::Russian => "Копировать сведения о поддержке",
         LocaleFamily::English => "Copy Support Info",
     }
 }
@@ -807,6 +812,7 @@ fn app_menu_close_tab_label(locale: &str) -> &'static str {
         LocaleFamily::Italian => "Chiudi scheda",
         LocaleFamily::Turkish => "Sekmeyi kapat",
         LocaleFamily::Portuguese => "Fechar aba",
+        LocaleFamily::Russian => "Закрыть вкладку",
         LocaleFamily::English => "Close Tab",
     }
 }
@@ -822,6 +828,7 @@ fn app_menu_quit_label(locale: &str, app_name: &str) -> String {
         LocaleFamily::Italian => format!("Esci da {app_name}"),
         LocaleFamily::Turkish => format!("{app_name} Uygulamasından Çık"),
         LocaleFamily::Portuguese => format!("Sair do {app_name}"),
+        LocaleFamily::Russian => format!("Выйти из {app_name}"),
         LocaleFamily::English => format!("Quit {app_name}"),
     }
 }
@@ -1034,6 +1041,7 @@ mod tests {
         assert_eq!(tray_menu_labels_for_locale("it-IT"), ("Mostra DBX", "Esci da DBX"));
         assert_eq!(tray_menu_labels_for_locale("pt-BR"), ("Mostrar DBX", "Sair do DBX"));
         assert_eq!(tray_menu_labels_for_locale("tr-TR"), ("DBX'i Göster", "DBX'ten Çık"));
+        assert_eq!(tray_menu_labels_for_locale("ru-RU"), ("Показать DBX", "Выйти из DBX"));
         assert_eq!(tray_menu_labels_for_locale("en-US"), ("Show DBX", "Quit DBX"));
         // Unknown and empty locales fall back to English; "ita" must not match "it".
         assert_eq!(tray_menu_labels_for_locale("ita"), ("Show DBX", "Quit DBX"));
@@ -1047,6 +1055,7 @@ mod tests {
         assert_eq!(app_menu_quit_label("ja-JP", "DBX"), "DBXを終了");
         assert_eq!(app_menu_quit_label("ko-KR", "DBX"), "DBX 종료");
         assert_eq!(app_menu_quit_label("tr-TR", "DBX"), "DBX Uygulamasından Çık");
+        assert_eq!(app_menu_quit_label("ru-RU", "DBX"), "Выйти из DBX");
         assert_eq!(app_menu_quit_label("az-AZ", "DBX"), "DBX-dən çıx");
         assert_eq!(app_menu_quit_label("en-US", "DBX"), "Quit DBX");
         assert_eq!(app_menu_quit_label("", "DBX"), "Quit DBX");
@@ -1054,6 +1063,7 @@ mod tests {
         assert_eq!(app_menu_copy_support_info_label("zh-TW"), "複製支援資訊");
         assert_eq!(app_menu_copy_support_info_label("ko-KR"), "지원 정보 복사");
         assert_eq!(app_menu_copy_support_info_label("tr-TR"), "Destek bilgilerini kopyala");
+        assert_eq!(app_menu_copy_support_info_label("ru-RU"), "Копировать сведения о поддержке");
         assert_eq!(app_menu_copy_support_info_label("az-AZ"), "Dəstək məlumatlarını kopyala");
         assert_eq!(app_menu_copy_support_info_label("en-US"), "Copy Support Info");
         assert_eq!(app_menu_close_tab_label("zh-CN"), "关闭标签页");
@@ -1666,6 +1676,13 @@ pub fn run() {
                     .open_url(url, None::<&str>)
                     .map_err(|err| format!("Failed to open the system browser: {err}"))
             }));
+            let sf_app_handle = app.handle().clone();
+            state.set_salesforce_browser_opener(Arc::new(move |url| {
+                sf_app_handle
+                    .opener()
+                    .open_url(url, None::<&str>)
+                    .map_err(|err| format!("Failed to open the system browser: {err}"))
+            }));
             let state = Arc::new(state);
             app.manage(state.clone());
             commands::plugins::install_plugin_event_bridge(app.handle(), state.clone());
@@ -1785,6 +1802,10 @@ pub fn run() {
             commands::ai::ai_stream,
             commands::ai::ai_agent_stream,
             commands::ai::ai_cancel_stream,
+            commands::ai::ai_resolve_tool_approval,
+            commands::ai::get_ai_plugin_tool_plugins,
+            commands::ai::set_ai_plugin_tool_plugin_enabled,
+            commands::ai::preview_plugin_ai_tools,
             commands::ai::ai_test_connection,
             commands::ai::ai_list_models,
             commands::ai::ai_resolve_model_effort,
@@ -1884,6 +1905,12 @@ pub fn run() {
             commands::connection::test_connection,
             commands::connection::test_connection_with_info,
             commands::connection::test_ssh_tunnel,
+            commands::salesforce_oauth::salesforce_oauth_browser_authorize,
+            commands::salesforce_oauth::salesforce_oauth_device_start,
+            commands::salesforce_oauth::salesforce_oauth_device_poll,
+            commands::salesforce_oauth::salesforce_oauth_refresh,
+            commands::salesforce_oauth::salesforce_oauth_password_login,
+            commands::salesforce_oauth::salesforce_current_user,
             commands::connection::connect_db,
             commands::connection::connection_final_proxy_port,
             commands::connection::disconnect_db,
@@ -2007,6 +2034,7 @@ pub fn run() {
             commands::schema::get_table_owner,
             commands::schema::list_extensions,
             commands::schema::list_available_extensions,
+            commands::schema::list_event_triggers,
             commands::schema_diff::prepare_schema_diff,
             commands::schema_diff::generate_schema_sync_sql,
             commands::schema_diff::generate_schema_sync_plan,
@@ -2043,6 +2071,9 @@ pub fn run() {
             commands::query::get_explain_info,
             commands::query::get_plugin_plan_capabilities,
             commands::query::get_plugin_estimated_plan,
+            commands::query::query_plugin_data,
+            commands::query::get_plugin_data_grants,
+            commands::query::set_plugin_data_grant,
             commands::query::build_create_user_sql,
             commands::query::build_dropped_file_preview_sql,
             commands::query::build_table_select_sql,
@@ -2170,6 +2201,7 @@ pub fn run() {
             commands::redis_cmd::redis_set_keys_ttl,
             commands::redis_cmd::redis_set_keys_expire_at,
             commands::redis_cmd::redis_delete_keys,
+            commands::redis_cmd::redis_delete_keys_by_pattern,
             commands::redis_cmd::redis_flush_db,
             commands::redis_cmd::redis_execute_command,
             commands::redis_cmd::redis_load_more,

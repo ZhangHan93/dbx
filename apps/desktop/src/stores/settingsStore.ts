@@ -1,3 +1,4 @@
+import { normalizePluginShortcutSettings, type PluginShortcutSettings } from "@/lib/plugins/pluginShortcuts";
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 import { aiConfigToItem, generateId, getConfigKey } from "@/lib/ai/aiConfigList";
@@ -24,7 +25,7 @@ import { REDIS_DATABASE_DISPLAY_LIMIT_DEFAULT, REDIS_DATABASE_DISPLAY_LIMIT_MIN,
 import { normalizeSidebarHiddenTablePrefixes } from "@/lib/sidebar/sidebarTableNameDisplay";
 import { normalizeSidebarCopyTableNameSeparator } from "@/lib/sidebar/sidebarTableNameCopy";
 import type { SidebarActivation } from "@/lib/sidebar/treeNodeClick";
-import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlCompletion";
+import { DEFAULT_SQL_SNIPPETS } from "@/lib/sql/sqlSnippetTemplates";
 import { DEFAULT_SQL_FORMATTER_SETTINGS, normalizeSqlFormatterSettings, type SqlFormatterSettings } from "@/lib/sql/sqlFormatterConfig";
 import { canonicalSqlShortcutSql, DEFAULT_SQL_SHORTCUTS, deriveSqlShortcutDatabaseTypes, mergeDefaultSqlShortcuts, normalizeSqlShortcutDatabaseTypes, normalizeSqlShortcutKind, normalizeSqlShortcutLimit, normalizeSqlShortcutSqlByDatabaseType } from "@/lib/sql/sqlShortcutActions";
 import { normalizeSqlVariableSyntaxOverrides, type SqlVariableSyntaxOverrides } from "@/lib/sql/sqlVariableSyntax";
@@ -85,6 +86,13 @@ export interface McpConnectionPolicy {
   databaseScope: "all" | "selected" | "none";
   allowedDatabases: string[];
   databasePolicies: McpDatabasePolicy[];
+  /**
+   * Per-connection opt-in for AI-agent writes to a Salesforce org. Off by default and
+   * forced off by `readOnly`: SOQL reads need nothing beyond the execution mode, but
+   * Salesforce DML has no transaction and no rollback, so it also requires the
+   * two-step prepare/apply confirmation on every single write.
+   */
+  allowSalesforceDml: boolean;
 }
 
 export interface McpDatabasePolicy {
@@ -173,6 +181,9 @@ export function normalizeMcpGlobalPolicy(policy: Partial<McpGlobalPolicy> | null
         databaseScope,
         allowedDatabases,
         databasePolicies,
+        // Same fail-closed shape as allowDangerousSql: read-only wins, and a policy
+        // saved before the switch existed (field absent) normalizes to off.
+        allowSalesforceDml: rule.readOnly !== true && rule.allowSalesforceDml === true,
       };
       return rules;
     }, {}),
@@ -249,6 +260,8 @@ export interface AiPartnerProviderPreset extends AiProviderPreset {
   websiteUrl: string;
   apiKeyUrl: string;
   descriptionKey: string;
+  /** Locale key of the promo badge shown next to this preset; omit for no badge. */
+  badgeKey?: string;
 }
 
 export const AI_PROVIDER_PRESETS: Record<AiProvider, AiProviderPreset> = {
@@ -459,6 +472,22 @@ export function aiProviderLabel(provider: AiProvider, t: (key: string) => string
 
 export const AI_PROVIDER_PARTNER_PRESETS: readonly AiPartnerProviderPreset[] = [
   {
+    id: "aicodemirror",
+    label: "AICodeMirror",
+    iconPath: "/icons/ai/aicodemirror.png",
+    group: "partner",
+    provider: "openai-compatible",
+    endpoint: "https://api.aicodemirror.ai/v1",
+    model: "",
+    apiStyle: "completions",
+    authMethod: "bearer",
+    requiresApiKey: true,
+    websiteUrl: "https://www.aicodemirror.ai/register?invitecode=DK44NH",
+    apiKeyUrl: "https://www.aicodemirror.ai/register?invitecode=DK44NH",
+    descriptionKey: "ai.aicodemirrorDescription",
+    badgeKey: "ai.aicodemirrorSponsored",
+  },
+  {
     id: "jalapeno-cloud",
     label: "Jalapeno Cloud",
     iconPath: "/icons/ai/jalapeno-cloud.png",
@@ -473,6 +502,7 @@ export const AI_PROVIDER_PARTNER_PRESETS: readonly AiPartnerProviderPreset[] = [
     websiteUrl: "https://www.jalapeno-cloud.ai/dbx",
     apiKeyUrl: "https://www.jalapeno-cloud.ai/dbx",
     descriptionKey: "ai.jalapenoDescription",
+    badgeKey: "ai.jalapenoSponsored",
   },
   {
     id: "hualong-ai",
@@ -489,6 +519,7 @@ export const AI_PROVIDER_PARTNER_PRESETS: readonly AiPartnerProviderPreset[] = [
     websiteUrl: "https://api.hualong.online/register?promo=DBX%26HUALONG",
     apiKeyUrl: "https://api.hualong.online/register?promo=DBX%26HUALONG",
     descriptionKey: "ai.hualongDescription",
+    badgeKey: "ai.hualongSponsored",
   },
 ];
 
@@ -663,6 +694,8 @@ const DATA_GRID_RENDER_MODES = ["dom", "canvas"] as const;
 export type DataGridRenderMode = (typeof DATA_GRID_RENDER_MODES)[number];
 const DATA_GRID_SEARCH_MODES = ["filter", "highlight"] as const;
 export type DataGridSearchMode = (typeof DATA_GRID_SEARCH_MODES)[number];
+const DATA_GRID_ROW_NUMBER_MODES = ["view", "source"] as const;
+export type DataGridRowNumberMode = (typeof DATA_GRID_ROW_NUMBER_MODES)[number];
 export type DataGridFilterEditorView = "quick" | "conditions" | "text";
 export type DataGridToolbarLayout = "single" | "split";
 const RESULT_RUN_DISPLAY_MODES = ["tabs", "list"] as const;
@@ -802,6 +835,7 @@ export interface EditorSettings {
   wordWrap: boolean;
   showWhitespace: boolean;
   tableDdlWordWrap: boolean;
+  ddlOpenMode: "dialog" | "tab";
   refreshDdlOnOpen: boolean;
   excludeDdlStorage: boolean;
   vimModeEnabled: boolean;
@@ -837,6 +871,9 @@ export interface EditorSettings {
   mongoViewMode: "document" | "table";
   showColumnCommentsInHeader: boolean;
   showColumnTypesInHeader: boolean;
+  showColumnHeaderTooltips: boolean;
+  /** 结果集页签/结果列表的名称是否带上库名（关闭后只显示表名，完整名称仍在悬浮提示中）。 */
+  showResultSourceDatabase: boolean;
   dataGridShowTransposeFieldMetadata: boolean;
   colorizeDataGridCellTypes: boolean;
   dataGridTypeColorSchemes: DataGridTypeColorScheme[];
@@ -852,6 +889,7 @@ export interface EditorSettings {
   localFilterPopoverWidth: number;
   dataGridRenderMode: DataGridRenderMode;
   dataGridSearchMode: DataGridSearchMode;
+  dataGridRowNumberMode: DataGridRowNumberMode;
   dataGridCopyExtractor: DataGridCopyPreference;
   dataGridExtractorOptions: DataGridExtractorOptions;
   dataGridExtractorOptionsMigrationVersion: number;
@@ -937,6 +975,7 @@ export interface EditorSettings {
   queryExportKeysetOptimizationEnabled: boolean;
   updateDownloadSource: UpdateDownloadSource;
   ignoredUpdateVersion: string;
+  pluginShortcuts: PluginShortcutSettings;
   toolbarItems: ToolbarItems;
   objectBrowserShowCheckbox: boolean;
   objectBrowserViewMode: "list" | "grid";
@@ -1078,6 +1117,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   wordWrap: false,
   showWhitespace: false,
   tableDdlWordWrap: true,
+  ddlOpenMode: "dialog",
   refreshDdlOnOpen: false,
   excludeDdlStorage: true,
   vimModeEnabled: false,
@@ -1112,6 +1152,8 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   mongoViewMode: "document",
   showColumnCommentsInHeader: true,
   showColumnTypesInHeader: true,
+  showColumnHeaderTooltips: true,
+  showResultSourceDatabase: true,
   dataGridShowTransposeFieldMetadata: false,
   colorizeDataGridCellTypes: false,
   dataGridTypeColorSchemes: [],
@@ -1127,6 +1169,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   localFilterPopoverWidth: 360,
   dataGridRenderMode: "canvas",
   dataGridSearchMode: "filter",
+  dataGridRowNumberMode: "view",
   dataGridCopyExtractor: "smart",
   dataGridExtractorOptions: normalizeDataGridExtractorOptions(DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS),
   dataGridExtractorOptionsMigrationVersion: DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION,
@@ -1206,6 +1249,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   queryExportKeysetOptimizationEnabled: true,
   updateDownloadSource: "official",
   ignoredUpdateVersion: "",
+  pluginShortcuts: normalizePluginShortcutSettings(undefined),
   toolbarItems: { ...DEFAULT_TOOLBAR_ITEMS },
   objectBrowserShowCheckbox: false,
   objectBrowserViewMode: "list",
@@ -1298,6 +1342,10 @@ function normalizeDataGridRenderMode(value: unknown): DataGridRenderMode {
 
 function normalizeDataGridSearchMode(value: unknown): DataGridSearchMode {
   return DATA_GRID_SEARCH_MODES.includes(value as DataGridSearchMode) ? (value as DataGridSearchMode) : DEFAULT_EDITOR_SETTINGS.dataGridSearchMode;
+}
+
+function normalizeDataGridRowNumberMode(value: unknown): DataGridRowNumberMode {
+  return DATA_GRID_ROW_NUMBER_MODES.includes(value as DataGridRowNumberMode) ? (value as DataGridRowNumberMode) : DEFAULT_EDITOR_SETTINGS.dataGridRowNumberMode;
 }
 
 function normalizeDataGridFilterEditorView(value: unknown): DataGridFilterEditorView {
@@ -1627,6 +1675,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     showWhitespace: typeof settings.showWhitespace === "boolean" ? settings.showWhitespace : DEFAULT_EDITOR_SETTINGS.showWhitespace,
     tableDdlWordWrap: typeof settings.tableDdlWordWrap === "boolean" ? settings.tableDdlWordWrap : DEFAULT_EDITOR_SETTINGS.tableDdlWordWrap,
     excludeDdlStorage: typeof settings.excludeDdlStorage === "boolean" ? settings.excludeDdlStorage : DEFAULT_EDITOR_SETTINGS.excludeDdlStorage,
+    ddlOpenMode: settings.ddlOpenMode === "tab" ? "tab" : DEFAULT_EDITOR_SETTINGS.ddlOpenMode,
     refreshDdlOnOpen: typeof settings.refreshDdlOnOpen === "boolean" ? settings.refreshDdlOnOpen : DEFAULT_EDITOR_SETTINGS.refreshDdlOnOpen,
     vimModeEnabled: typeof settings.vimModeEnabled === "boolean" ? settings.vimModeEnabled : DEFAULT_EDITOR_SETTINGS.vimModeEnabled,
     autoCloseBrackets: typeof settings.autoCloseBrackets === "boolean" ? settings.autoCloseBrackets : DEFAULT_EDITOR_SETTINGS.autoCloseBrackets,
@@ -1660,6 +1709,8 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     mongoViewMode: settings.mongoViewMode === "table" ? "table" : DEFAULT_EDITOR_SETTINGS.mongoViewMode,
     showColumnCommentsInHeader: settings.showColumnCommentsInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader,
     showColumnTypesInHeader: settings.showColumnTypesInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader,
+    showColumnHeaderTooltips: settings.showColumnHeaderTooltips ?? DEFAULT_EDITOR_SETTINGS.showColumnHeaderTooltips,
+    showResultSourceDatabase: settings.showResultSourceDatabase ?? DEFAULT_EDITOR_SETTINGS.showResultSourceDatabase,
     dataGridShowTransposeFieldMetadata: settings.dataGridShowTransposeFieldMetadata === true,
     colorizeDataGridCellTypes: settings.colorizeDataGridCellTypes ?? DEFAULT_EDITOR_SETTINGS.colorizeDataGridCellTypes,
     dataGridTypeColorSchemes,
@@ -1675,6 +1726,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     localFilterPopoverWidth: normalizeDrawerWidth(settings.localFilterPopoverWidth, 240, DEFAULT_EDITOR_SETTINGS.localFilterPopoverWidth),
     dataGridRenderMode: normalizeDataGridRenderMode(settings.dataGridRenderMode),
     dataGridSearchMode: normalizeDataGridSearchMode(settings.dataGridSearchMode),
+    dataGridRowNumberMode: normalizeDataGridRowNumberMode(settings.dataGridRowNumberMode),
     dataGridCopyExtractor: normalizeDataGridCopyPreference(settings.dataGridCopyExtractor),
     dataGridExtractorOptions,
     dataGridExtractorOptionsMigrationVersion: DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION,
@@ -1804,6 +1856,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     queryExportKeysetOptimizationEnabled: typeof settings.queryExportKeysetOptimizationEnabled === "boolean" ? settings.queryExportKeysetOptimizationEnabled : DEFAULT_EDITOR_SETTINGS.queryExportKeysetOptimizationEnabled,
     updateDownloadSource: normalizeUpdateDownloadSource(settings.updateDownloadSource),
     ignoredUpdateVersion: typeof settings.ignoredUpdateVersion === "string" ? settings.ignoredUpdateVersion : DEFAULT_EDITOR_SETTINGS.ignoredUpdateVersion,
+    pluginShortcuts: normalizePluginShortcutSettings(settings.pluginShortcuts),
     toolbarItems: normalizeToolbarItems(settings.toolbarItems),
     objectBrowserShowCheckbox: typeof settings.objectBrowserShowCheckbox === "boolean" ? settings.objectBrowserShowCheckbox : DEFAULT_EDITOR_SETTINGS.objectBrowserShowCheckbox,
     objectBrowserViewMode: settings.objectBrowserViewMode === "grid" ? "grid" : DEFAULT_EDITOR_SETTINGS.objectBrowserViewMode,
@@ -1910,6 +1963,7 @@ export const useSettingsStore = defineStore("settings", () => {
   const isMcpGlobalPolicyLoaded = ref(false);
   const isEditorSettingsLoaded = ref(false);
   let initEditorSettingsPromise: Promise<void> | null = null;
+  let initAiConfigsPromise: Promise<void> | null = null;
   let pendingEditorSettingsPatches: Partial<EditorSettings>[] = [];
   let editorSettingsOperationQueue: Promise<void> | null = null;
   let editorSettingsPatchRevision = 0;
@@ -2115,7 +2169,15 @@ export const useSettingsStore = defineStore("settings", () => {
 
   async function initAiConfigs(): Promise<void> {
     if (isAiConfigLoaded.value) return;
+    if (!initAiConfigsPromise) {
+      initAiConfigsPromise = loadAiConfigurationState().finally(() => {
+        initAiConfigsPromise = null;
+      });
+    }
+    await initAiConfigsPromise;
+  }
 
+  async function loadAiConfigurationState(): Promise<void> {
     // 尝试加载新格式
     const newConfigs = await api.loadAiConfigs();
 
@@ -2441,6 +2503,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.showWhitespace !== undefined) editorSettings.value.showWhitespace = partial.showWhitespace === true;
     if (partial.tableDdlWordWrap !== undefined) editorSettings.value.tableDdlWordWrap = partial.tableDdlWordWrap === true;
     if (partial.excludeDdlStorage !== undefined) editorSettings.value.excludeDdlStorage = partial.excludeDdlStorage === true;
+    if (partial.ddlOpenMode !== undefined) editorSettings.value.ddlOpenMode = partial.ddlOpenMode === "tab" ? "tab" : "dialog";
     if (partial.refreshDdlOnOpen !== undefined) editorSettings.value.refreshDdlOnOpen = partial.refreshDdlOnOpen === true;
     if (partial.vimModeEnabled !== undefined) editorSettings.value.vimModeEnabled = partial.vimModeEnabled === true;
     if (partial.autoCloseBrackets !== undefined) editorSettings.value.autoCloseBrackets = partial.autoCloseBrackets === true;
@@ -2478,6 +2541,8 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.mongoViewMode !== undefined) editorSettings.value.mongoViewMode = partial.mongoViewMode;
     if (partial.showColumnCommentsInHeader !== undefined) editorSettings.value.showColumnCommentsInHeader = partial.showColumnCommentsInHeader;
     if (partial.showColumnTypesInHeader !== undefined) editorSettings.value.showColumnTypesInHeader = partial.showColumnTypesInHeader;
+    if (partial.showColumnHeaderTooltips !== undefined) editorSettings.value.showColumnHeaderTooltips = partial.showColumnHeaderTooltips;
+    if (partial.showResultSourceDatabase !== undefined) editorSettings.value.showResultSourceDatabase = partial.showResultSourceDatabase;
     if (partial.dataGridShowTransposeFieldMetadata !== undefined) editorSettings.value.dataGridShowTransposeFieldMetadata = partial.dataGridShowTransposeFieldMetadata === true;
     if (partial.colorizeDataGridCellTypes !== undefined) editorSettings.value.colorizeDataGridCellTypes = partial.colorizeDataGridCellTypes === true;
     if (partial.dataGridTypeColorSchemes !== undefined) {
@@ -2499,6 +2564,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.localFilterPopoverWidth !== undefined) editorSettings.value.localFilterPopoverWidth = normalizeDrawerWidth(partial.localFilterPopoverWidth, 240, DEFAULT_EDITOR_SETTINGS.localFilterPopoverWidth);
     if (partial.dataGridRenderMode !== undefined) editorSettings.value.dataGridRenderMode = normalizeDataGridRenderMode(partial.dataGridRenderMode);
     if (partial.dataGridSearchMode !== undefined) editorSettings.value.dataGridSearchMode = normalizeDataGridSearchMode(partial.dataGridSearchMode);
+    if (partial.dataGridRowNumberMode !== undefined) editorSettings.value.dataGridRowNumberMode = normalizeDataGridRowNumberMode(partial.dataGridRowNumberMode);
     if (partial.dataGridCopyExtractor !== undefined) editorSettings.value.dataGridCopyExtractor = normalizeDataGridCopyPreference(partial.dataGridCopyExtractor);
     if (partial.dataGridExtractorOptions !== undefined) editorSettings.value.dataGridExtractorOptions = normalizeDataGridExtractorOptions(partial.dataGridExtractorOptions);
     if (partial.dataGridExtractorOptionsMigrationVersion !== undefined) editorSettings.value.dataGridExtractorOptionsMigrationVersion = DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION;
@@ -2589,6 +2655,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.queryExportKeysetOptimizationEnabled !== undefined) editorSettings.value.queryExportKeysetOptimizationEnabled = partial.queryExportKeysetOptimizationEnabled;
     if (partial.updateDownloadSource !== undefined) editorSettings.value.updateDownloadSource = normalizeUpdateDownloadSource(partial.updateDownloadSource);
     if (partial.ignoredUpdateVersion !== undefined) editorSettings.value.ignoredUpdateVersion = typeof partial.ignoredUpdateVersion === "string" ? partial.ignoredUpdateVersion : "";
+    if (partial.pluginShortcuts !== undefined) editorSettings.value.pluginShortcuts = normalizePluginShortcutSettings(partial.pluginShortcuts);
     if (partial.toolbarItems !== undefined) editorSettings.value.toolbarItems = normalizeToolbarItems(partial.toolbarItems);
     if (partial.objectBrowserShowCheckbox !== undefined) editorSettings.value.objectBrowserShowCheckbox = partial.objectBrowserShowCheckbox === true;
     if (partial.objectBrowserViewMode !== undefined) editorSettings.value.objectBrowserViewMode = partial.objectBrowserViewMode === "grid" ? "grid" : "list";

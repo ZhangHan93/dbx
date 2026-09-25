@@ -159,6 +159,7 @@ export function connectionDisplayUrlScheme(connection: Pick<ConnectionConfig, "d
     case "dynamodb":
     case "mq":
     case "consul":
+    case "salesforce":
       return connection.ssl ? "https" : "http";
     case "cloudflare-d1":
       return "https";
@@ -284,6 +285,9 @@ export function connectionUrlPlaceholder(dbType: DatabaseType, driverProfile?: s
 
     case "victoriametrics":
       return "http://user:password@host:port/prometheus";
+
+    case "salesforce":
+      return "https://acme.my.salesforce.com";
 
     case "jdbc":
       return "jdbc:mysql://host:3306/database";
