@@ -2249,7 +2249,7 @@ fn postgres_index_column_sql(
 ) -> String {
     // The base key text: a real column is quoted as an identifier; an expression/functional
     // key part arrives as raw expression text (the per-column `pg_get_indexdef` omits the
-    // opclass — see `crates/dbx-drivers/src/db/postgres.rs`), so quoting the whole thing as
+    // opclass — see `crates/dbx-driver-postgres/src/postgres.rs`), so quoting the whole thing as
     // an identifier would turn it into a nonexistent column reference (#6295).
     let base = if is_expression { column.to_string() } else { quote_identifier(column, &DatabaseType::Postgres) };
     // The opclass is read separately from `pg_index.indclass` for every key position
@@ -2269,9 +2269,45 @@ fn postgres_index_column_sql(
     }
 }
 
-fn generate_postgres_index_ddl(indexes: &[db::IndexInfo], table: &str, schema: &str) -> Vec<String> {
+/// `CREATE INDEX/SEQUENCE IF NOT EXISTS` was added in PostgreSQL 9.5: 9.2/9.3/9.4
+/// reject both with `syntax error at or near "NOT"` (issue #8853). A server that does
+/// not report its version keeps the idempotent form, matching the long-standing behavior.
+fn postgres_if_not_exists_supported(server_version_num: Option<i32>) -> bool {
+    server_version_num.is_none_or(|version| version >= 90_500)
+}
+
+/// Decides whether the target index/sequence DDL may use `IF NOT EXISTS`. openGauss/GaussDB
+/// report a 9.x `server_version_num` but do implement the syntax, so only a plain
+/// PostgreSQL target is version-gated.
+async fn target_supports_if_not_exists_ddl(state: &AppState, pool_key: &str) -> bool {
+    let (_, _, db_type, _) = transfer_pool_context(state, pool_key).await;
+    if db_type != Some(DatabaseType::Postgres) {
+        return true;
+    }
+    let version = execute_read_on_pool(state, pool_key, "SHOW server_version_num")
+        .await
+        .ok()
+        .and_then(|result| result.rows.first().and_then(|row| row.first()).and_then(server_version_num_of));
+    postgres_if_not_exists_supported(version)
+}
+
+fn server_version_num_of(value: &serde_json::Value) -> Option<i32> {
+    match value {
+        serde_json::Value::Number(number) => number.as_i64().and_then(|version| i32::try_from(version).ok()),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn generate_postgres_index_ddl(
+    indexes: &[db::IndexInfo],
+    table: &str,
+    schema: &str,
+    if_not_exists: bool,
+) -> Vec<String> {
     let full_table = qualified_table(table, schema, &DatabaseType::Postgres, None);
     let mut statements = Vec::new();
+    let idempotent = if if_not_exists { "IF NOT EXISTS " } else { "" };
     for index in indexes.iter().filter(|index| !index.is_primary) {
         if index.name.trim().is_empty() || index.columns.is_empty() {
             continue;
@@ -2323,7 +2359,7 @@ fn generate_postgres_index_ddl(indexes: &[db::IndexInfo], table: &str, schema: &
             .map(|value| format!(" WHERE {value}"))
             .unwrap_or_default();
         statements.push(format!(
-            "CREATE {unique}INDEX IF NOT EXISTS {} ON {full_table}{using_clause} ({columns}){include_clause}{filter_clause}",
+            "CREATE {unique}INDEX {idempotent}{} ON {full_table}{using_clause} ({columns}){include_clause}{filter_clause}",
             quote_identifier(&index.name, &DatabaseType::Postgres)
         ));
         if let Some(comment) = index.comment.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
@@ -2404,7 +2440,8 @@ async fn restore_postgres_table_schema_objects(
     source_indexes: &[db::IndexInfo],
     source_foreign_keys: &[db::ForeignKeyInfo],
 ) -> Result<(), String> {
-    for statement in generate_postgres_index_ddl(source_indexes, target_table, target_schema) {
+    let index_if_not_exists = target_supports_if_not_exists_ddl(state, target_pool_key).await;
+    for statement in generate_postgres_index_ddl(source_indexes, target_table, target_schema, index_if_not_exists) {
         execute_on_pool(state, target_pool_key, &statement)
             .await
             .map_err(|e| format!("Failed to create PostgreSQL index for {target_table}: {e}"))?;
@@ -2551,11 +2588,16 @@ fn postgres_sequence_qualified_name(schema: &str, sequence_name: &str) -> String
     }
 }
 
-fn generate_postgres_transfer_sequence_create_ddl(sequence: &PostgresTransferSequence, schema: &str) -> String {
+fn generate_postgres_transfer_sequence_create_ddl(
+    sequence: &PostgresTransferSequence,
+    schema: &str,
+    if_not_exists: bool,
+) -> String {
     let qualified_name = postgres_sequence_qualified_name(schema, &sequence.name);
     let cycle = if sequence.cycle { "CYCLE" } else { "NO CYCLE" };
+    let idempotent = if if_not_exists { "IF NOT EXISTS " } else { "" };
     format!(
-        "CREATE SEQUENCE IF NOT EXISTS {qualified_name}\n  AS {data_type}\n  START WITH {start_value}\n  INCREMENT BY {increment}\n  MINVALUE {min_value}\n  MAXVALUE {max_value}\n  CACHE {cache_value}\n  {cycle}",
+        "CREATE SEQUENCE {idempotent}{qualified_name}\n  AS {data_type}\n  START WITH {start_value}\n  INCREMENT BY {increment}\n  MINVALUE {min_value}\n  MAXVALUE {max_value}\n  CACHE {cache_value}\n  {cycle}",
         data_type = sequence.data_type,
         start_value = sequence.start_value,
         increment = sequence.increment,
@@ -6590,6 +6632,7 @@ async fn prepare_postgres_owned_sequences_for_transfer(
             .map(|sequence| (sequence.name.clone(), sequence))
             .collect::<HashMap<_, _>>();
 
+    let sequence_if_not_exists = target_supports_if_not_exists_ddl(state, target_pool_key).await;
     for sequence in &owned_sequences {
         let should_create = validate_existing_postgres_sequence(
             sequence,
@@ -6600,7 +6643,11 @@ async fn prepare_postgres_owned_sequences_for_transfer(
             let definition = definitions
                 .get(&sequence.name)
                 .ok_or_else(|| format!("PostgreSQL sequence definition not found: {}", sequence.name))?;
-            let create_sql = generate_postgres_transfer_sequence_create_ddl(definition, &request.target_schema);
+            let create_sql = generate_postgres_transfer_sequence_create_ddl(
+                definition,
+                &request.target_schema,
+                sequence_if_not_exists,
+            );
             execute_on_pool(state, target_pool_key, &create_sql)
                 .await
                 .map_err(|e| format!("Failed to create PostgreSQL sequence for {target_table}: {e}"))?;
@@ -10130,6 +10177,11 @@ where
             .map_err(|e| format!("Failed to create PostgreSQL domain {}: {e}", domain.domain_name))?;
     }
 
+    let sequence_if_not_exists = if selected_sequences.is_empty() {
+        true
+    } else {
+        target_supports_if_not_exists_ddl(state, target_pool_key).await
+    };
     for sequence in selected_sequences {
         if is_cancelled(&request.transfer_id).await {
             return Err("Cancelled".to_string());
@@ -10149,7 +10201,7 @@ where
         execute_on_pool(
             state,
             target_pool_key,
-            &generate_postgres_transfer_sequence_create_ddl(&sequence, &request.target_schema),
+            &generate_postgres_transfer_sequence_create_ddl(&sequence, &request.target_schema, sequence_if_not_exists),
         )
         .await
         .map_err(|e| format!("Failed to create PostgreSQL sequence {}: {e}", sequence.name))?;
@@ -12233,8 +12285,14 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             };
 
             assert_eq!(
-                generate_postgres_transfer_sequence_create_ddl(&sequence, "archive"),
+                generate_postgres_transfer_sequence_create_ddl(&sequence, "archive", true),
                 "CREATE SEQUENCE IF NOT EXISTS \"archive\".\"biz_banner_id_seq\"\n  AS bigint\n  START WITH 5\n  INCREMENT BY 2\n  MINVALUE -10\n  MAXVALUE 999\n  CACHE 7\n  CYCLE"
+            );
+            // PostgreSQL 9.2-9.4 reject `CREATE SEQUENCE IF NOT EXISTS` just like the
+            // index form, so legacy targets get the plain statement.
+            assert_eq!(
+                generate_postgres_transfer_sequence_create_ddl(&sequence, "archive", false),
+                "CREATE SEQUENCE \"archive\".\"biz_banner_id_seq\"\n  AS bigint\n  START WITH 5\n  INCREMENT BY 2\n  MINVALUE -10\n  MAXVALUE 999\n  CACHE 7\n  CYCLE"
             );
             assert_eq!(
                 generate_postgres_transfer_sequence_setval_sql(&sequence, "archive"),
@@ -14760,7 +14818,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             },
         ];
 
-        let index_sql = generate_postgres_index_ddl(&indexes, "users", "public");
+        let index_sql = generate_postgres_index_ddl(&indexes, "users", "public", true);
         let foreign_key_sql = generate_postgres_foreign_key_ddl(&foreign_keys, "orders", "public", "archive");
 
         assert_eq!(
@@ -14795,12 +14853,50 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             constraint_backed: false,
         }];
 
-        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public", true);
 
         assert_eq!(
             sql,
             vec!["CREATE INDEX IF NOT EXISTS \"users_name_trgm_idx\" ON \"public\".\"users\" USING gin (\"name\" gin_trgm_ops)".to_string()]
         );
+    }
+
+    #[test]
+    fn postgres_index_ddl_drops_if_not_exists_for_legacy_servers() {
+        // PostgreSQL 9.2/9.3/9.4 reject `CREATE INDEX IF NOT EXISTS` outright
+        // (`syntax error at or near "NOT"`), so the transfer must fall back to the
+        // plain form there (issue #8853).
+        let indexes = vec![db::IndexInfo {
+            name: "users_name_idx".to_string(),
+            columns: vec!["name".to_string(), "status".to_string()],
+            is_unique: false,
+            is_primary: false,
+            filter: None,
+            index_type: None,
+            included_columns: None,
+            comment: None,
+            key_is_expression: vec![false, false],
+            column_opclasses: vec![None, None],
+            key_options: Vec::new(),
+            constraint_backed: false,
+        }];
+
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public", false);
+
+        assert_eq!(
+            sql,
+            vec!["CREATE INDEX \"users_name_idx\" ON \"public\".\"users\" (\"name\", \"status\")".to_string()]
+        );
+    }
+
+    #[test]
+    fn postgres_if_not_exists_is_version_gated() {
+        assert!(postgres_if_not_exists_supported(Some(150_001)));
+        assert!(postgres_if_not_exists_supported(Some(90_500)));
+        assert!(!postgres_if_not_exists_supported(Some(90_499)));
+        assert!(!postgres_if_not_exists_supported(Some(90_223)));
+        // Unknown version keeps the idempotent form used by every modern target.
+        assert!(postgres_if_not_exists_supported(None));
     }
 
     #[test]
@@ -14820,7 +14916,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             constraint_backed: false,
         }];
 
-        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public", true);
 
         assert_eq!(
             sql,
@@ -14851,7 +14947,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             constraint_backed: false,
         }];
 
-        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public", true);
 
         assert_eq!(
             sql,
@@ -14877,7 +14973,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             constraint_backed: false,
         }];
 
-        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public", true);
 
         assert_eq!(
             sql,
@@ -14907,7 +15003,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             constraint_backed: false,
         }];
 
-        let sql = generate_postgres_index_ddl(&indexes, "event_log", "public");
+        let sql = generate_postgres_index_ddl(&indexes, "event_log", "public", true);
 
         assert_eq!(
             sql,
@@ -14932,7 +15028,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             constraint_backed: false,
         }];
 
-        let sql = generate_postgres_index_ddl(&indexes, "events", "public");
+        let sql = generate_postgres_index_ddl(&indexes, "events", "public", true);
 
         assert_eq!(
             sql,
@@ -14958,7 +15054,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             constraint_backed: false,
         }];
 
-        let sql = generate_postgres_index_ddl(&indexes, "users", "public");
+        let sql = generate_postgres_index_ddl(&indexes, "users", "public", true);
 
         assert_eq!(
             sql,
