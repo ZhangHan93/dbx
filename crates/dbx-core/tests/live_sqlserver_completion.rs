@@ -80,6 +80,7 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         is_production: false,
         production_databases: vec![],
         show_system_schemas: false,
+        sidebar_auto_load_all_tables: false,
         database_info: None,
     }
 }
@@ -134,6 +135,8 @@ fn live_sqlserver_import_request(
         date_time_format: None,
         prepared_source: None,
         retain_source: false,
+        conflict_policy: None,
+        skip_duplicate_rows: false,
     }
 }
 
