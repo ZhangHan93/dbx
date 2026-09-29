@@ -20,6 +20,25 @@ import type { AiConfigItem } from "@/types/ai";
 import { DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION } from "@/lib/dataGrid/dataGridCopyExtractor";
 
 describe("normalizeEditorSettings", () => {
+  it("defaults and sanitizes AI conversation typography independently", () => {
+    expect(normalizeEditorSettings({})).toMatchObject({ aiFontFamily: "", aiFontSize: 12 });
+    expect(
+      normalizeEditorSettings({
+        fontFamily: "SQL editor font",
+        uiFontFamily: "Interface font",
+        aiFontFamily: "  'Atkinson Hyperlegible', sans-serif\n",
+        aiFontSize: 17.6,
+      }),
+    ).toMatchObject({
+      fontFamily: "SQL editor font",
+      uiFontFamily: "Interface font",
+      aiFontFamily: "'Atkinson Hyperlegible', sans-serif",
+      aiFontSize: 18,
+    });
+    expect(normalizeEditorSettings({ aiFontFamily: null, aiFontSize: 999 } as any)).toMatchObject({ aiFontFamily: "", aiFontSize: 24 });
+    expect(normalizeEditorSettings({ aiFontSize: "18" } as any).aiFontSize).toBe(12);
+  });
+
   it("defaults DDL viewing to a dialog and preserves the selected open mode", () => {
     expect(DEFAULT_EDITOR_SETTINGS.ddlOpenMode).toBe("dialog");
     expect(normalizeEditorSettings({}).ddlOpenMode).toBe("dialog");
@@ -390,6 +409,12 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({}).dataGridSearchMode).toBe("filter");
     expect(normalizeEditorSettings({ dataGridSearchMode: "highlight" }).dataGridSearchMode).toBe("highlight");
     expect(normalizeEditorSettings({ dataGridSearchMode: "invalid" as any }).dataGridSearchMode).toBe("filter");
+  });
+
+  it("defaults double-click inside a string to selecting the whole value and preserves word mode", () => {
+    expect(normalizeEditorSettings({}).doubleClickStringSelectionMode).toBe("content");
+    expect(normalizeEditorSettings({ doubleClickStringSelectionMode: "word" }).doubleClickStringSelectionMode).toBe("word");
+    expect(normalizeEditorSettings({ doubleClickStringSelectionMode: "invalid" as any }).doubleClickStringSelectionMode).toBe("content");
   });
 
   it("defaults the data grid row number column to the view position and preserves original row numbers", () => {
@@ -1157,6 +1182,49 @@ describe("settingsStore persisted settings initialization", () => {
     expect(saveEditorSettings).toHaveBeenLastCalledWith(expect.objectContaining({ tableCompletionSchemaQualification: "always" }));
   });
 
+  it("persists and resets AI typography without changing editor or interface fonts", async () => {
+    const loadEditorSettings = vi.fn().mockResolvedValue({
+      fontFamily: "SQL editor font",
+      uiFontFamily: "Interface font",
+    });
+    const saveEditorSettings = vi.fn().mockResolvedValue(undefined);
+    vi.doMock("@/lib/backend/api", () => ({ loadEditorSettings, saveEditorSettings }));
+
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+    await store.initEditorSettings();
+    saveEditorSettings.mockClear();
+
+    await store.updateEditorSettingsAndPersist({ aiFontFamily: "  Georgia, serif  ", aiFontSize: 18 });
+
+    expect(store.editorSettings).toMatchObject({
+      fontFamily: "SQL editor font",
+      uiFontFamily: "Interface font",
+      aiFontFamily: "Georgia, serif",
+      aiFontSize: 18,
+    });
+    expect(saveEditorSettings).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        fontFamily: "SQL editor font",
+        uiFontFamily: "Interface font",
+        aiFontFamily: "Georgia, serif",
+        aiFontSize: 18,
+      }),
+    );
+
+    await store.updateEditorSettingsAndPersist({
+      aiFontFamily: DEFAULT_EDITOR_SETTINGS.aiFontFamily,
+      aiFontSize: DEFAULT_EDITOR_SETTINGS.aiFontSize,
+    });
+
+    expect(store.editorSettings).toMatchObject({
+      fontFamily: "SQL editor font",
+      uiFontFamily: "Interface font",
+      aiFontFamily: "",
+      aiFontSize: 12,
+    });
+  });
+
   it("loads and persists the substitution switch without discarding syntax overrides", async () => {
     const loadEditorSettings = vi.fn().mockResolvedValue({
       sqlVariableSubstitutionEnabled: false,
@@ -1212,7 +1280,9 @@ describe("settingsStore persisted settings initialization", () => {
     const { useSettingsStore } = await import("@/stores/settingsStore");
     const firstStore = useSettingsStore();
     await firstStore.initEditorSettings();
+    expect(firstStore.editorSettings.colorizeConnectionTabs).toBe(true);
     await firstStore.updateEditorSettingsAndPersist({
+      colorizeConnectionTabs: false,
       tabPlacement: "left",
       tabGroupMode: "connection",
       tabSortMode: "title-asc",
@@ -1226,6 +1296,7 @@ describe("settingsStore persisted settings initialization", () => {
     await restartedStore.initEditorSettings();
 
     expect(restartedStore.editorSettings).toMatchObject({
+      colorizeConnectionTabs: false,
       tabPlacement: "left",
       tabGroupMode: "connection",
       tabSortMode: "title-asc",

@@ -1194,6 +1194,7 @@ impl ConnectionConfig {
             DatabaseType::Trino => format!("trino://{host}:{port}{db_part}"),
             DatabaseType::PrestoSql => format!("prestosql://{host}:{port}{db_part}"),
             DatabaseType::Hive | DatabaseType::Argo => format!("hive://{host}:{port}{db_part}"),
+            DatabaseType::Transwarp => format!("transwarp://{host}:{port}{db_part}"),
             DatabaseType::Kyuubi => format!("kyuubi://{host}:{port}{db_part}"),
             DatabaseType::Impala => format!("impala://{host}:{port}{db_part}"),
             DatabaseType::Spark => format!("spark://{host}:{port}{db_part}"),
@@ -1432,7 +1433,7 @@ impl ConnectionConfig {
             DatabaseType::PrestoSql => {
                 format!("prestosql://{}:{}@{host}:{port}{db_part}", username, password)
             }
-            DatabaseType::Hive | DatabaseType::Argo => {
+            DatabaseType::Hive | DatabaseType::Argo | DatabaseType::Transwarp => {
                 format!("hive://{}:{}@{host}:{port}{db_part}", username, password)
             }
             DatabaseType::Kyuubi => {

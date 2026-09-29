@@ -56,6 +56,7 @@ pub fn is_schema_aware(database_type: DatabaseType) -> bool {
             | DatabaseType::Kyuubi
             | DatabaseType::Impala
             | DatabaseType::Argo
+            | DatabaseType::Transwarp
             | DatabaseType::Spark
             | DatabaseType::Db2
             | DatabaseType::Informix
@@ -114,6 +115,11 @@ pub fn pagination_strategy(database_type: Option<DatabaseType>, context: Paginat
         // `LimitOffset` catch-all and 32-bit DSN connections hit the identical
         // `LIMIT 100` syntax error.
         Some(DatabaseType::Odbc | DatabaseType::Odbc32) => TablePaginationStrategy::AgentMaxRows,
+        Some(DatabaseType::Cassandra)
+            if matches!(context, PaginationContext::TablePreview | PaginationContext::UserQuery) =>
+        {
+            TablePaginationStrategy::AgentMaxRows
+        }
         Some(DatabaseType::Oracle) if matches!(context, PaginationContext::TablePreview) => {
             TablePaginationStrategy::Rownum
         }

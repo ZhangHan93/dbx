@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, h, nextTick, onMounted, onUnmounted, reactive, ref, toRaw, watch, type Component } from "vue";
 import { uuid } from "@/lib/common/utils";
-import { deferUntilPanelResizeEnd } from "@/lib/app/panelResizeState";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
+import { deferUntilPanelResizeEnd } from "@/lib/app/panelResizeState";
 import {
   ArrowDown,
   ArrowUp,
@@ -66,6 +66,7 @@ import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { usePromptTemplateStore } from "@/stores/promptTemplateStore";
 import { useUserSkillStore } from "@/stores/userSkillStore";
 import { buildSelectedSkillChips, capSkillsToCharLimit, removeSkillIds, userSkillSourceOfId } from "@/lib/ai/userSkillSelection";
+import { aiConversationTypographyCssVariables } from "@/lib/ai/aiTypography";
 import { ACTIVE_SKILLS_TOTAL_MAX, type ReadUserSkill, type ReadUserSkillFailure, type UserSkillFailureReason, type UserSkillRootSettings } from "@/types/userSkills";
 import { supportsAiAssistantContext } from "@/lib/database/databaseFeatureSupport";
 import ConnectionIcon from "@/components/icons/ConnectionIcon.vue";
@@ -210,6 +211,12 @@ const AiHtmlPreview = defineAsyncComponent({
   loader: () => import("@/components/ai/rich/AiHtmlPreview.vue"),
 });
 const settings = useSettingsStore();
+const aiTypographyStyle = computed(() =>
+  aiConversationTypographyCssVariables({
+    fontFamily: settings.editorSettings.aiFontFamily,
+    fontSize: settings.editorSettings.aiFontSize,
+  }),
+);
 const connectionStore = useConnectionStore();
 const savedSqlStore = useSavedSqlStore();
 const promptTemplateStore = usePromptTemplateStore();
@@ -5419,7 +5426,7 @@ async function openExternalUrl(url: string) {
 </script>
 
 <template>
-  <div ref="assistantRootRef" data-ai-assistant-root class="flex h-full min-h-0 flex-col overflow-hidden" @dragenter="onAttachmentDragEnter" @dragover="onAttachmentDragOver" @dragleave="onAttachmentDragLeave" @drop="onAttachmentDrop">
+  <div ref="assistantRootRef" data-ai-assistant-root class="flex h-full min-h-0 flex-col overflow-hidden" :style="aiTypographyStyle" @dragenter="onAttachmentDragEnter" @dragover="onAttachmentDragOver" @dragleave="onAttachmentDragLeave" @drop="onAttachmentDrop">
     <div class="flex items-center gap-2 border-b px-3 shrink-0" :class="settings.editorSettings.appLayout === 'classic' ? 'h-9' : 'h-10'">
       <span class="flex flex-1 self-stretch items-center truncate text-xs font-medium" data-tauri-drag-region>
         {{ chatTitle }}
@@ -5655,7 +5662,7 @@ async function openExternalUrl(url: string) {
                     data-edit-textarea
                     v-model="editingContent"
                     rows="3"
-                    class="w-full resize-none rounded-lg border bg-background px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-primary"
+                    class="ai-conversation-text w-full resize-none rounded-lg border bg-background px-3 py-2 text-xs outline-none focus:ring-1 focus:ring-primary"
                     @keydown="onEditKeydown($event, i)"
                     @compositionstart="editCompositionActive = true"
                     @compositionend="editCompositionActive = false"
@@ -5707,7 +5714,7 @@ async function openExternalUrl(url: string) {
                         class="w-44"
                       />
                     </div>
-                    <div v-if="messageReferenceMentions(msg).length || msg.content" class="min-w-0 rounded-lg bg-primary px-3 py-2 text-xs text-primary-foreground">
+                    <div v-if="messageReferenceMentions(msg).length || msg.content" class="ai-conversation-text min-w-0 rounded-lg bg-primary px-3 py-2 text-xs text-primary-foreground">
                       <div v-if="messageReferenceMentions(msg).length" class="mb-1.5 flex flex-wrap justify-end gap-1">
                         <button
                           v-for="mention in messageReferenceMentions(msg)"
@@ -5777,7 +5784,7 @@ async function openExternalUrl(url: string) {
 
             <!-- Keep the metadata row as wide as the reply card so its export action stays right-aligned. -->
             <div v-else-if="msg.content || msg.reasoning || msg.isThinking" class="flex w-full max-w-[95%] min-w-0 flex-col">
-              <div class="w-full rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed [overflow-wrap:anywhere]">
+              <div data-ai-assistant-message-content class="ai-conversation-text w-full rounded-lg bg-muted px-3 py-2 text-xs leading-relaxed [overflow-wrap:anywhere]">
                 <div v-if="msg.reasoning || msg.isThinking" class="mb-2">
                   <button class="flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground transition-colors" @click="toggleReasoning()">
                     <ChevronRight class="h-3 w-3 transition-transform duration-200" :class="{ 'rotate-90': reasoningExpanded }" />
@@ -6015,7 +6022,6 @@ async function openExternalUrl(url: string) {
                 @update:model-value="(v) => changeConnection(v)"
               />
               <template v-if="boundConnection && showAiDatabaseSelector">
-                <Database class="h-3 w-3 shrink-0 text-foreground/40" />
                 <Popover
                   @update:open="
                     (open: boolean) => {
@@ -6024,7 +6030,8 @@ async function openExternalUrl(url: string) {
                   "
                 >
                   <PopoverTrigger as-child>
-                    <Button variant="ghost" :title="selectedDatabaseLabel" :class="['h-5 min-w-0 max-w-64 justify-start border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none', showAiSchemaSelector && 'flex-1']">
+                    <Button variant="ghost" :title="selectedDatabaseLabel" :aria-label="selectedDatabaseLabel" :class="['ai-database-selector-trigger h-5 min-w-0 max-w-64 justify-start gap-1 border-0 p-0 px-1 text-xs font-normal text-foreground/80 shadow-none', showAiSchemaSelector && 'flex-1']">
+                      <Database class="ai-database-selector-icon h-3 w-3 shrink-0 text-foreground/40" />
                       <span class="truncate">{{ selectedDatabaseLabel }}</span>
                     </Button>
                   </PopoverTrigger>
@@ -6330,7 +6337,7 @@ async function openExternalUrl(url: string) {
             ref="promptTextareaRef"
             v-model="prompt"
             :style="{ height: `${textareaHeight}px`, maxHeight: `${maxTextareaHeight()}px` }"
-            class="w-full resize-none bg-transparent text-xs outline-none placeholder:text-muted-foreground mb-1"
+            class="ai-conversation-text w-full resize-none bg-transparent text-xs outline-none placeholder:text-muted-foreground mb-1"
             :placeholder="activePlaceholder"
             @input="refreshMentionState"
             @click="refreshMentionState"
@@ -6675,12 +6682,14 @@ async function openExternalUrl(url: string) {
 </template>
 
 <style scoped>
-.ai-prompt-context-row--compact .ai-prompt-context-spacer {
-  flex: 0 0 0;
+.ai-conversation-text {
+  font-family: var(--dbx-ai-content-font-family, inherit);
+  font-size: var(--dbx-ai-content-font-size, 0.75rem);
 }
 
 .ai-prompt-context-row--compact .ai-template-selector-trigger,
-.ai-prompt-context-row--compact .ai-skills-selector-trigger {
+.ai-prompt-context-row--compact .ai-skills-selector-trigger,
+.ai-prompt-context-row--compact .ai-database-selector-trigger {
   flex: 0 0 1.5rem;
   width: 1.5rem;
   max-width: 1.5rem;
@@ -6692,7 +6701,8 @@ async function openExternalUrl(url: string) {
 .ai-prompt-context-row--compact .ai-template-selector-label,
 .ai-prompt-context-row--compact .ai-template-selector-chevron,
 .ai-prompt-context-row--compact .ai-skills-selector-label,
-.ai-prompt-context-row--compact .ai-skills-selector-count {
+.ai-prompt-context-row--compact .ai-skills-selector-count,
+.ai-prompt-context-row--compact .ai-database-selector-trigger > span {
   display: none;
 }
 
@@ -6791,7 +6801,7 @@ async function openExternalUrl(url: string) {
   border-radius: 0.25rem;
   background: var(--muted);
   padding: 0.125rem 0.375rem;
-  font-size: 11px;
+  font-size: var(--dbx-ai-inline-code-font-size, 11px);
   font-family: ui-monospace, monospace;
 }
 .ai-markdown :deep(pre) {
@@ -6871,6 +6881,11 @@ html.dbx-legacy-webview.dark .ai-markdown :deep(.ai-markdown-table-wrap:hover::-
 }
 .ai-code-block :deep(.line) {
   min-height: 1lh;
+}
+
+.ai-code-block {
+  font-family: ui-monospace, monospace;
+  font-size: var(--dbx-ai-code-font-size, 0.75rem);
 }
 
 .ai-message-scroll :deep([data-slot="scroll-area-viewport"]) {
