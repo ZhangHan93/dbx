@@ -26,6 +26,7 @@ import { useI18n } from "vue-i18n";
 import { useTheme } from "@/composables/useTheme";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { createPluginAiCompletion } from "@/lib/plugins/pluginAiCompletion";
 import { OPEN_PLUGIN_AI_CONVERSATION } from "@/lib/ai/aiPluginConversation";
 
 const props = withDefaults(
@@ -50,6 +51,19 @@ const { t, locale: appLocale } = useI18n();
 const { isDark, themeRevision } = useTheme();
 const settingsStore = useSettingsStore();
 const openAiConversation = inject(OPEN_PLUGIN_AI_CONVERSATION, undefined);
+const aiCompletion = createPluginAiCompletion({
+  load: () => import("@/lib/backend/tauri").then((api) => api.loadAiConfigs()),
+  discover: (config) => import("@/lib/backend/tauri").then((api) => api.aiListModels(config)),
+  complete: (request) => import("@/lib/backend/tauri").then((api) => api.aiComplete(request)),
+  confirm: async (pluginName, model) => {
+    const { ask } = await import("@tauri-apps/plugin-dialog");
+    const zh = appLocale.value.startsWith("zh");
+    return ask(zh ? `插件「${pluginName}」将把准备的文本发送给「${model.name} / ${model.model}」，并读取生成结果。是否继续？` : `Plugin "${pluginName}" will send its prepared text to "${model.name} / ${model.model}" and receive the generated result. Continue?`, {
+      title: zh ? "插件 AI 生成" : "Plugin AI generation",
+      kind: "info",
+    });
+  },
+});
 const iframe = ref<HTMLIFrameElement>();
 const source = ref("");
 const loading = ref(true);
@@ -73,8 +87,10 @@ let bootCacheHit = false;
 // keeps File objects and in-memory save buffers (`w<n>` ids). Handle ids are
 // opaque strings end to end — never run them through Number(): ids above
 // Number.MAX_SAFE_INTEGER silently round, and the registry then rejects every
-// read with "unknown plugin file handle". Only paths that came from a native
-// dialog or an OS drop reach plugin_file_open — never a plugin-supplied string.
+// read with "unknown plugin file handle". Every path is consented to on the
+// Rust side — dialogs open there (plugin_file_pick_files / plugin_file_save_as)
+// and drops are registered by the native drag-drop pipeline before
+// plugin_file_open accepts them — never a plugin-supplied string.
 
 let webFileSequence = 0;
 const webPickedFiles = new Map<string, File>();
@@ -104,6 +120,9 @@ async function tauriFileApi() {
   return import("@/lib/backend/tauri");
 }
 
+// OS drops are the one flow where the renderer still names a path: the native
+// drag-drop pipeline registered the dropped files for THIS webview, and
+// plugin_file_open accepts exactly those (one open per dropped file).
 async function openTauriPluginFile(pluginId: string, path: string, write: boolean): Promise<PluginFileHandleMeta> {
   const { openPluginLocalFile } = await tauriFileApi();
   const handle = await openPluginLocalFile(pluginId, path, write);
@@ -115,16 +134,15 @@ async function openTauriPluginFile(pluginId: string, path: string, write: boolea
 
 async function pickPluginFiles(pluginId: string, options: PluginPickFilesOptions): Promise<PluginFileHandleMeta[]> {
   if (isTauriRuntime()) {
-    const { open } = await import("@tauri-apps/plugin-dialog");
-    const selected = await open({ multiple: options.multiple === true });
-    const paths = Array.isArray(selected) ? selected : selected ? [selected] : [];
+    // The native dialog is opened on the Rust side: paths never round-trip
+    // through renderer-controlled arguments, the handles are the only result.
+    const { pickPluginLocalFiles } = await tauriFileApi();
     const files: PluginFileHandleMeta[] = [];
-    for (const path of paths) {
-      try {
-        files.push(await openTauriPluginFile(pluginId, path, false));
-      } catch (error) {
-        console.warn("[DBX][plugin-workbench:pick]", error);
-      }
+    for (const handle of await pickPluginLocalFiles(pluginId, options.multiple === true)) {
+      // Track read AND write handles: unmount must reclaim both (leaked fds
+      // also burn the shared 64-handle registry quota).
+      openTauriHandles.add(handle.handleId);
+      files.push({ handleId: `${tauriHandlePrefix}${handle.handleId}`, name: handle.name, size: handle.size, contentType: handle.contentType });
     }
     return files;
   }
@@ -205,19 +223,15 @@ async function deletePluginStorage(pluginId: string, key: string): Promise<void>
 
 async function beginPluginFileSave(pluginId: string, request: { name?: string; contentType?: string; size?: number }): Promise<{ handleId: string; chunkBytes: number } | null> {
   if (isTauriRuntime()) {
-    const { save } = await import("@tauri-apps/plugin-dialog");
-    const fileName = request.name || "download.bin";
-    const extension = fileName.includes(".") ? fileName.split(".").pop() : "";
-    const path = await save({
-      defaultPath: fileName,
-      filters: extension ? [{ name: extension.toUpperCase(), extensions: [extension] }] : undefined,
-    });
-    if (!path) return null;
-    // Route through openTauriPluginFile so the write handle joins
-    // openTauriHandles: a beginSave the plugin abandons must still be
+    // The save dialog runs on the Rust side and returns an already-consented
+    // write handle; only the suggested file name crosses the bridge. Track it
+    // in openTauriHandles: a beginSave the plugin abandons must still be
     // reclaimed on unmount instead of burning the shared registry quota.
-    const handle = await openTauriPluginFile(pluginId, path, true);
-    return { handleId: handle.handleId, chunkBytes: PLUGIN_SAVE_CHUNK_BYTES };
+    const { savePluginLocalFileAs } = await tauriFileApi();
+    const handle = await savePluginLocalFileAs(pluginId, request.name || "download.bin");
+    if (!handle) return null;
+    openTauriHandles.add(handle.handleId);
+    return { handleId: `${tauriHandlePrefix}${handle.handleId}`, chunkBytes: PLUGIN_SAVE_CHUNK_BYTES };
   }
   const handleId = `${webHandlePrefix}${++webFileSequence}`;
   webSaveBuffers.set(handleId, { name: request.name || "download.bin", contentType: request.contentType || "application/octet-stream", chunks: new Map() });
@@ -383,6 +397,7 @@ function createBridge() {
       sendBinary: api.sendPluginBinary,
       readAsset: api.readPluginUiAsset,
       openAiConversation,
+      ...(isTauriRuntime() ? aiCompletion : {}),
       setAiRecommendations: (update) => emit("recommendations", update),
       openWorkbench: async (pluginId, contributionId, context, options) => emit("openWorkbench", pluginId, contributionId, context, options),
       openFilesystem: async (pluginId, providerId, context) => emit("openFilesystem", pluginId, providerId, context),

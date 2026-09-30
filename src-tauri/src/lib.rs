@@ -1779,6 +1779,23 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // Anchor the plugin-file drop consent on the Rust side: paths are
+            // registered for the webview that physically received the drop,
+            // and plugin_file_open consumes them there. Renderer-side drop
+            // events stay display-only; they cannot mint file access.
+            if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                let dropped: Vec<String> = paths
+                    .iter()
+                    .filter(|path| path.is_file())
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect();
+                if !dropped.is_empty() {
+                    if let Some(state) = window.try_state::<commands::plugin_file::PluginFileState>() {
+                        state.register_dropped_paths(window.label(), dropped);
+                    }
+                }
+                return;
+            }
             if let tauri::WindowEvent::Destroyed = event {
                 if let Some(tab_id) = window.label().strip_prefix("detached-tab-") {
                     let _ = window.emit("dbx:detached-tab-lost", serde_json::json!({ "tabId": tab_id }));
@@ -1920,6 +1937,9 @@ pub fn run() {
             commands::cloud_sync::snippet_sync_upload,
             commands::cloud_sync::snippet_sync_download,
             commands::cloud_sync::snippet_sync_inspect,
+            commands::local_backup::local_backup_export,
+            commands::local_backup::local_backup_inspect,
+            commands::local_backup::local_backup_import,
             commands::connection::test_connection,
             commands::connection::test_connection_with_info,
             commands::connection::test_ssh_tunnel,
@@ -1955,6 +1975,8 @@ pub fn run() {
             commands::connection::load_table_vgroups,
             commands::connection::delete_table_vgroups_for_connection,
             commands::plugin_file::plugin_file_open,
+            commands::plugin_file::plugin_file_pick_files,
+            commands::plugin_file::plugin_file_save_as,
             commands::plugin_file::plugin_file_read,
             commands::plugin_file::plugin_file_write,
             commands::plugin_file::plugin_file_close,
