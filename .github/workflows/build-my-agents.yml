@@ -47,8 +47,11 @@ jobs:
           Write-Output "dotnet: $(dotnet --version)"
           Write-Output "perl: $((perl --version | Select-Object -First 2) -join ' ')"
 
+      # --frozen-lockfile：锁文件与 package.json 不一致时**直接 fail fast**，不再重新解析覆盖
+      #   ⇒ CI 装到的就是仓库钉住的版本，产物可复现（对齐上游 ci.yml 的同一 flag）。
+      #   原先未启用 frozen 校验，留了解析漂移的口子。
       - name: Install frontend dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       # 为什么必须有这一步：`pnpm tauri build` 的 beforeBuildCommand 是 `pnpm build`（纯 vite build，
       # esbuild 直接剥类型），**不做类型检查**。于是「按 DatabaseType 穷举的映射表漏了某个 db_type」
@@ -154,8 +157,9 @@ jobs:
           toolchain: nightly-2026-07-22
           components: rust-src
 
+      # 同 x64 job：--frozen-lockfile 保可复现（不一致即 fail fast）。
       - name: Install frontend dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Prepare Win7-compatible WebView2 loader
         shell: pwsh
