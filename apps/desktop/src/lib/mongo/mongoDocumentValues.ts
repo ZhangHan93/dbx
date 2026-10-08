@@ -103,7 +103,41 @@ export function mongoShellDateToExtendedJson(value: unknown): unknown {
   if (typeof value !== "string") return value;
   const match = value.trim().match(MONGO_SHELL_DATE_PATTERN);
   if (!match) return value;
-  return { $date: match[2] };
+  return { $date: normalizeMongoDateInput(match[2] ?? "") ?? match[2] };
+}
+
+/** `2025-04-01 19:46:03`, `2025/04/01`, `2025-04-01T19:46` … : a date with no zone, as people read one off a screen. */
+const MONGO_LOCAL_DATE_PATTERN = /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3})\d*)?)?)?$/;
+/** The one spelling the server's `$date` parser accepts, kept as written. */
+const MONGO_RFC3339_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/**
+ * Turns the date text a person types into the RFC 3339 string `$date` requires.
+ *
+ * The server accepts nothing else, but people paste what they see: a grid cell
+ * shows `2025-04-01 19:46:03`, a log line `2025-04-01`. Those name no zone, so
+ * they are read as local time, the way the person reads them, and sent as UTC.
+ * Text that already spells RFC 3339 is kept as written; any other spelling the
+ * platform can parse is canonicalised. Returns null when the text is no date.
+ */
+export function normalizeMongoDateInput(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  if (MONGO_RFC3339_DATE_PATTERN.test(trimmed) && !Number.isNaN(Date.parse(trimmed))) return trimmed;
+
+  const local = MONGO_LOCAL_DATE_PATTERN.exec(trimmed);
+  if (local) {
+    const [, year = "", month = "", day = "", hour = "0", minute = "0", second = "0", fraction = "0"] = local;
+    const parts = [Number(year), Number(month), Number(day), Number(hour), Number(minute), Number(second), Number(fraction.padEnd(3, "0"))] as const;
+    const date = new Date(parts[0], parts[1] - 1, parts[2], parts[3], parts[4], parts[5], parts[6]);
+    // `new Date(2025, 1, 30)` rolls over into March; a day that does not exist is a typo, not a date.
+    const exists = date.getFullYear() === parts[0] && date.getMonth() === parts[1] - 1 && date.getDate() === parts[2];
+    if (!exists || parts[3] > 23 || parts[4] > 59 || parts[5] > 59) return null;
+    return date.toISOString();
+  }
+
+  const parsed = Date.parse(trimmed);
+  return Number.isNaN(parsed) ? null : new Date(parsed).toISOString();
 }
 
 export function parseMongoDocumentInputValue(raw: MongoInputValue): unknown {
@@ -370,6 +404,73 @@ function mongoDocumentFieldValue(document: unknown, field: string): unknown {
 function mongoShellNumberLongToExtendedJson(value: string): unknown {
   const match = value.match(MONGO_SHELL_NUMBER_LONG_PATTERN);
   return match ? { $numberLong: match[2] } : value;
+}
+
+/**
+ * `NumberLong("-7")`, `NumberInt(3)`, `NumberDouble("1.5")`, `NumberDecimal("-12.5")`
+ * — the shell-style display text the collection grid renders typed BSON scalars with.
+ */
+const MONGO_SHELL_NUMBER_LITERAL_PATTERN = /^(?:NumberLong|NumberInt|NumberDouble|NumberDecimal)\(\s*(?:"([^"]*)"|'([^']*)'|([^()]*))\s*\)$/;
+const MONGO_NUMERIC_WRAPPER_KEYS: ReadonlySet<string> = new Set<string>(MONGO_EXTENDED_JSON_NUMERIC_TYPES.keys());
+
+function mongoNumericText(text: string): number | undefined {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+  const numeric = Number(trimmed);
+  return Number.isFinite(numeric) ? numeric : undefined;
+}
+
+function mongoShellNumericText(text: string): number | undefined {
+  const literal = MONGO_SHELL_NUMBER_LITERAL_PATTERN.exec(text.trim());
+  if (!literal) return mongoNumericText(text);
+  return mongoNumericText(literal[1] ?? literal[2] ?? literal[3] ?? "");
+}
+
+function mongoJsonNumericValue(json: string): number | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed === "number") return Number.isFinite(parsed) ? parsed : undefined;
+  if (typeof parsed === "string") return mongoShellNumericText(parsed);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const entries = Object.entries(parsed as Record<string, unknown>);
+  if (entries.length !== 1) return undefined;
+  const [key, inner] = entries[0]!;
+  if (!MONGO_NUMERIC_WRAPPER_KEYS.has(key)) return undefined;
+  if (typeof inner === "number") return Number.isFinite(inner) ? inner : undefined;
+  return typeof inner === "string" ? mongoNumericText(inner) : undefined;
+}
+
+/**
+ * The number a collection-grid cell contributes to a selection total, or
+ * undefined when it is not a number.
+ *
+ * BSON keeps numeric types the JSON grid cannot express: `int32` / `int64` /
+ * `decimal128` values arrive as extended-JSON wrappers or shell literals
+ * (`NumberLong("-7")`), so plain `Number(...)` coercion rejects them. Without
+ * this, a column whose plain doubles are counted while its wrapped values are
+ * skipped reports a total built from only part of the column — the dropped part
+ * being whichever type the rest of the column happens not to use, commonly the
+ * negative entries.
+ *
+ * Shell literals are read exactly as the grid displays them, so a BSON string
+ * whose text happens to be `NumberLong("-7")` contributes -7; that string is
+ * indistinguishable from a typed Int64 once it reaches a cell.
+ */
+export function mongoDocumentGridNumericValue(value: unknown): number | undefined {
+  if (typeof value === "number") return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== "string") return undefined;
+  if (value === MONGO_DOCUMENT_GRID_NULL) return undefined;
+  // Values in the reserved namespace are escaped BSON strings: only plain
+  // numeric text counts, never a shell literal that was stored as text.
+  const escaped = mongoDocumentGridEscapedString(value);
+  if (escaped !== undefined) return mongoNumericText(escaped);
+  const json = mongoDocumentGridJson(value);
+  if (json !== undefined) return mongoJsonNumericValue(json);
+  return mongoShellNumericText(value);
 }
 
 export function buildMongoUpdateDocument(changes: Map<number, MongoInputValue>, columns: string[], originalDocument?: unknown): Record<string, unknown> {

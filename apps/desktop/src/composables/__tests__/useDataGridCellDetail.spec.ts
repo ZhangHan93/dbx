@@ -12,13 +12,17 @@ const mocks = vi.hoisted(() => ({
   openSearch: vi.fn(),
   focus: vi.fn(),
   onChange: undefined as undefined | ((value: string) => void),
+  onSaveShortcut: undefined as undefined | ((event: KeyboardEvent) => boolean),
   fontFamily: undefined as undefined | (() => string),
+  lineWrapping: undefined as undefined | (() => boolean),
 }));
 
 vi.mock("@/composables/useCellDetailEditor", () => ({
-  useCellDetailEditor: (options: { onChange?: (value: string) => void; fontFamily: () => string }) => {
+  useCellDetailEditor: (options: { onChange?: (value: string) => void; onSaveShortcut?: (event: KeyboardEvent) => boolean; fontFamily: () => string; lineWrapping?: () => boolean }) => {
     mocks.onChange = options.onChange;
+    mocks.onSaveShortcut = options.onSaveShortcut;
     mocks.fontFamily = options.fontFamily;
+    mocks.lineWrapping = options.lineWrapping;
     return {
       create: mocks.create,
       destroy: mocks.destroy,
@@ -31,7 +35,7 @@ vi.mock("@/composables/useCellDetailEditor", () => ({
 }));
 vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: ref(false), themePalette: ref({}) }) }));
 vi.mock("@/stores/settingsStore", () => ({
-  useSettingsStore: () => ({ editorSettings: { theme: "default", fontSize: 13, fontFamily: "monospace", tableFontFamily: "'Grid Font', sans-serif" } }),
+  useSettingsStore: () => ({ editorSettings: { theme: "default", fontSize: 13, fontFamily: "monospace", tableFontFamily: "'Grid Font', sans-serif", wordWrap: true } }),
 }));
 vi.mock("@/lib/dataGrid/geometryPreview", () => ({ renderWktOnCanvas: vi.fn() }));
 
@@ -61,7 +65,9 @@ function detail(): DataGridCellDetail {
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.onChange = undefined;
+  mocks.onSaveShortcut = undefined;
   mocks.fontFamily = undefined;
+  mocks.lineWrapping = undefined;
   mocks.getValue.mockReturnValue("");
 });
 
@@ -76,6 +82,7 @@ describe("useDataGridCellDetail", () => {
 
     expect(mocks.focus).toHaveBeenCalledOnce();
     expect(mocks.fontFamily?.()).toBe("'Grid Font', sans-serif");
+    expect(mocks.lineWrapping?.()).toBe(true);
 
     composable.detailsEditorContainer.value = undefined;
     await nextTick();
@@ -151,6 +158,43 @@ describe("useDataGridCellDetail", () => {
     finishCreate();
     await Promise.resolve();
     expect(mocks.setValue).not.toHaveBeenCalled();
+    scope.stop();
+  });
+
+  it("claims the save shortcut in the details editor and commits + saves via onSave (#10515)", async () => {
+    const scope = effectScope();
+    const onSave = vi.fn();
+    const composable = scope.run(() => useDataGridCellDetail({ detail: ref(detail()), editValue: ref(""), onCancel: vi.fn(), onSave }))!;
+
+    composable.detailsEditorContainer.value = document.createElement("div");
+    await nextTick();
+    expect(mocks.create).toHaveBeenCalledOnce();
+    expect(mocks.onSaveShortcut).toBeTypeOf("function");
+
+    // useCellDetailEditor 会对每个 keydown 回调本钩子；普通按键必须原样放行
+    // （返回 false），否则详情编辑器完全无法输入（#10515 回归）。
+    expect(mocks.onSaveShortcut?.(new KeyboardEvent("keydown", { key: "a" }))).toBe(false);
+    expect(mocks.onSaveShortcut?.(new KeyboardEvent("keydown", { key: "Enter" }))).toBe(false);
+    expect(onSave).not.toHaveBeenCalled();
+
+    expect(mocks.onSaveShortcut?.(new KeyboardEvent("keydown", { key: "s", ctrlKey: true }))).toBe(true);
+    expect(onSave).toHaveBeenCalledOnce();
+
+    composable.detailsEditorContainer.value = undefined;
+    await nextTick();
+    scope.stop();
+  });
+
+  it("does not claim any key when onSave is not provided", async () => {
+    const scope = effectScope();
+    const composable = scope.run(() => useDataGridCellDetail({ detail: ref(detail()), editValue: ref(""), onCancel: vi.fn() }))!;
+
+    composable.detailsEditorContainer.value = document.createElement("div");
+    await nextTick();
+    expect(mocks.onSaveShortcut).toBeUndefined();
+
+    composable.detailsEditorContainer.value = undefined;
+    await nextTick();
     scope.stop();
   });
 });

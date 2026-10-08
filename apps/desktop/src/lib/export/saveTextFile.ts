@@ -1,7 +1,8 @@
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { appendDebugLog, getBrowserMemorySnapshot, isDebugLoggingEnabled } from "@/lib/backend/debugLog";
+import { autoRevealExportedPathIfConfigured, promptExportSavePath } from "./exportPath";
 
-export async function saveTextFile(content: string, defaultFileName: string, filterName: string, filterExt: string, diagnostics: { exportId?: string; operation?: string } = {}): Promise<boolean> {
+export async function saveTextFile(content: string, defaultFileName: string, filterName: string, filterExt: string, diagnostics: { exportId?: string; operation?: string; autoOpenFolder?: boolean } = {}): Promise<boolean> {
   const logSaveStage = (stage: string, details: Record<string, unknown> = {}) => {
     if (!isDebugLoggingEnabled()) return;
     appendDebugLog("info", `[DBX][export:save:${stage}]`, {
@@ -16,15 +17,17 @@ export async function saveTextFile(content: string, defaultFileName: string, fil
 
   logSaveStage("start");
   if (isTauriRuntime()) {
-    const { save } = await import("@tauri-apps/plugin-dialog");
     const { writeTextFile } = await import("@tauri-apps/plugin-fs");
-    const path = await save({
-      defaultPath: defaultFileName,
+    const path = await promptExportSavePath({
+      defaultFileName,
       filters: [{ name: filterName, extensions: [filterExt] }],
     });
     logSaveStage("dialog-result", { selected: !!path });
     if (path) await writeTextFile(path, content);
     if (path) logSaveStage("write-done");
+    if (path && diagnostics.autoOpenFolder) {
+      void autoRevealExportedPathIfConfigured(path);
+    }
     return Boolean(path);
   }
 

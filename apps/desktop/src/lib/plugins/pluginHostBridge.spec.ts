@@ -437,6 +437,68 @@ describe("PluginHostBridge", () => {
     expect(openWorkbench).toHaveBeenNthCalledWith(2, "sample", "sample.other", undefined, { forceNew: false });
   });
 
+  it("routes host.executeCommand to the surface handler scoped to the calling plugin", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const executeCommand = vi.fn(() => ({ error: "Command 'sample.open-panel' is disabled by enablement" }));
+    const bridge = new PluginHostBridge(plugin(["host.workbench"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      executeCommand,
+    });
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "3", method: "host.executeCommand", params: { commandId: "open-panel", context: { connectionId: "c1" } } },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(executeCommand).toHaveBeenCalledWith("sample", "open-panel", { connectionId: "c1" });
+    // Expected business outcomes resolve as a result (no rejection) so webviews
+    // can surface a notice instead of catching.
+    expect(messages[0]).toMatchObject({ id: "3", result: { error: "Command 'sample.open-panel' is disabled by enablement" } });
+  });
+
+  it("normalizes a void executeCommand handler to an empty result object", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const executeCommand = vi.fn();
+    const bridge = new PluginHostBridge(plugin(["host.workbench"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      executeCommand,
+    });
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "4", method: "host.executeCommand", params: { commandId: "open-panel" } },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(executeCommand).toHaveBeenCalledWith("sample", "open-panel", undefined);
+    expect(messages[0]).toMatchObject({ id: "4", result: {} });
+  });
+
+  it("host.executeCommand requires the host.workbench permission", async () => {
+    const messages: unknown[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const executeCommand = vi.fn();
+    const bridge = new PluginHostBridge(plugin(), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      executeCommand,
+    });
+    bridge.handleWindowMessage({
+      source: target,
+      data: { source: "dbx-plugin", version: 1, type: "request", id: "5", method: "host.executeCommand", params: { commandId: "open-panel" } },
+    } as MessageEvent);
+    await vi.waitFor(() => expect(messages).toHaveLength(1));
+    expect(messages[0]).toMatchObject({ id: "5", error: "Plugin has not declared permission 'host.workbench'" });
+    expect(executeCommand).not.toHaveBeenCalled();
+  });
+
   it("reopens a plugin connection through host.reopenConnection", async () => {
     const messages: unknown[] = [];
     const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
@@ -995,6 +1057,22 @@ describe("PluginHostBridge", () => {
     expect(document).toContain("script-src 'unsafe-inline' blob:;");
     expect(document).toContain("font-src data: blob:;");
     expect(document).not.toContain("<base ");
+  });
+
+  it("adds unsafe-eval to script-src only for the granted plugin", () => {
+    const granted = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, {
+      baseUrl: "http://dbx-plugin.localhost/io.github.t8y2.s3/assets/",
+      allowUnsafeEval: true,
+    });
+    expect(granted).toContain("script-src 'unsafe-inline' 'unsafe-eval' blob: http://dbx-plugin.localhost;");
+    // The grant is scoped to script-src; no other directive picks it up.
+    expect(granted).toContain("style-src 'unsafe-inline' blob:;");
+    expect(granted).not.toContain("img-src data: blob: http://dbx-plugin.localhost 'unsafe-eval'");
+
+    const withheld = pluginSandboxDocument("<html><head></head><body></body></html>", [], undefined, {
+      baseUrl: "http://dbx-plugin.localhost/io.github.t8y2.s3/assets/",
+    });
+    expect(withheld).not.toContain("unsafe-eval");
   });
 
   it("pre-seeds the current theme as the sandbox first paint", () => {
@@ -1822,5 +1900,149 @@ describe("AI completion bridge", () => {
     expect(api.generateAiText).not.toHaveBeenCalled();
     expect((await request("host.ai.generateText", { pluginName: "forged", configId: "one", model: "a", prompt: "hi" })).result).toBe("fix: example");
     expect(api.generateAiText).toHaveBeenCalledWith("Sample", { configId: "one", model: "a", prompt: "hi" });
+  });
+  it("validates the host-owned task enum and forwards known presets only", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const generateAiText = vi.fn().mockResolvedValue("ls -la");
+    const bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn(), generateAiText });
+    const request = async (params: unknown) => {
+      const count = messages.length;
+      bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id: String(count), method: "host.ai.generateText", params } } as MessageEvent);
+      await vi.waitFor(() => expect(messages.length).toBe(count + 1));
+      return messages[count];
+    };
+    expect((await request({ configId: "one", model: "a", prompt: "hi", task: "system prompt injection" })).error).toContain("Invalid AI task");
+    expect(generateAiText).not.toHaveBeenCalled();
+    expect((await request({ configId: "one", model: "a", prompt: "hi", task: 42 })).error).toContain("Invalid AI task");
+    expect((await request({ configId: "one", model: "a", prompt: "hi", task: "command-generation" })).result).toBe("ls -la");
+    expect(generateAiText).toHaveBeenCalledWith("Sample", { configId: "one", model: "a", prompt: "hi", task: "command-generation" });
+    // Absent/null task keeps the exact legacy call shape.
+    generateAiText.mockClear();
+    expect((await request({ configId: "one", model: "a", prompt: "hi" })).result).toBe("ls -la");
+    expect(generateAiText).toHaveBeenCalledWith("Sample", { configId: "one", model: "a", prompt: "hi" });
+    expect((await request({ configId: "one", model: "a", prompt: "hi", task: null })).result).toBe("ls -la");
+    expect(generateAiText).toHaveBeenLastCalledWith("Sample", { configId: "one", model: "a", prompt: "hi" });
+  });
+  it("streams generations as requestId-scoped chunk events and resolves with the full text", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    let pushChunk!: (delta: string, done: boolean) => void;
+    let settle!: () => void;
+    const generateAiTextStream = vi.fn((_pluginName: string, _request: unknown, onChunk: (chunk: { delta: string; done: boolean }) => void) => {
+      pushChunk = (delta, done) => onChunk({ delta, done });
+      return new Promise<string>((resolve) => {
+        settle = () => resolve("ls -la");
+      });
+    });
+    const bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn(), generateAiTextStream, cancelAiGeneration: vi.fn().mockResolvedValue(true) });
+    const send = (id: string, method: string, params: unknown) => bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id, method, params } } as MessageEvent);
+    const waitResponse = async (id: string) => {
+      await vi.waitFor(() => expect(messages.some((message) => message.type === "response" && message.id === id)).toBe(true));
+      return messages.find((message) => message.type === "response" && message.id === id);
+    };
+    bridge.sendInit();
+    expect(messages[0].capabilities.aiCompletionStream).toBe(true);
+    send("open", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "list files", requestId: "gen-1", task: "command-generation" });
+    await vi.waitFor(() => expect(generateAiTextStream).toHaveBeenCalledOnce());
+    expect(generateAiTextStream.mock.calls[0][0]).toBe("Sample");
+    expect(generateAiTextStream.mock.calls[0][1]).toMatchObject({ configId: "one", model: "a", prompt: "list files", requestId: "gen-1", task: "command-generation" });
+    pushChunk("ls ", false);
+    pushChunk("-la", false);
+    await vi.waitFor(() => expect(messages.filter((message) => message.type === "event" && message.method === "host.ai.generationChunk")).toHaveLength(2));
+    expect(messages.filter((message) => message.method === "host.ai.generationChunk").map((message) => message.params)).toEqual([
+      { requestId: "gen-1", delta: "ls ", done: false },
+      { requestId: "gen-1", delta: "-la", done: false },
+    ]);
+    send("cancel", "host.ai.cancelGeneration", { requestId: "gen-1" });
+    await waitResponse("cancel");
+    expect(messages.find((message) => message.id === "cancel").result).toEqual({ cancelled: true });
+    // The completion emits the final done chunk before its promise resolves.
+    pushChunk("", true);
+    settle();
+    expect((await waitResponse("open")).result).toBe("ls -la");
+    // A finished stream is no longer cancellable and unknown ids answer false.
+    send("late", "host.ai.cancelGeneration", { requestId: "gen-1" });
+    await waitResponse("late");
+    expect(messages.find((message) => message.id === "late").result).toEqual({ cancelled: false });
+  });
+  it("gates streaming, validates requestId and task, and keeps the capability honest", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    const baseApi = () => ({ invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn() });
+    const generateAiTextStream = vi.fn().mockResolvedValue("done");
+    const cancelAiGeneration = vi.fn().mockResolvedValue(true);
+    // Without both stream and cancel the capability stays off and the call is refused.
+    let bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { ...baseApi(), generateAiTextStream });
+    const send = (b: PluginHostBridge, id: string, method: string, params: unknown) => b.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id, method, params } } as MessageEvent);
+    const waitResponse = async (id: string) => {
+      await vi.waitFor(() => expect(messages.some((message) => message.type === "response" && message.id === id)).toBe(true));
+      return messages.find((message) => message.type === "response" && message.id === id);
+    };
+    bridge.sendInit();
+    expect(messages[messages.length - 1].capabilities.aiCompletionStream).toBe(false);
+    send(bridge, "half", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-0" });
+    expect((await waitResponse("half")).error).toContain("unavailable");
+    // With both methods the capability is advertised, but permission, requestId
+    // and the task enum are still enforced.
+    bridge = new PluginHostBridge(plugin([]), workbench, {}, () => target, { ...baseApi(), generateAiTextStream, cancelAiGeneration });
+    send(bridge, "gate", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-1" });
+    expect((await waitResponse("gate")).error).toContain("host.ai");
+    bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { ...baseApi(), generateAiTextStream, cancelAiGeneration });
+    send(bridge, "missing-id", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi" });
+    expect((await waitResponse("missing-id")).error).toContain("AI requestId");
+    send(bridge, "bad-task", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-2", task: "injected" });
+    expect((await waitResponse("bad-task")).error).toContain("Invalid AI task");
+    send(bridge, "ok", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-2" });
+    expect((await waitResponse("ok")).result).toBe("done");
+    expect(generateAiTextStream).toHaveBeenCalledOnce();
+    expect(generateAiTextStream.mock.calls[0][1]).toMatchObject({ requestId: "gen-2" });
+  });
+  it("cancels only its own active streams and stops forwarding after cancellation", async () => {
+    const messages: any[] = [];
+    const target = { postMessage: (message: unknown) => messages.push(message) } as unknown as Window;
+    let pushChunk!: (delta: string, done: boolean) => void;
+    const generateAiTextStream = vi.fn((_pluginName: string, _request: unknown, onChunk: (chunk: { delta: string; done: boolean }) => void) => {
+      pushChunk = (delta, done) => onChunk({ delta, done });
+      return new Promise<string>(() => undefined);
+    });
+    const cancelAiGeneration = vi.fn().mockResolvedValue(true);
+    const bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, { invoke: vi.fn(), notify: vi.fn(), sendBinary: vi.fn(), readAsset: vi.fn(), generateAiTextStream, cancelAiGeneration });
+    const send = (id: string, method: string, params: unknown) => bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id, method, params } } as MessageEvent);
+    const waitResponse = async (id: string) => {
+      await vi.waitFor(() => expect(messages.some((message) => message.type === "response" && message.id === id)).toBe(true));
+      return messages.find((message) => message.type === "response" && message.id === id);
+    };
+    send("open", "host.ai.generateTextStream", { configId: "one", model: "a", prompt: "hi", requestId: "gen-1" });
+    await vi.waitFor(() => expect(generateAiTextStream).toHaveBeenCalledOnce());
+    // A request from another workbench (never registered here) cannot cancel.
+    send("foreign", "host.ai.cancelGeneration", { requestId: "someone-else" });
+    await waitResponse("foreign");
+    expect(cancelAiGeneration).not.toHaveBeenCalled();
+    expect(messages.find((message) => message.id === "foreign").result).toEqual({ cancelled: false });
+    send("cancel", "host.ai.cancelGeneration", { requestId: "gen-1" });
+    await waitResponse("cancel");
+    expect(cancelAiGeneration).toHaveBeenCalledWith("gen-1");
+    expect(messages.find((message) => message.id === "cancel").result).toEqual({ cancelled: true });
+    // Chunks after cancellation are no longer forwarded.
+    pushChunk("late", false);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(messages.some((message) => message.method === "host.ai.generationChunk" && message.params.delta === "late")).toBe(false);
+  });
+  it("cancels active streams when the workbench is disposed", async () => {
+    const target = { postMessage: vi.fn() } as unknown as Window;
+    const cancelAiGeneration = vi.fn().mockResolvedValue(true);
+    const bridge = new PluginHostBridge(plugin(["host.ai"]), workbench, {}, () => target, {
+      invoke: vi.fn(),
+      notify: vi.fn(),
+      sendBinary: vi.fn(),
+      readAsset: vi.fn(),
+      generateAiTextStream: vi.fn(() => new Promise<string>(() => undefined)),
+      cancelAiGeneration,
+    });
+    bridge.handleWindowMessage({ source: target, data: { source: "dbx-plugin", version: 1, type: "request", id: "open", method: "host.ai.generateTextStream", params: { configId: "one", model: "a", prompt: "hi", requestId: "gen-1" } } } as MessageEvent);
+    await vi.waitFor(() => expect(cancelAiGeneration.mock.calls.length).toBeGreaterThanOrEqual(0));
+    bridge.dispose();
+    expect(cancelAiGeneration).toHaveBeenCalledWith("gen-1");
   });
 });

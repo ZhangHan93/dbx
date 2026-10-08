@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
 import { Check, ChevronDown, Copy, Eye, Loader2, Map, Plus, RefreshCcw, RotateCcw, Rows3, Save, TableProperties, Trash2, Upload } from "@lucide/vue";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -30,7 +30,6 @@ import {
 const props = defineProps<{
   compact?: boolean;
   compactActionCount?: number;
-  navigationVisible?: boolean;
   refresh: DataGridToolbarActionCapability;
   autoRefresh?: DataGridToolbarAutoRefreshCapability;
   addRow?: DataGridToolbarAddRowCapability;
@@ -46,11 +45,22 @@ const props = defineProps<{
 }>();
 
 const autoRefreshIntervals = computed(() => (props.autoRefresh ? dataGridToolbarIntervalOptions(props.autoRefresh.intervalOptions, props.autoRefresh.intervalSeconds) : []));
+
+// Each dropdown is wrapped in a Tooltip so its button keeps a hover hint, but a
+// TooltipTrigger claims the popper anchor for its own popper root. Pointing the
+// menu at the button element directly keeps the surface positioned on screen.
+const autoRefreshTriggerRef = ref<HTMLElement | { $el?: HTMLElement }>();
+const exportTriggerRef = ref<HTMLElement | { $el?: HTMLElement }>();
+
+function toolbarTriggerElement(trigger: HTMLElement | { $el?: HTMLElement } | undefined): HTMLElement | undefined {
+  if (!trigger) return undefined;
+  return trigger instanceof HTMLElement ? trigger : trigger.$el;
+}
+
 const visibleActionOrder = computed<DataGridToolbarActionKey[]>(() => {
   const visibility: Record<DataGridToolbarActionKey, boolean> = {
     refresh: isDataGridToolbarCapabilityVisible(props.refresh),
     autoRefresh: isDataGridToolbarCapabilityVisible(props.autoRefresh),
-    navigation: props.navigationVisible === true,
     copyData: isDataGridToolbarCapabilityVisible(props.copyData),
     addRow: isDataGridToolbarCapabilityVisible(props.addRow),
     deleteRow: isDataGridToolbarCapabilityVisible(props.deleteRow),
@@ -98,6 +108,7 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
         <TooltipTrigger as-child>
           <DropdownMenuTrigger as-child>
             <Button
+              ref="autoRefreshTriggerRef"
               variant="ghost"
               size="sm"
               data-toolbar-action="autoRefresh"
@@ -113,7 +124,7 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
         </TooltipTrigger>
         <TooltipContent side="bottom">{{ autoRefresh?.label ?? autoRefresh?.shortLabel }}</TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" class="w-40">
+      <DropdownMenuContent :reference="toolbarTriggerElement(autoRefreshTriggerRef)" align="end" class="w-40">
         <DropdownMenuItem class="gap-2" :disabled="autoRefresh?.disabled" @select="void toggleDataGridToolbarAutoRefresh(autoRefresh)">
           <Check v-if="autoRefresh?.enabled" class="h-3.5 w-3.5" />
           <span v-else class="h-3.5 w-3.5" />
@@ -126,8 +137,6 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
-
-    <slot name="navigation" :compact="actionIsCompact('navigation')" />
 
     <div v-if="isDataGridToolbarCapabilityVisible(copyData)" class="flex h-5 shrink-0 items-stretch overflow-hidden rounded-md border border-border">
       <Tooltip>
@@ -200,7 +209,7 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
       <Tooltip>
         <TooltipTrigger as-child>
           <DropdownMenuTrigger as-child>
-            <Button data-toolbar-action="exportData" variant="ghost" size="sm" :class="actionButtonClass('exportData')" :disabled="exportData?.disabled || !exportData?.items.length">
+            <Button ref="exportTriggerRef" data-toolbar-action="exportData" variant="ghost" size="sm" :class="actionButtonClass('exportData')" :disabled="exportData?.disabled || !exportData?.items.length">
               <Upload class="data-grid-topbar-action-icon h-3 w-3" />
               <span class="data-grid-topbar-action-label" :class="actionLabelClass('exportData')">{{ exportData?.label }}</span>
             </Button>
@@ -208,7 +217,7 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
         </TooltipTrigger>
         <TooltipContent side="bottom">{{ exportData?.label }}</TooltipContent>
       </Tooltip>
-      <DropdownMenuContent align="end" class="min-w-52">
+      <DropdownMenuContent :reference="toolbarTriggerElement(exportTriggerRef)" align="end" class="min-w-52">
         <template v-for="item in exportData?.items ?? []" :key="item.value">
           <DropdownMenuSeparator v-if="item.separatorBefore" />
           <DropdownMenuItem :disabled="item.disabled" @select="void selectDataGridToolbarExportItem(exportData, item.value)">
@@ -244,6 +253,7 @@ function actionLabelClass(action: DataGridToolbarActionKey) {
           size="sm"
           :class="[...actionButtonClass('tableInfo'), tableInfo?.active ? 'bg-primary/10 text-primary hover:bg-primary/15' : '']"
           :disabled="isDataGridToolbarCapabilityDisabled(tableInfo)"
+          :aria-label="tableInfo?.tooltip ?? tableInfo?.label"
           :aria-pressed="tableInfo?.active"
           @click="void triggerDataGridToolbarAction(tableInfo)"
         >

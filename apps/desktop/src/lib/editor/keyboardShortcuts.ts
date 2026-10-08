@@ -273,6 +273,10 @@ export function isDeleteCurrentRowShortcut(event: ShortcutLikeEvent, shortcuts?:
   return matchesShortcut(event, actionShortcut("deleteCurrentRow", shortcuts));
 }
 
+export function isFocusWhereShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
+  return matchesShortcut(event, actionShortcut("focusWhere", shortcuts, platform), platform);
+}
+
 export function isGoToColumnShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
   return matchesShortcut(event, actionShortcut("goToColumn", shortcuts, platform), platform);
 }
@@ -315,6 +319,10 @@ export function isPasteSidebarSelectionShortcut(event: ShortcutLikeEvent, shortc
 
 export function isEditSidebarConnectionShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("editSidebarConnection", shortcuts));
+}
+
+export function isDisconnectSidebarConnectionShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("disconnectSidebarConnection", shortcuts));
 }
 
 export function isViewTableDdlShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
@@ -374,4 +382,10 @@ export function isBrowserReloadShortcut(event: ShortcutLikeEvent): boolean {
   const key = normalizeKey(event.key);
   if (key === "F5") return true;
   return key === "r" && (!!event.metaKey || !!event.ctrlKey);
+}
+
+export function isBrowserTaskManagerShortcut(event: ShortcutLikeEvent): boolean {
+  if (event.isComposing || event.altKey || event.ctrlKey || event.metaKey) return false;
+  if (!event.shiftKey) return false;
+  return event.key === "Escape" || event.key === "Esc" || event.code === "Escape";
 }

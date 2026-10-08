@@ -1,11 +1,12 @@
 // @vitest-environment happy-dom
 
-import { createApp, defineComponent, h, markRaw, nextTick, type App, type PropType } from "vue";
+import { createApp, defineComponent, h, markRaw, nextTick, ref, type App, type PropType } from "vue";
 import { createPinia, setActivePinia } from "pinia";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import type { QueryResult } from "@/types/database";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import type { DataGridToolbarActionCapability } from "@/lib/dataGrid/dataGridToolbar";
 
 vi.mock("@/composables/useDataGridColumnResize", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/composables/useDataGridColumnResize")>();
@@ -85,6 +86,11 @@ function mountToolbar() {
         onToggle: vi.fn(),
         onSelectInterval: vi.fn(),
       },
+      exportData: {
+        label: "Export",
+        items: [{ value: "csv", label: "CSV" }],
+        onSelect: vi.fn(),
+      },
     }),
   );
 }
@@ -98,16 +104,17 @@ function mountGrid() {
     shortcuts: { ...settingsStore.editorSettings.shortcuts, goToColumn: "Mod+G" },
   });
   const result = markRaw<QueryResult>({
-    columns: ["id"],
-    rows: [[1]],
+    columns: ["id", "name"],
+    rows: [[1, "Ada"]],
     affected_rows: 0,
     execution_time_ms: 0,
   });
+  const grid = ref<{ goToColumnToolbarCapability: DataGridToolbarActionCapability }>();
   const host = document.createElement("div");
   document.body.append(host);
   const Root = defineComponent({
     setup() {
-      return () => h(TooltipProvider, { delayDuration: 0 }, { default: () => h(DataGrid, { result, databaseType: "mysql", context: "table-data" }) });
+      return () => h(TooltipProvider, { delayDuration: 0 }, { default: () => h(DataGrid, { ref: grid, result, databaseType: "mysql", context: "table-data" }) });
     },
   });
   const app = createApp(Root);
@@ -117,7 +124,7 @@ function mountGrid() {
   app.mount(host);
   const mounted = { app, host };
   mountedApps.push(mounted);
-  return mounted;
+  return { ...mounted, grid };
 }
 
 async function settle() {
@@ -145,6 +152,21 @@ function showsTooltip(text: string): boolean {
 async function hover(element: HTMLElement) {
   element.dispatchEvent(new PointerEvent("pointermove", { bubbles: true, cancelable: true, pointerType: "mouse" }));
   await settle();
+}
+
+async function click(element: HTMLElement) {
+  element.click();
+  await settle();
+}
+
+function expectPositionedSurface(contentType: string) {
+  const content = document.querySelector<HTMLElement>(`[data-slot="${contentType}"]`);
+  if (!content) throw new Error(`No ${contentType} surface was rendered`);
+  const wrapper = content.parentElement;
+  if (!wrapper) throw new Error(`No ${contentType} popper wrapper was rendered`);
+  // Reka parks an unpositioned surface at `translate(0, -200%)`, which puts every
+  // menu and popover above the viewport.
+  expect(wrapper.style.transform).toMatch(/^translate\(-?[\d.]+px, -?[\d.]+px\)$/);
 }
 
 afterEach(() => {
@@ -177,13 +199,53 @@ describe("data grid icon-only toolbar tooltips", () => {
     expect(showsTooltip("Auto-refresh results")).toBe(true);
   });
 
-  it("shows a tooltip for the go to column control", async () => {
-    const { host } = mountGrid();
+  it("opens the column lookup side panel through its toolbar capability", async () => {
+    const { host, grid } = mountGrid();
     await settle();
 
-    const button = toolbarButton(host, "navigation");
-    await hover(button);
+    expect(grid.value?.goToColumnToolbarCapability.visible).toBe(true);
+    expect(grid.value?.goToColumnToolbarCapability.label).toBe("Go to column");
 
-    expect(showsTooltip("Go to column")).toBe(true);
+    await grid.value!.goToColumnToolbarCapability.onTrigger();
+    await settle();
+
+    expect(host.querySelector("[data-column-lookup-panel]")).not.toBeNull();
+    expect(host.querySelector('[data-slot="popover-content"]')).toBeNull();
+  });
+});
+
+// Reka resolves the popper anchor from the nearest popper root. Wrapping an overlay
+// trigger in TooltipTrigger handed the anchor to the tooltip root instead, so the
+// menu/popover still opened but kept the unpositioned `translate(0, -200%)`
+// fallback and every toolbar click looked like a no-op.
+describe("data grid toolbar overlay surfaces anchor to their trigger", () => {
+  it("positions the auto refresh menu after a click", async () => {
+    const { host } = mountToolbar();
+    await settle();
+
+    await click(toolbarButton(host, "autoRefresh"));
+
+    expectPositionedSurface("dropdown-menu-content");
+  });
+
+  it("positions the export menu after a click", async () => {
+    const { host } = mountToolbar();
+    await settle();
+
+    await click(toolbarButton(host, "exportData"));
+
+    expectPositionedSurface("dropdown-menu-content");
+  });
+
+  it("keeps the column lookup surface in the grid side panel", async () => {
+    const { host, grid } = mountGrid();
+    await settle();
+
+    await grid.value!.goToColumnToolbarCapability.onTrigger();
+    await settle();
+
+    const panel = host.querySelector<HTMLElement>("[data-column-lookup-panel]");
+    expect(panel).not.toBeNull();
+    expect(panel?.querySelector('input[placeholder="Search column/comment..."]')).not.toBeNull();
   });
 });

@@ -4,6 +4,7 @@
 // is shared by every PluginWorkbenchHost instance, so only the first boot of a
 // plugin version pays the read/decode/inline pipeline.
 import * as api from "@/lib/backend/api";
+import { COMPONENT_PLUGINS_UPDATED_EVENT } from "@/lib/updates/componentUpdateEvents";
 
 export interface PluginUiHtml {
   html: string;
@@ -11,12 +12,15 @@ export interface PluginUiHtml {
   /** Final sandbox document (html + CSP/SDK/theme injection); built lazily once
    * per plugin version — regenerating it re-runs megabyte-scale string surgery
    * on every panel/tab boot. The embedded appearance only affects the pre-init
-   * first paint; the init message pushes the live theme right after. */
-  sandboxDoc?: string;
+   * first paint; the init message pushes the live theme right after. Carries the
+   * `unsafe-eval` grant it was built with: that grant is a user setting that can
+   * flip while the html stays valid, and it changes the CSP. */
+  sandboxDoc?: { allowUnsafeEval: boolean; doc: string };
 }
 
 const cache = new Map<string, PluginUiHtml>();
 const LIMIT = 4;
+let cacheGeneration = 0;
 
 export function getCachedPluginUiHtml(key: string): PluginUiHtml | undefined {
   const hit = cache.get(key);
@@ -36,6 +40,7 @@ export function setCachedPluginUiHtml(key: string, value: PluginUiHtml): void {
 
 /** Test and plugin-uninstall escape hatch. */
 export function clearPluginUiHtmlCache(): void {
+  cacheGeneration++;
   cache.clear();
   inFlight.clear();
 }
@@ -94,6 +99,17 @@ async function inlineLocalUiAssets(html: string, pluginId: string): Promise<Plug
       resource.replaceWith(script);
     } else {
       const style = document.createElement("style");
+      // Carry the stylesheet's own attributes over, exactly like the script
+      // branch does: they are how a plugin addresses the sheet later (a theme or
+      // skin switch selects sheets by a data-* marker and toggles `disabled`),
+      // so dropping them here silently breaks every runtime stylesheet lookup in
+      // plugin form. Note that `disabled` does not reflect from the content
+      // attribute on a <style> element the way it does on a <link>, and it cannot
+      // survive serialization as an IDL property either — a plugin that ships a
+      // disabled stylesheet has to re-apply `sheet.disabled` itself.
+      for (const attribute of [...resource.attributes]) {
+        if (attribute.name !== "href" && attribute.name !== "rel") style.setAttribute(attribute.name, attribute.value);
+      }
       style.textContent = content;
       resource.replaceWith(style);
     }
@@ -125,15 +141,30 @@ export function getOrLoadPluginUiHtml(key: string, pluginId: string): Promise<Pl
   if (hit) return Promise.resolve(hit);
   let load = inFlight.get(key);
   if (!load) {
+    const generation = cacheGeneration;
     load = loadPluginUiHtml(pluginId)
       .then((value) => {
-        setCachedPluginUiHtml(key, value);
+        // A plugin change may arrive while its old UI document is still being
+        // read. Do not let that pre-invalidation request repopulate the cache.
+        if (cacheGeneration === generation) setCachedPluginUiHtml(key, value);
         return value;
       })
       .finally(() => {
-        inFlight.delete(key);
+        // A post-invalidation load may already own this key.
+        if (cacheGeneration === generation) inFlight.delete(key);
       });
     inFlight.set(key, load);
   }
   return load;
+}
+
+// The plugin set can change from entry points other than the plugin center (the update center
+// dispatches COMPONENT_PLUGINS_UPDATED_EVENT from App.vue while the center is closed; batch
+// uninstall dispatches only dbx:plugins-changed), and a same-version reinstall reuses the
+// id:version key. Invalidate on both events here, at the cache owner — the same contract the
+// icon resolver follows — so workbench tabs opened after an install/update/uninstall read the
+// new ui build instead of the stale inlined bytes.
+if (typeof window !== "undefined") {
+  window.addEventListener(COMPONENT_PLUGINS_UPDATED_EVENT, clearPluginUiHtmlCache);
+  window.addEventListener("dbx:plugins-changed", clearPluginUiHtmlCache);
 }

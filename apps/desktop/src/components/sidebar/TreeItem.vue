@@ -56,7 +56,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
 import type { ColumnInfo, ConnectionConfig, CustomTypeTreeMemberMeta, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
-import { alignedCommentLeadingWidth, canTreeNodePin, canTreeNodeShowExpander, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
+import { alignedCommentLeadingWidth, canTreeNodePin, canTreeNodeShowExpander, isSidebarCommentSupportedType, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
 import {
   clearActiveTableReferencePayload,
   createColumnReferencePayload,
@@ -639,7 +639,7 @@ const detailTooltip = computed(() => {
   }
   const column = node.type === "column" ? (node.meta as ColumnInfo | undefined) : undefined;
   const comment = column && "comment" in column ? column.comment : node.comment;
-  if ((!comment && !column) || (node.type !== "schema" && node.type !== "table" && node.type !== "view" && node.type !== "column")) return null;
+  if ((!comment && !column) || !isSidebarCommentSupportedType(node.type)) return null;
   const rows: DetailTooltipRow[] = [
     { label: t("connection.name"), value: visibleLabel(node) },
     ...(column ? [{ label: t("structureEditor.nullable"), value: t(column.is_nullable ? "structureEditor.nullable" : "structureEditor.notNull") }] : []),
@@ -968,9 +968,9 @@ const tableSearchValue = computed(() => {
 
 const isConnecting = computed(() => activeNode.value.type === "connection" && !!activeNode.value.connectionId && connectionStore.connectingIds.has(activeNode.value.connectionId));
 
-// Navicat-style activation cue: the connection icon itself is full color when
-// connected and grayed out when not, complementing the trailing green dot.
-const connectionIconInactiveClass = computed(() => (activeNode.value.type === "connection" && activeNode.value.connectionId && !connectionStore.connectedIds.has(activeNode.value.connectionId) ? "grayscale opacity-45" : ""));
+// Keep disconnected connections visually subdued without stripping their
+// database colors entirely; the trailing green dot still marks active ones.
+const connectionIconInactiveClass = computed(() => (activeNode.value.type === "connection" && activeNode.value.connectionId && !connectionStore.connectedIds.has(activeNode.value.connectionId) ? "saturate-50 opacity-70" : ""));
 
 const isConnectionReadonly = computed(() => activeNode.value.type === "connection" && !!activeNode.value.connectionId && (connectionStore.getConfig(activeNode.value.connectionId)?.read_only ?? false));
 
@@ -1200,7 +1200,7 @@ function pinnedSortKey(): string {
 }
 
 function canDragPinnedOrder(): boolean {
-  return isPinned.value && !isNodeDefaultDatabase.value && !props.reorderDisabled;
+  return isPinned.value && !(isNodeDefaultDatabase.value && settingsStore.editorSettings.sidebarPinDefaultDatabase) && !props.reorderDisabled;
 }
 
 const {

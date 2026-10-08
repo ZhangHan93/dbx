@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   eventToModifierOnlyShortcut,
   eventToShortcut,
+  isBrowserTaskManagerShortcut,
   isConvertNamingStyleShortcut,
   isEditTableStructureShortcut,
   isExecuteSqlInNewResultTabShortcut,
   isGoToColumnShortcut,
+  isFocusWhereShortcut,
   isGoToFirstPageShortcut,
   isGoToLastPageShortcut,
   isGoToNextPageShortcut,
@@ -20,6 +22,14 @@ import { formatShortcutDisplay, isMacShortcutPlatform } from "@/lib/editor/short
 import { shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
 
 describe("keyboard shortcut matching", () => {
+  it("matches configured WHERE focus on macOS and Windows while respecting a cleared binding", () => {
+    expect(isFocusWhereShortcut({ key: "L", metaKey: true, shiftKey: true }, { focusWhere: "Mod+Shift+L" }, "MacIntel")).toBe(true);
+    expect(isFocusWhereShortcut({ key: "L", ctrlKey: true, shiftKey: true }, { focusWhere: "Mod+Shift+L" }, "Win32")).toBe(true);
+    expect(isFocusWhereShortcut({ key: "L", ctrlKey: true, shiftKey: true }, { focusWhere: "" }, "Win32")).toBe(false);
+    expect(isFocusWhereShortcut({ key: "L", ctrlKey: true, shiftKey: true }, undefined, "Win32")).toBe(false);
+    expect(isFocusWhereShortcut({ key: "L", metaKey: true, shiftKey: true }, undefined, "MacIntel")).toBe(false);
+  });
+
   it("records modifier-only mouse shortcut settings", () => {
     expect(eventToModifierOnlyShortcut({ key: "Alt", altKey: true })).toBe("Alt");
     expect(eventToModifierOnlyShortcut({ key: "Shift", shiftKey: true })).toBe("Shift");
@@ -253,5 +263,21 @@ describe("tabSwitcherDirectionFromShortcut", () => {
   it("honors a remapped shortcut and does not reverse when it already uses Shift", () => {
     expect(tabSwitcherDirectionFromShortcut({ key: "Tab", ctrlKey: true, shiftKey: true }, { tabSwitcher: "Shift+Ctrl+Tab" })).toBe(1);
     expect(tabSwitcherDirectionFromShortcut({ key: "Tab", ctrlKey: true }, { tabSwitcher: "Shift+Ctrl+Tab" })).toBeNull();
+  });
+});
+
+describe("isBrowserTaskManagerShortcut", () => {
+  it("matches Shift+Escape combinations and rejects regular Escape or extra modifiers", () => {
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true })).toBe(true);
+    expect(isBrowserTaskManagerShortcut({ key: "Esc", shiftKey: true })).toBe(true);
+    expect(isBrowserTaskManagerShortcut({ code: "Escape", shiftKey: true, key: "Unidentified" })).toBe(true);
+
+    expect(isBrowserTaskManagerShortcut({ key: "Escape" })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: false })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, ctrlKey: true })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, metaKey: true })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, altKey: true })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "Escape", shiftKey: true, isComposing: true })).toBe(false);
+    expect(isBrowserTaskManagerShortcut({ key: "x", shiftKey: true })).toBe(false);
   });
 });

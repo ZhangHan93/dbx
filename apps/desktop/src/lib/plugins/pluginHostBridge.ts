@@ -1,4 +1,5 @@
-import type { PluginAiProvider, PluginAiModel, PluginAiGenerateRequest } from "./pluginAiCompletion";
+import { PLUGIN_AI_TASKS } from "./pluginAiCompletion";
+import type { PluginAiProvider, PluginAiModel, PluginAiGenerateRequest, PluginAiStreamRequest, PluginAiStreamChunkEvent, PluginAiTask } from "./pluginAiCompletion";
 import type { InstalledPlugin, PluginBinaryEvent, PluginEvent, PluginUiAssetPayload, PluginUiContribution } from "@/types/database";
 import { clonePluginData, snapshotPluginWorkbenchContext } from "./pluginData";
 import { MAX_PLUGIN_PLAN_SQL_CHARS, MAX_PLUGIN_PLAN_TIMEOUT_MS, PLUGIN_PLAN_PERMISSION, type PluginPlanCapabilities, type PluginPlanRequest, type PluginPlanResult } from "@/types/pluginPlan";
@@ -7,6 +8,8 @@ import { isValidPluginAiRecommendationTemplate, resolvePluginAiRecommendationUpd
 import type { PluginAiRecommendation } from "@/types/pluginAiRecommendations";
 import { MAX_PLUGIN_SCHEMA_METADATA_NAME_CHARS, PLUGIN_SCHEMA_METADATA_CAPABILITY, PLUGIN_SCHEMA_METADATA_PERMISSION, type PluginTableContext, type PluginTableMetadata } from "@/types/pluginSchemaMetadata";
 import { MAX_PLUGIN_DATA_MAX_ROWS, MAX_PLUGIN_DATA_NAME_CHARS, MAX_PLUGIN_DATA_SQL_CHARS, MAX_PLUGIN_DATA_TIMEOUT_MS, PLUGIN_DATA_ACCESS_NOT_GRANTED, PLUGIN_DATA_CAPABILITY, PLUGIN_DATA_READ_PERMISSION, type PluginDataQueryRequest, type PluginDataQueryResult } from "@/types/pluginData";
+import { floatingWindowLabel } from "@/lib/app/windowContext";
+import { parseFloatingWindowRequest, type FloatingRect, type OpenFloatingWindowRequest, type OpenFloatingWindowResult } from "@/lib/plugins/pluginFloatingWindow";
 
 const PLUGIN_MESSAGE_SOURCE = "dbx-plugin";
 const HOST_MESSAGE_SOURCE = "dbx-host";
@@ -120,6 +123,8 @@ export interface PluginFileHandleMeta {
   name: string;
   size: number;
   contentType: string;
+  /** Only for files expanded out of a dropped folder: '/'-separated path relative to the dropped folder root, so the plugin can rebuild the dragged tree. */
+  relativePath?: string;
 }
 
 export interface PluginPickFilesOptions {
@@ -159,9 +164,30 @@ export interface PluginHostBridgeApi {
   listAiModels?(): Promise<PluginAiModel[]>;
   /** Must obtain trusted host consent for every send; never return provider errors or credentials. */
   generateAiText?(pluginName: string, input: PluginAiGenerateRequest): Promise<string>;
+  /**
+   * E1 incremental generation: chunks ride `host.ai.generationChunk` events
+   * scoped to the request's requestId (the same pattern as
+   * `host.download.progress`); the promise resolves with the full text once
+   * the stream completes. Must go through the same host consent as the plain
+   * call.
+   */
+  generateAiTextStream?(pluginName: string, request: PluginAiStreamRequest, onChunk: (chunk: PluginAiStreamChunkEvent) => void): Promise<string>;
+  /** Cancels one active streamed generation of THIS bridge by requestId. */
+  cancelAiGeneration?(requestId: string): Promise<boolean>;
   openAiConversation?(request: AiPluginConversationRequest): Promise<void>;
   setAiRecommendations?(update: PluginAiRecommendationHostUpdate): void;
-  openWorkbench?(pluginId: string, contributionId: string, context?: PluginWorkbenchContext, options?: { forceNew?: boolean }): Promise<void> | void;
+  openWorkbench?(pluginId: string, contributionId: string, context?: PluginWorkbenchContext, options?: { forceNew?: boolean; target?: "tab" }): Promise<void> | void;
+  /**
+   * §4/§5 command execution asked from a plugin webview: the same registry
+   * path as menu execution — enablement (§5.4), §4.1 singleton reuse,
+   * host-authored context — scoped to the calling plugin's own declared
+   * commands. The optional context merges over the command-declared context
+   * (caller wins; reserved identity fields are host-owned) and feeds
+   * `instance_key` `{{path}}` placeholders, so per-connection instances are
+   * one `logs:{{connectionId}}` declaration away. Resolves `{ error }` for
+   * expected business outcomes; only bridge or permission failures reject.
+   */
+  executeCommand?(pluginId: string, commandId: string, context?: Record<string, unknown>): Promise<{ error?: string } | null | void> | { error?: string } | null | void;
   openFilesystem?(pluginId: string, providerId: string, context?: PluginWorkbenchContext): Promise<void> | void;
   /** Explicit user-triggered reconnect of an owned plugin connection (full flow, interactive password prompt allowed). */
   reopenConnection?(pluginId: string, connectionId: string): Promise<void>;
@@ -201,6 +227,27 @@ export interface PluginHostBridgeApi {
   /** Persists the grant the user just allowed. */
   grantDataAccess?(pluginId: string, connectionId: string): Promise<void>;
   closeTab?(): Promise<void> | void;
+  /**
+   * Floating plugin windows (the §8.3 "window" surface): a frameless,
+   * always-on-top desktop widget outside the main shell. Desktop hosts only — a
+   * host without it omits these so `capabilities.floating` stays false and the
+   * plugin can fall back to an in-shell surface (tab or dock).
+   *
+   * Geometry is host-owned end to end: the plugin asks to open/close its window
+   * and reports drag intent, while positions, work-area snapping, and DPI
+   * conversion stay here. A drag is driven by the native cursor position rather
+   * than plugin-supplied coordinates, which would be relative to a viewport that
+   * is itself moving.
+   */
+  openFloatingWindow?(request: OpenFloatingWindowRequest): Promise<OpenFloatingWindowResult>;
+  /** Closes floating windows by host label; callers derive labels from their own manifest, never from plugin input. */
+  closeFloatingWindows?(labels: string[]): Promise<void>;
+  /** Hands the calling floating window's movement to the OS drag loop. */
+  beginFloatingDrag?(): Promise<void>;
+  /** Ends a drag, snapping the window onto the work-area edges it landed near. Resolves the final physical rect. */
+  endFloatingDrag?(snap: boolean): Promise<FloatingRect | null>;
+  /** Resizes the calling floating window (logical pixels). */
+  setFloatingSize?(width: number, height: number): Promise<void>;
   /** Persist plugin bytes through the host's native save dialog. Resolves null when the user cancels. */
   saveFile?(pluginId: string, request: PluginSaveFileRequest, data: Uint8Array): Promise<PluginSaveFileResult | null>;
   downloadFile?(pluginId: string, request: PluginDownloadRequest, onProgress: (progress: unknown) => void): Promise<PluginSaveFileResult | null>;
@@ -239,6 +286,8 @@ export interface PluginHostBridgeApi {
   finishFileSave?(pluginId: string, handleId: string): Promise<void>;
   /** Close any file handle, discarding unsaved state. */
   closeFileHandle?(pluginId: string, handleId: string): Promise<void>;
+  /** Whether this host receives OS file drops on the plugin's behalf (desktop only). */
+  receiveOsDrops?: boolean;
   /** Persistent per-plugin key-value storage for sandboxed UIs; resolves null when the key is unset. */
   storageGet?(pluginId: string, key: string): Promise<unknown>;
   storageSet?(pluginId: string, key: string, value: unknown): Promise<void>;
@@ -284,6 +333,8 @@ export class PluginHostBridge {
   private pendingDataAccess = new Map<string, Promise<void>>();
   private inFlightDataQueries = 0;
   private runtimeAiRecommendations: PluginAiRecommendationUpdate | null | undefined;
+  /** Active streamed AI generations of this bridge, by plugin-supplied requestId. */
+  private activeAiStreams = new Set<string>();
 
   /** Bounded audit trail of this session's clipboard read attempts (oldest first). */
   get clipboardAudit(): readonly PluginClipboardAuditEntry[] {
@@ -378,6 +429,10 @@ export class PluginHostBridge {
     this.disposed = true;
     for (const downloadId of this.downloads) void this.api.cancelDownload?.(this.plugin.manifest.id, downloadId).catch(() => undefined);
     this.downloads.clear();
+    // Best-effort: a torn-down workbench must not keep a provider stream
+    // running with nobody to receive its chunks.
+    for (const requestId of this.activeAiStreams) void this.api.cancelAiGeneration?.(requestId).catch(() => undefined);
+    this.activeAiStreams.clear();
     for (const token of this.mediaTokens) void this.api.closeMedia?.(this.plugin.manifest.id, token).catch(() => undefined);
     this.mediaTokens.clear();
     this.publishAiRecommendations({ context: {}, items: [] });
@@ -442,6 +497,9 @@ export class PluginHostBridge {
         ai: !!this.api.openAiConversation,
         aiModelDiscovery: !!this.api.listAiProviders && !!this.api.discoverAiModels,
         aiCompletion: !!this.api.listAiModels && !!this.api.generateAiText,
+        // Streaming generation goes together with per-request cancellation;
+        // advertising both or neither keeps the capability honest.
+        aiCompletionStream: !!this.api.generateAiTextStream && !!this.api.cancelAiGeneration,
         aiRecommendations: !!this.api.openAiConversation && !!this.api.setAiRecommendations,
         // Additive with the same "absence means unsupported" contract: an older
         // host omits these, and a web host has neither.
@@ -449,6 +507,19 @@ export class PluginHostBridge {
         clipboardRead: !!this.api.clipboardRead,
         clipboardImageRead: !!this.api.clipboardReadImage,
         mediaUrl: !!this.api.openMedia && !!this.api.closeMedia,
+        // Floating desktop widget windows: advertised only when the host can both
+        // open a window and drive its geometry, so a plugin sees one honest flag.
+        floating: !!this.api.openFloatingWindow && !!this.api.beginFloatingDrag && !!this.api.endFloatingDrag,
+        // The namespace exists on both hosts, but what it can DO differs:
+        // portable plugins gate on these flags instead of probing calls.
+        fileTransfer: {
+          pick: !!this.api.pickFiles,
+          beginSave: !!this.api.beginFileSave && !!this.api.writeFileChunk && !!this.api.finishFileSave,
+          read: !!this.api.readFileChunk,
+          // OS drops (and their folder expansion) are desktop-only.
+          drop: !!this.api.receiveOsDrops,
+          folderExpansion: !!this.api.receiveOsDrops,
+        },
       },
       context: snapshotPluginWorkbenchContext(this.context),
     });
@@ -528,8 +599,8 @@ export class PluginHostBridge {
   }
 
   /** Hand the plugin already-opened handles for files dropped onto its workbench. */
-  forwardFileDrop(files: PluginFileHandleMeta[]): void {
-    this.post({ source: HOST_MESSAGE_SOURCE, version: BRIDGE_VERSION, type: "filedrop", files });
+  forwardFileDrop(files: PluginFileHandleMeta[], drop?: { dropId?: string; truncated?: boolean }): void {
+    this.post({ source: HOST_MESSAGE_SOURCE, version: BRIDGE_VERSION, type: "filedrop", files, dropId: drop?.dropId, truncated: drop?.truncated === true });
   }
 
   private async handleRequest(request: PluginRequestMessage, target: Window): Promise<void> {
@@ -590,7 +661,47 @@ export class PluginHostBridge {
       for (const key of ["configId", "model", "prompt"] as const) {
         if (typeof input[key] !== "string" || !input[key].trim() || input[key].length > (key === "prompt" ? 100000 : 256)) throw new Error("Invalid AI " + key);
       }
-      return this.api.generateAiText(this.plugin.manifest.name, { configId: input.configId as string, model: input.model as string, prompt: input.prompt as string });
+      // Task presets are a closed host-owned enum: a plugin picks a template,
+      // it never writes system text. Unknown values fail loudly.
+      const task = input.task === undefined || input.task === null ? undefined : requirePluginAiTask(input.task);
+      return this.api.generateAiText(this.plugin.manifest.name, { configId: input.configId as string, model: input.model as string, prompt: input.prompt as string, ...(task === undefined ? {} : { task }) });
+    }
+    if (method === "host.ai.generateTextStream") {
+      this.requirePermission("host.ai");
+      // Same conjunction the aiCompletionStream capability advertises: a host
+      // that cannot cancel does not stream.
+      if (!this.api.generateAiTextStream || !this.api.cancelAiGeneration) throw new Error("DBX AI text generation streaming is unavailable");
+      const input = requireRecord(params, "AI generation request");
+      for (const key of ["configId", "model", "prompt"] as const) {
+        if (typeof input[key] !== "string" || !input[key].trim() || input[key].length > (key === "prompt" ? 100000 : 256)) throw new Error("Invalid AI " + key);
+      }
+      const requestId = requireProtocolName(input.requestId, "AI requestId");
+      if (this.activeAiStreams.has(requestId)) throw new Error("Duplicate AI requestId");
+      const task = input.task === undefined || input.task === null ? undefined : requirePluginAiTask(input.task);
+      this.activeAiStreams.add(requestId);
+      try {
+        // Same event channel as host.download.progress: incremental chunks are
+        // delivered as host.ai.generationChunk events that plugins filter by
+        // requestId; the call itself resolves with the full text.
+        return await this.api.generateAiTextStream(this.plugin.manifest.name, { configId: input.configId as string, model: input.model as string, prompt: input.prompt as string, requestId, ...(task === undefined ? {} : { task }) }, (chunk) => {
+          if (!this.activeAiStreams.has(requestId)) return;
+          this.post({ source: HOST_MESSAGE_SOURCE, version: BRIDGE_VERSION, type: "event", method: "host.ai.generationChunk", params: { requestId, delta: chunk.delta, done: chunk.done === true } });
+        });
+      } finally {
+        this.activeAiStreams.delete(requestId);
+      }
+    }
+    if (method === "host.ai.cancelGeneration") {
+      const input = requireRecord(params, "AI cancel request");
+      const requestId = requireProtocolName(input.requestId, "AI requestId");
+      // Scoped like host.cancelDownload: a workbench may only cancel the
+      // streams it started. Unknown or finished ids answer { cancelled: false }.
+      if (!this.activeAiStreams.has(requestId) || !this.api.cancelAiGeneration) return { cancelled: false };
+      const cancelled = (await this.api.cancelAiGeneration(requestId)) === true;
+      // A confirmed cancel also stops chunk forwarding immediately; the
+      // stream's own settle path becomes a no-op delete.
+      if (cancelled) this.activeAiStreams.delete(requestId);
+      return { cancelled };
     }
     if (method === "host.ai.openConversation") {
       this.requirePermission("host.ai");
@@ -660,8 +771,18 @@ export class PluginHostBridge {
       this.requirePermission("host.workbench");
       if (!this.api.openWorkbench) throw new Error("Host workbench navigation is unavailable");
       const input = requireRecord(params, "host.openWorkbench params");
-      await this.api.openWorkbench(this.plugin.manifest.id, requireProtocolName(input.contributionId, "workbench contribution"), isRecord(input.context) ? input.context : undefined, { forceNew: input.forceNew === true });
+      // `target: "tab"` lets a dock-hosted webview ask for a main-workbench
+      // tab instead of another dock entry (e.g. the SSH dock's "open session
+      // in tab" button). Surfaces that ignore it keep the old behavior, so
+      // older handlers stay compatible.
+      await this.api.openWorkbench(this.plugin.manifest.id, requireProtocolName(input.contributionId, "workbench contribution"), isRecord(input.context) ? input.context : undefined, { forceNew: input.forceNew === true, target: input.target === "tab" ? "tab" : undefined });
       return null;
+    }
+    if (method === "host.executeCommand") {
+      this.requirePermission("host.workbench");
+      if (!this.api.executeCommand) throw new Error("Host command execution is unavailable");
+      const input = requireRecord(params, "host.executeCommand params");
+      return (await this.api.executeCommand(this.plugin.manifest.id, requireProtocolName(input.commandId, "command id"), isRecord(input.context) ? input.context : undefined)) ?? {};
     }
     if (method === "host.reopenConnection") {
       if (!this.api.reopenConnection) throw new Error("Connection reopen is unavailable");
@@ -838,7 +959,52 @@ export class PluginHostBridge {
       await this.api.storageDelete(this.plugin.manifest.id, requireStorageKey(input.key));
       return null;
     }
+    if (method === "host.openFloating") {
+      // A floating window is a workbench surface in its own right, so it shares
+      // the workbench permission gate instead of introducing a new one.
+      this.requirePermission("host.workbench");
+      if (!this.api.openFloatingWindow) throw new Error("Floating plugin windows require the desktop host");
+      const request = parseFloatingWindowRequest(this.plugin.manifest.id, requireRecord(params, "host.openFloating params"));
+      if (!this.ownWorkbenchContributionIds().has(request.contributionId)) throw new Error("Unknown workbench contribution");
+      return this.api.openFloatingWindow(request);
+    }
+    if (method === "host.closeFloating") {
+      if (!this.api.closeFloatingWindows) throw new Error("Floating plugin windows require the desktop host");
+      const input = isRecord(params) ? params : {};
+      const contributionId = optionalTrimmedString(input.contributionId);
+      const own = this.ownWorkbenchContributionIds();
+      if (contributionId && !own.has(contributionId)) throw new Error("Unknown workbench contribution");
+      // Without an explicit contribution every floating window of this plugin
+      // closes; labels are host-derived, so a plugin can never reach another
+      // plugin's window (or the main shell) through this path.
+      const contributionIds = contributionId ? [contributionId] : [...own];
+      await this.api.closeFloatingWindows(contributionIds.map((id) => floatingWindowLabel(this.plugin.manifest.id, id)));
+      return null;
+    }
+    if (method === "host.beginFloatingDrag") {
+      if (!this.api.beginFloatingDrag) throw new Error("Floating plugin windows require the desktop host");
+      await this.api.beginFloatingDrag();
+      return null;
+    }
+    if (method === "host.endFloatingDrag") {
+      if (!this.api.endFloatingDrag) throw new Error("Floating plugin windows require the desktop host");
+      const input = isRecord(params) ? params : {};
+      return (await this.api.endFloatingDrag(input.snap !== false)) ?? null;
+    }
+    if (method === "host.setFloatingSize") {
+      if (!this.api.setFloatingSize) throw new Error("Floating plugin windows require the desktop host");
+      const input = requireRecord(params, "host.setFloatingSize params");
+      const width = requireFloatingDimension(input.width, "width");
+      const height = requireFloatingDimension(input.height, "height");
+      await this.api.setFloatingSize(width, height);
+      return null;
+    }
     throw new Error(`Unsupported plugin host method '${method}'`);
+  }
+
+  /** The plugin's own declared workbench contributions — the only ones it may host in a floating window. */
+  private ownWorkbenchContributionIds(): Set<string> {
+    return new Set((this.plugin.manifest.contributions || []).filter((candidate) => candidate.type === "workbench").map((candidate) => candidate.id));
   }
 
   private async requireClipboardRead(): Promise<number> {
@@ -931,13 +1097,21 @@ export interface PluginSandboxOptions {
    * hosts without the plugin asset protocol (the web host).
    */
   baseUrl?: string;
+  /**
+   * Adds `'unsafe-eval'` to `script-src`. WebGL graphics engines codegen their
+   * uniform sync with `new Function` and refuse to initialize without it, so
+   * the user grants this per plugin (see `pluginGraphicsEngine.ts`). Off by
+   * default: the sandbox stays eval-free for every other plugin.
+   */
+  allowUnsafeEval?: boolean;
 }
 
 export function pluginSandboxDocument(html: string, permissions?: readonly string[], theme?: PluginBridgeTheme, options?: PluginSandboxOptions): string {
   const networkOrigins = pluginNetworkOrigins(permissions);
   const connectSrc = networkOrigins.length > 0 ? `connect-src ${networkOrigins.join(" ")};` : "connect-src 'none';";
   const assetSource = pluginAssetCspSource(options?.baseUrl);
-  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline' blob:${assetSource}; style-src 'unsafe-inline' blob:; img-src data: blob:${assetSource}; font-src data: blob:${assetSource}; ${connectSrc} media-src data: blob:${assetSource};">`;
+  const scriptSrc = options?.allowUnsafeEval ? "script-src 'unsafe-inline' 'unsafe-eval'" : "script-src 'unsafe-inline'";
+  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; ${scriptSrc} blob:${assetSource}; style-src 'unsafe-inline' blob:; img-src data: blob:${assetSource}; font-src data: blob:${assetSource}; ${connectSrc} media-src data: blob:${assetSource};">`;
   // <base> must precede every relative URL the document resolves (inlined CSS
   // url(), dynamic import specifiers), so it leads the injection.
   const base = options?.baseUrl && assetSource ? `<base href="${escapeHtmlAttribute(options.baseUrl)}">` : "";
@@ -1191,6 +1365,13 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
         discoverModels: (configId) => request('host.ai.discoverModels', {configId}),
         listModels: () => request('host.ai.listModels'),
         generateText: (options) => request('host.ai.generateText', options),
+        // E1 streaming: chunk events arrive as host.ai.generationChunk, filter
+        // them by options.requestId via onEvent; the promise resolves with the
+        // full text when the stream finishes. Gate on capabilities.aiCompletionStream.
+        generateTextStream: (options) => request('host.ai.generateTextStream', options),
+        // Cancels one active streamed generation by its requestId; resolves
+        // { cancelled: boolean } and only ever touches this workbench's streams.
+        cancelGeneration: (requestId) => request('host.ai.cancelGeneration', { requestId }),
         openConversation: (options) => request('host.ai.openConversation', options),
         setRecommendations: (update) => request('host.ai.setRecommendations', update),
         clearRecommendations: () => request('host.ai.clearRecommendations'),
@@ -1208,7 +1389,39 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
         const asset = await request('ui.readAsset', { path });
         return URL.createObjectURL(new Blob([decode(asset.dataBase64)], { type: asset.contentType }));
       },
-      openWorkbench: (contributionId, childContext, options) => request('host.openWorkbench', { contributionId, context: childContext, forceNew: !!(options && options.forceNew) }),
+      openWorkbench: (contributionId, childContext, options) => request('host.openWorkbench', { contributionId, context: childContext, forceNew: !!(options && options.forceNew), target: options && options.target === "tab" ? "tab" : undefined }),
+      // Closes whatever surface hosts this plugin UI — a workbench tab, a dock
+      // entry, or this plugin's floating window. Same path as the Ctrl+W
+      // shortcut, so a plugin can offer its own close/minimize affordance.
+      closeWorkbench: () => parent.postMessage({ source: '${PLUGIN_MESSAGE_SOURCE}', version: ${BRIDGE_VERSION}, type: 'shortcut', shortcut: 'closeTab' }, '*'),
+      // Floating desktop widget windows (the "window" surface): a frameless,
+      // always-on-top window that stays visible over other applications. Gate on
+      // capabilities.floating — a web host, or a desktop host without window
+      // support, omits it and the plugin should fall back to tab or dock.
+      //
+      // Dragging is split by design: the plugin decides WHEN a drag starts
+      // (thresholds, which element is a grip) and the host owns the movement —
+      // beginDrag hands the window to the OS move loop, and the host snaps it
+      // onto the work-area edges and remembers the spot once the loop goes
+      // quiet. Per-move coordinates are deliberately not part of the protocol:
+      // once the window follows the pointer, the webview's pointer capture is
+      // cancelled and the move stream dies mid-drag.
+      floating: Object.freeze({
+        open: (options) => request('host.openFloating', options || {}),
+        close: (contributionId) => request('host.closeFloating', { contributionId }),
+        beginDrag: () => request('host.beginFloatingDrag'),
+        endDrag: (options) => request('host.endFloatingDrag', options || {}),
+        setSize: (width, height) => request('host.setFloatingSize', { width, height }),
+      }),
+      // §4/§5 command execution from a webview — the same registry path a menu
+      // placement takes (enablement, §4.1 reuse, host-authored context),
+      // scoped to the plugin's own declared commands. The optional context
+      // merges over the command context and scopes instance_key placeholders
+      // (e.g. one panel per connection). Resolves { error } for expected
+      // business outcomes so callers can surface a notice without try/catch.
+      // NOTE: this block is the sandbox bootstrap template source — comments
+      // here must not contain backticks or dollar-brace interpolation.
+      executeCommand: (commandId, context) => request('host.executeCommand', { commandId, context }),
       openFilesystem: (providerId, childContext) => request('host.openFilesystem', { providerId, context: childContext }),
       reopenConnection: (connectionId) => request('host.reopenConnection', { connectionId }),
       // Estimated plans only: mode must be sent explicitly so a plugin states
@@ -1326,8 +1539,11 @@ export function pluginSdkSource(initialTheme?: PluginBridgeTheme): string {
         document.dispatchEvent(new CustomEvent('dbx-plugin-binary', { detail: payload }));
       } else if (message.type === 'filedrop') {
         const files = Array.isArray(message.files) ? message.files : [];
-        listeners.filedrop.forEach((listener) => listener(files));
-        document.dispatchEvent(new CustomEvent('dbx-plugin-filedrop', { detail: files }));
+        // The drop metadata rides as a second listener argument so existing
+        // single-parameter listeners keep working unchanged.
+        const drop = { dropId: typeof message.dropId === 'string' ? message.dropId : undefined, truncated: message.truncated === true };
+        listeners.filedrop.forEach((listener) => listener(files, drop));
+        document.dispatchEvent(new CustomEvent('dbx-plugin-filedrop', { detail: { files, drop } }));
       } else if (message.type === 'dragstate') {
         const active = message.active === true;
         listeners.dragstate.forEach((listener) => listener(active));
@@ -1358,6 +1574,12 @@ function validRequestMessage(value: Record<string, unknown>): value is Record<st
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
   if (!isRecord(value)) throw new Error(`${label} must be an object`);
   return value;
+}
+
+/** A host-owned AI task preset (E3): the enum is closed, so unknown values fail here. */
+function requirePluginAiTask(value: unknown): PluginAiTask {
+  if (typeof value !== "string" || !PLUGIN_AI_TASKS.includes(value as PluginAiTask)) throw new Error("Invalid AI task");
+  return value as PluginAiTask;
 }
 
 function requireProtocolName(value: unknown, label: string): string {
@@ -1530,6 +1752,12 @@ function requireStorageKey(value: unknown): string {
   if (typeof value !== "string" || !value || value.length > MAX_PLUGIN_STORAGE_KEY_CHARS || /[\u0000-\u001f]/.test(value)) {
     throw new Error("storage key is invalid");
   }
+  return value;
+}
+
+/** A floating window dimension in logical pixels; the host clamps it to its own bounds. */
+function requireFloatingDimension(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) throw new Error(`${label} must be a positive number`);
   return value;
 }
 

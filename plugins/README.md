@@ -369,6 +369,7 @@ A workbench opens in a normal persistent DBX tab. The iframe is loaded with `san
 - `sendBinary(channel, data)` — requires `host.binary`
 - `readAsset(path)` / `readAssetUrl(path)`
 - `openWorkbench(contributionId, context)` — requires `host.workbench`
+- `executeCommand(commandId, context?)` — executes one of this plugin's own declared commands through the same path a menu placement takes: `enablement` is re-checked, `presentation: "panel"` commands dock in the bottom panel and `presentation: "tab"` (default) commands open a workbench tab, with §4.1 singleton reuse. `context` merges over the command-declared context (reserved identity fields stay host-owned) and scopes `instance_key` `{{path}}` placeholders — declare `instance_key: "logs:{{connectionId}}"` to get one panel instance per connection; a template that cannot resolve falls back to its literal. Resolves `{ error }` for expected outcomes (unknown command, enablement-blocked); requires `host.workbench`
 - `openFilesystem(providerId, context)` — requires `host.filesystem`
 - `getPlanCapabilities(connectionId)` / `explainPlan(request)` — reads an estimated execution plan for one connection; requires `host.plans:read`, see [Estimated execution plans](#estimated-execution-plans)
 - `getTableMetadata({ connectionId, database?, schema?, table })` — reads narrow schema metadata for one table on an already-open connection; requires `host.schema:read`, see [Table Schema Metadata](#table-schema-metadata)
@@ -434,7 +435,7 @@ A result view contributes a plugin-rendered visualization for query results. DBX
 
 A result view declares display metadata only: it carries no UI of its own and never names a workbench. The opened contribution id reaches the plugin UI in the init payload (`dbx-plugin-init` detail `contributionId`), so a plugin that declares several result views selects the matching one inside its single UI entrypoint.
 
-The `context.result` snapshot is bounded — `{ columns, rows (<= 500), truncated }` plus `sql`, `connectionId`, and `database`. Plugins that need more rows can re-run a read-only statement with [`queryData`](#read-only-data-queries) (requires `host.data:read` and the user's consent for that connection). Requires a UI entrypoint.
+The `context.result` snapshot is bounded — `{ columns, rows (<= 500), truncated }` plus `sql`, `connectionId`, `database`, and `schema`. Plugins that need more rows can re-run a read-only statement with [`queryData`](#read-only-data-queries) (requires `host.data:read` and the user's consent for that connection). Requires a UI entrypoint.
 
 ### `context-menu`
 
@@ -477,6 +478,24 @@ A context-menu item can instead declare a host-handled Workbench action:
 
 The `workbench` reference must identify a `workbench` contribution in the same plugin manifest. This declarative action is resolved by the host and does not invoke the plugin backend.
 
+To provide state-dependent items and one level of native submenus, set `"dynamic": true` on a `context-menu` contribution. This requires a backend entrypoint. On each right-click, DBX calls `contextMenu/resolve/<id>` with the same non-secret `{ connection }` or `{ table }` envelope used by legacy actions, plus the current `locale`; connection menus also include `ownerPluginId` when the connection belongs to a plugin. A plugin can return an empty menu for connections it does not own. Return `{ "items": [...] }`; returning an empty array hides the contribution. For example:
+
+```json
+{
+  "items": [
+    {
+      "label": "Tunnels",
+      "children": [
+        { "label": "Manage port forwards", "action": { "type": "open-workbench", "workbench": "ssh.tunnels", "presentation": "dialog" } },
+        { "label": "Start saved tunnels", "action": { "type": "invoke", "id": "start-all", "reopenConnectionOnMissing": true } }
+      ]
+    }
+  ]
+}
+```
+
+Each item accepts `label`, optional `visible`, `enabled`, `checked`, and either `action` or `children`. Children may not contain another submenu. An `invoke` action calls the declared contribution's existing `contextMenu/<id>` backend method with the original envelope plus `itemId`; the host never executes an arbitrary method supplied by the resolver. For connection items, `reopenConnectionOnMissing: true` retries once after DBX restores that plugin connection when the backend reports `Connection is not active`; omit it for actions that do not need an open connection. An `open-workbench` action must target a workbench declared by the same plugin. Dynamic menu items may add `"presentation": "dialog"` to that action to show the workbench in a modal over DBX; without it the workbench opens in a tab. The host limits response size and resolution time; invalid or failed responses contribute no items. Existing static context-menu contributions continue to work unchanged.
+
 For legacy entries without `action`, clicking a connection item dispatches `contextMenu/<id>` with the existing non-secret connection summary (`{ id, dbType, name, database }`) under `connection`. Clicking a table item uses the same backend method and dispatches:
 
 ```json
@@ -493,6 +512,29 @@ For legacy entries without `action`, clicking a connection item dispatches `cont
 `database` and `schema` are optional and are omitted when the selected database does not expose those scopes. The table context contains object identity only; it never contains credentials, connection strings, or raw connection configuration.
 
 For a declarative `open-workbench` action, DBX passes the current connection summary as Workbench context for `menu: "connection"`, and the stable `TableContext` object above directly as Workbench context for `menu: "table"` (without the backend `table` envelope). Connection context includes only `id`, `dbType`, `name`, and `database`; the host may also provide the standard `connectionId` for tab association. Neither path includes `host`, `port`, `username`, `password`, a connection string, or raw connection configuration. Reopening the same Workbench refreshes it with the latest invocation context.
+
+#### Declarative launch options (`options_action`)
+
+A dock `command` contribution's `open-workbench` action may declare `options_action: "<sidecar method>"` (context-menu entries cannot: their action form has no such field, and unknown fields are rejected at manifest validation). Before offering launch targets, the host invokes that method with the current UI locale so labels arrive localized:
+
+```json
+{ "locale": "zh-CN" }
+```
+
+The sidecar answers:
+
+```json
+{
+  "entries": [
+    { "label": "Local terminal", "description": "Default shell: /bin/zsh", "context": {} },
+    { "label": "zsh", "description": "/bin/zsh", "context": { "shell": "zsh" } }
+  ]
+}
+```
+
+- `context` is opaque plugin payload: it is merged into the host-authored Workbench context of the panel opened for that entry, and the host never interprets it.
+- A command declaring `options_action` owns the picker: the host's generic replay item hides while `options_action` is declared and does not come back if the sidecar fetch fails or returns nothing — the picker then simply has no launch entries.
+- Plugins ignore the `locale` field safely if they do not localize.
 
 A backend entrypoint is required only for legacy context-menu entries without a declarative action. Their `{ "message": "..." }` result continues to surface as a toast.
 

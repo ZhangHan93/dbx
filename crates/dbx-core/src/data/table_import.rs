@@ -2209,7 +2209,7 @@ impl SqlImportRowStream {
         .await?;
         Ok(Self {
             decoder,
-            splitter: Some(StreamingSqlFileSplitter::new(options.sql_dialect, parsing_options)),
+            splitter: Some(StreamingSqlFileSplitter::new(options.sql_dialect, parsing_options, false)),
             family,
             target: None,
             rows: Vec::new(),
@@ -5231,7 +5231,7 @@ fn infer_column_type(rows: &[Vec<serde_json::Value>], source_index: usize) -> Im
 fn text_data_type(db_type: &DatabaseType) -> &'static str {
     match db_type {
         DatabaseType::SqlServer => "NVARCHAR(MAX)",
-        DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng => "CLOB",
+        DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng | DatabaseType::Db2 => "CLOB",
         DatabaseType::ClickHouse => "String",
         DatabaseType::Hive
         | DatabaseType::Transwarp
@@ -9240,6 +9240,7 @@ mod tests {
             column_comments: vec![],
             rows: vec![vec![serde_json::json!(""), serde_json::Value::Null]],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -10568,6 +10569,7 @@ mod tests {
                 column_comments: vec![],
                 rows: vec![vec![serde_json::json!(1)]],
                 numeric_column_right_align: false,
+                auto_filter: None,
             },
             XlsxWorksheetData {
                 sheet_name: Some("Second".to_string()),
@@ -10576,6 +10578,7 @@ mod tests {
                 column_comments: vec![],
                 rows: vec![vec![serde_json::json!("Ada")]],
                 numeric_column_right_align: false,
+                auto_filter: None,
             },
         ])
         .unwrap();
@@ -10614,6 +10617,7 @@ mod tests {
                 column_comments: vec![],
                 rows: vec![vec![serde_json::json!(1)]],
                 numeric_column_right_align: false,
+                auto_filter: None,
             },
             XlsxWorksheetData {
                 sheet_name: Some("Second".to_string()),
@@ -10622,6 +10626,7 @@ mod tests {
                 column_comments: vec![],
                 rows: vec![vec![serde_json::json!("Ada")], vec![serde_json::json!("Grace")]],
                 numeric_column_right_align: false,
+                auto_filter: None,
             },
         ])
         .unwrap();
@@ -10835,6 +10840,7 @@ mod tests {
                 vec![serde_json::json!(2), serde_json::json!("Grace")],
             ],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -11212,6 +11218,7 @@ mod tests {
                 vec![serde_json::json!("summary"), serde_json::json!(2)],
             ],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -11816,6 +11823,7 @@ mod tests {
                 vec![serde_json::json!(2), serde_json::json!(2.25)],
             ],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -11915,6 +11923,7 @@ mod tests {
                 vec![serde_json::json!("summary"), serde_json::json!(2)],
             ],
             numeric_column_right_align: false,
+            auto_filter: None,
         }])
         .unwrap();
         std::fs::write(&path, workbook).unwrap();
@@ -12033,6 +12042,29 @@ mod tests {
         let plan = build_import_create_table_plan(&data, &mappings, "events", "dbo", &DatabaseType::SqlServer).unwrap();
 
         assert_eq!(plan.sql, "CREATE TABLE [dbo].[events] (\n  [notes] NVARCHAR(MAX)\n)");
+    }
+
+    #[test]
+    fn db2_create_table_plan_uses_clob_for_inferred_text() {
+        let data = ParsedImportFile {
+            columns: vec!["id".to_string(), "notes".to_string()],
+            rows: vec![vec![serde_json::json!(1), serde_json::json!("long text")]],
+            total_rows: 1,
+            effective_encoding: None,
+        };
+        let mappings = data
+            .columns
+            .iter()
+            .map(|column| TableImportColumnMapping {
+                source_column: column.clone(),
+                target_column: column.clone(),
+                target_data_type: None,
+            })
+            .collect::<Vec<_>>();
+
+        let plan = build_import_create_table_plan(&data, &mappings, "events", "APP", &DatabaseType::Db2).unwrap();
+
+        assert_eq!(plan.sql, "CREATE TABLE \"APP\".\"events\" (\n  \"id\" BIGINT,\n  \"notes\" CLOB\n)");
     }
 
     #[test]
@@ -12200,6 +12232,50 @@ mod tests {
                 row_count: 1,
             },
         ]);
+    }
+
+    #[test]
+    fn db2_import_uses_schema_qualified_multi_row_insert() {
+        let mappings = vec![
+            TableImportColumnMapping {
+                source_column: "id".to_string(),
+                target_column: "ID".to_string(),
+                target_data_type: None,
+            },
+            TableImportColumnMapping {
+                source_column: "name".to_string(),
+                target_column: "NAME".to_string(),
+                target_data_type: None,
+            },
+        ];
+        let data = ParsedImportFile {
+            columns: vec!["id".to_string(), "name".to_string()],
+            rows: vec![
+                vec![serde_json::json!(1), serde_json::json!("Ada")],
+                vec![serde_json::json!(2), serde_json::json!("Grace")],
+            ],
+            total_rows: 2,
+            effective_encoding: None,
+        };
+
+        let batches = build_import_insert_batches(
+            &data,
+            &mappings,
+            &[("ID".to_string(), "BIGINT".to_string()), ("NAME".to_string(), "VARCHAR(128)".to_string())],
+            "USERS",
+            "APP",
+            &DatabaseType::Db2,
+            500,
+        )
+        .unwrap();
+
+        assert_eq!(
+            batches,
+            vec![ImportSqlBatch {
+                sql: "INSERT INTO \"APP\".\"USERS\" (\"ID\", \"NAME\") VALUES\n(1, 'Ada'),\n(2, 'Grace')".to_string(),
+                row_count: 2,
+            }]
+        );
     }
 
     #[test]

@@ -103,6 +103,9 @@ export interface DrawCanvasDataGridOptions {
   booleanDisplayMode?: "checkbox" | "dropdown";
   flatteningMultiLineEnabled: boolean;
   showWhitespace?: boolean;
+  stripedRows?: boolean;
+  zebraStriping?: boolean;
+  zebraRowBg?: string;
   /** 行号栏取值：`view` = 当前视图序号（默认，与筛选前一致），`source` = 筛选前的原始行号 */
   rowNumberMode?: "view" | "source";
 }
@@ -150,6 +153,21 @@ export function resolveCanvasBackingStoreMetrics(options: { width: number; heigh
     scaleY: pixelHeight / height,
     measured: measurementMatches,
   };
+}
+
+export function resolveCanvasDataGridRowBase(
+  theme: Pick<DataGridPaintTheme, "rowDeleted" | "rowNew" | "rowMuted" | "background">,
+  item: Pick<CanvasDataGridRow, "isDeleted" | "isNew" | "isDraft" | "displayIndex">,
+  options: { isActive: boolean; stripedRows?: boolean; zebraStriping?: boolean; zebraRowBg?: string },
+): string {
+  const { isActive } = options;
+  const stripedRows = options.stripedRows ?? options.zebraStriping ?? true;
+  const stripedRowBg = options.zebraRowBg?.trim() || theme.rowMuted;
+  if (item.isDeleted) return theme.rowDeleted;
+  if (item.isNew && !isActive) return theme.rowNew;
+  if (item.isDraft && !isActive) return theme.rowMuted;
+  if (stripedRows && item.displayIndex % 2 === 1 && !isActive) return stripedRowBg;
+  return theme.background;
 }
 
 export function resolveCanvasDataGridRowFill(theme: Pick<DataGridPaintTheme, "cellActive" | "cellSelected">, rowBase: string, options: { isActive: boolean; isDeleted: boolean; isSelected: boolean }): string {
@@ -252,16 +270,17 @@ function alignCanvasPixel(value: number, dpr: number): number {
   return Math.round(value * dpr) / dpr;
 }
 
-function drawBooleanCheckbox(ctx: CanvasRenderingContext2D, options: { drawX: number; y: number; colWidth: number; scaleX: number; scaleY: number; theme: DataGridPaintTheme; checked: boolean }): void {
+export function drawBooleanCheckbox(ctx: CanvasRenderingContext2D, options: { drawX: number; y: number; colWidth: number; scaleX: number; scaleY: number; theme: DataGridPaintTheme; checked: boolean }): void {
   const { drawX, y, colWidth, scaleX, scaleY, theme, checked } = options;
   const size = BOOLEAN_CHECKBOX_SIZE;
   const boxX = alignCanvasPixel(drawX + (colWidth - size) / 2, scaleX);
   const boxY = alignCanvasPixel(y + (CANVAS_DATA_GRID_ROW_HEIGHT - size) / 2, scaleY);
   ctx.lineWidth = 1;
+  ctx.fillStyle = theme.background;
+  ctx.fillRect(boxX, boxY, size, size);
   if (checked) {
-    ctx.fillStyle = theme.primary;
-    ctx.fillRect(boxX, boxY, size, size);
-    ctx.strokeStyle = theme.background;
+    ctx.strokeStyle = theme.foreground;
+    ctx.strokeRect(boxX + 0.5, boxY + 0.5, size - 1, size - 1);
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(boxX + 3, boxY + size / 2);
@@ -368,8 +387,12 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions): boolean 
     booleanDisplayMode = "dropdown",
     flatteningMultiLineEnabled,
     showWhitespace = false,
+    stripedRows: rawStripedRows,
+    zebraStriping,
+    zebraRowBg,
     rowNumberMode = "view",
   } = options;
+  const stripedRows = rawStripedRows ?? zebraStriping ?? true;
   // 框选热路径：整次绘制只判断一次。常见情况（单矩形 / 多列且每段都是多格）可跳过逐格 kind 查询
   const paintSelectionOuterFrame = dataGridSelectionUsesOuterFrame(selectionFrames);
   const suppressAllSelectedCellBorders = selectionFrames.length > 0 && selectionFrames.every(dataGridFrameIsMultiCell);
@@ -430,7 +453,12 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions): boolean 
     const rowIsActive = isRowActive(item.displayIndex);
     const rowSelectionVisual = rowCellsUseSelectionVisual(item.id);
 
-    const rowBase = item.isDeleted ? theme.rowDeleted : item.isNew && !rowIsActive ? theme.rowNew : item.isDraft && !rowIsActive ? theme.rowMuted : item.displayIndex % 2 === 1 && !rowIsActive ? theme.rowMuted : theme.background;
+    const rowBase = resolveCanvasDataGridRowBase(theme, item, {
+      isActive: rowIsActive,
+      stripedRows,
+      zebraStriping,
+      zebraRowBg,
+    });
     const rowFill = resolveCanvasDataGridRowFill(theme, rowBase, {
       isActive: rowIsActive,
       isDeleted: item.isDeleted,
