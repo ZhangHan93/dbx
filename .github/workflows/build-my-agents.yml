@@ -55,7 +55,19 @@ jobs:
       # 这类错误（如 DATABASE_NAMESPACE_CREATION_MATRIX 缺 odbc/odbc32）在编译期毫无征兆，
       # 只在运行时 `Entry[db_type].field` 抛 TypeError —— 症状是右键连接菜单直接不弹。
       # vue-tsc 会把 satisfies Record<DatabaseType, ...> 的缺键报成 TS2740。
+      #
+      # ⚠️ 必须显式放大 Node 堆（2026-10-08 实测）：
+      #   windows runner 上 Node 的默认 old-space 上限只有 ~4.1GB（4132 MB），
+      #   0.6.35 合并后前端规模增长，vue-tsc 会撞上该上限并崩溃：
+      #     FATAL ERROR: Ineffective mark-compacts near heap limit
+      #     Allocation failed - JavaScript heap out of memory   (exit 134)
+      #   ★ 症状极具误导性：**一条 TS 报错都没有**，日志停在 `> vue-tsc ...`
+      #     之后，看起来像「类型检查失败」，实则是**内存不足**。
+      #   ★ 本机(Ryzen9/63GB) 卡 4096 都能过（38s），CI(4vCPU/16GB) 却 97s OOM ——
+      #     差别只在 V8 在低配机上并发 GC 跟不上、老年代峰值被顶穿。**别拿本机绿当准**。
       - name: Typecheck frontend
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
         run: pnpm typecheck
 
       - name: Build ODBC agent (64-bit)
