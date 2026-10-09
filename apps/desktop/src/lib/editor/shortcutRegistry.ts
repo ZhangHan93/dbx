@@ -24,6 +24,7 @@ export type ShortcutActionId =
   | "undo"
   | "redo"
   | "selectAll"
+  | "selectCurrentStatement"
   | "extendSelection"
   | "addNextSelectionOccurrence"
   | "selectAllSelectionOccurrences"
@@ -36,6 +37,7 @@ export type ShortcutActionId =
   | "toggleFold"
   | "foldAll"
   | "unfoldAll"
+  | "editCell"
   | "editTableStructure"
   | "copyCurrentRow"
   | "deleteCurrentRow"
@@ -83,6 +85,7 @@ export type ShortcutActionId =
   | "pasteSidebarSelection"
   | "editSidebarConnection"
   | "disconnectSidebarConnection"
+  | "disconnectAllActiveConnections"
   | "openDataInNewTab"
   | "viewTableDdl"
   | "sendSelectionToAi"
@@ -310,6 +313,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: "Mod+A",
   },
   {
+    id: "selectCurrentStatement",
+    labelKey: "settings.shortcutSelectCurrentStatement",
+    scope: "editor",
+    defaultShortcut: "Mod+Shift+E",
+  },
+  {
     id: "extendSelection",
     labelKey: "settings.shortcutExtendSelection",
     scope: "editor",
@@ -380,6 +389,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutUnfoldAll",
     scope: "editor",
     defaultShortcut: foldAllDefaultShortcut("unfoldAll"),
+  },
+  {
+    id: "editCell",
+    labelKey: "settings.shortcutEditCell",
+    scope: "grid",
+    defaultShortcut: "F2",
   },
   {
     id: "editTableStructure",
@@ -638,6 +653,12 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutToggleZenMode",
     scope: "global",
     defaultShortcut: "Shift+Mod+F12",
+  },
+  {
+    id: "disconnectAllActiveConnections",
+    labelKey: "sidebar.disconnectAllActiveConnections",
+    scope: "global",
+    defaultShortcut: "",
   },
   {
     id: "copySidebarSelection",

@@ -6723,6 +6723,9 @@ pub fn connection_configs_pool_equivalent(a: &ConnectionConfig, b: &ConnectionCo
     // established database session.
     a.sidebar_auto_load_all_tables = false;
     b.sidebar_auto_load_all_tables = false;
+    // A default browser filter does not change the established Redis session.
+    a.redis_key_filter = None;
+    b.redis_key_filter = None;
     if !a.save_password && !b.save_password {
         a.password.clear();
         b.password.clear();
@@ -6754,6 +6757,7 @@ pub fn connection_configs_session_credentials_compatible(a: &ConnectionConfig, b
         config.query_timeout_secs = 0;
         config.idle_timeout_secs = 0;
         config.keepalive_interval_secs = 0;
+        config.redis_key_filter = None;
         config.redis_key_separator.clear();
         config.redis_scan_page_size = None;
         config.redis_database_aliases.clear();
@@ -7398,6 +7402,7 @@ mod tests {
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),
@@ -9869,6 +9874,7 @@ sleep 30
             redis_scan_page_size: None,
             redis_database_aliases: Default::default(),
             redis_key_templates: Vec::new(),
+            redis_key_filter: None,
             redis_key_grouping: None,
             etcd_endpoints: String::new(),
             gbase_server: String::new(),

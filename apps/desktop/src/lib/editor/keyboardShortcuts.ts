@@ -265,6 +265,10 @@ export function isCopyCurrentRowShortcut(event: ShortcutLikeEvent, shortcuts?: P
   return matchesShortcut(event, actionShortcut("copyCurrentRow", shortcuts));
 }
 
+export function isEditCellShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
+  return matchesShortcut(event, actionShortcut("editCell", shortcuts, platform), platform);
+}
+
 export function isEditTableStructureShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
   return matchesShortcut(event, actionShortcut("editTableStructure", shortcuts, platform), platform);
 }
@@ -307,6 +311,10 @@ export function isToggleSidebarShortcut(event: ShortcutLikeEvent, shortcuts?: Pa
 
 export function isToggleZenModeShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
   return matchesShortcut(event, actionShortcut("toggleZenMode", shortcuts));
+}
+
+export function isDisconnectAllActiveConnectionsShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("disconnectAllActiveConnections", shortcuts));
 }
 
 export function isCopySidebarSelectionShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {

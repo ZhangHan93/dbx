@@ -427,6 +427,9 @@ pub fn is_write_sql(sql: &str) -> bool {
 /// executable comments and file exports, plus PostgreSQL-family/SQL Server
 /// `SELECT ... INTO` table creation.
 pub fn is_write_sql_for_database(sql: &str, database_type: DatabaseType) -> bool {
+    if database_type == DatabaseType::Neo4j {
+        return !crate::cypher_read_only::is_proven_read_only_cypher(sql);
+    }
     // VictoriaMetrics execution is hard-wired to the read-only query API; MetricsQL
     // does not use SQL verbs and must not be rejected by SQL write classification.
     if database_type == DatabaseType::VictoriaMetrics {
