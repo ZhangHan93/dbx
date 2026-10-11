@@ -1,4 +1,5 @@
 import { isMacShortcutPlatform, parseShortcutParts, parseShortcutStrokes, shortcutDisplayParts } from "@/lib/editor/shortcutDisplay";
+import { isModifierDoubleTapShortcut, matchesModifierDoubleTapShortcut } from "@/lib/editor/modifierDoubleTapShortcut";
 
 export type ShortcutActionId =
   | "executeSql"
@@ -51,6 +52,7 @@ export type ShortcutActionId =
   | "openSettings"
   | "closeTab"
   | "closeOtherTabs"
+  | "closeAllTabs"
   | "closeWindow"
   | "focusSearch"
   | "quickOpen"
@@ -100,6 +102,7 @@ export interface ShortcutDefinition {
   scope: ShortcutScope;
   defaultShortcut: string;
   inputKind?: "keyboard" | "modifier-only";
+  supportsModifierDoubleTap?: boolean;
 }
 
 export type ShortcutSettings = Record<ShortcutActionId, string>;
@@ -476,6 +479,14 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     defaultShortcut: closeOtherTabsDefaultShortcut(),
   },
   {
+    // VS Code's close-all-tabs chord (Cmd/Ctrl+K W) needs chord support the
+    // registry doesn't have, so this action ships unbound and stays optional.
+    id: "closeAllTabs",
+    labelKey: "contextMenu.closeAllTabs",
+    scope: "global",
+    defaultShortcut: "",
+  },
+  {
     id: "closeWindow",
     labelKey: "settings.shortcutCloseWindow",
     scope: "global",
@@ -489,12 +500,14 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
   },
   {
     id: "quickOpen",
+    supportsModifierDoubleTap: true,
     labelKey: "settings.shortcutQuickOpen",
     scope: "global",
     defaultShortcut: "Mod+P",
   },
   {
     id: "globalSearch",
+    supportsModifierDoubleTap: true,
     labelKey: "settings.shortcutGlobalSearch",
     scope: "global",
     defaultShortcut: "Mod+Alt+F",
@@ -733,6 +746,7 @@ function hasExplicitShortcut(settings: Partial<ShortcutSettings> | undefined, ac
 }
 
 function shortcutsUseSameKeys(first: string, second: string, platform = globalThis.navigator?.platform || ""): boolean {
+  if (isModifierDoubleTapShortcut(first) || isModifierDoubleTapShortcut(second)) return matchesModifierDoubleTapShortcut(first, second, platform);
   const comparisonKey = (shortcut: string) =>
     formatShortcut(shortcut, platform)
       .trim()

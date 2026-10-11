@@ -73,6 +73,7 @@ fn live_sqlserver_config(id: &str, database: &str) -> dbx_core::models::connecti
         production_databases: vec![],
         show_system_schemas: false,
         sidebar_auto_load_all_tables: false,
+        show_database_links: None,
         database_info: None,
     }
 }
@@ -130,6 +131,7 @@ async fn live_sqlserver_xlsx_export_can_outlive_query_timeout_while_rows_keep_ar
         timeout_secs: Some(1),
         keyset_optimization_enabled: true,
         client_session_id: None,
+        txn_session_id: None,
         execution_id: Some(format!("live-sqlserver-xlsx-{suffix}")),
         date_time_format: None,
         csv_quote_mode: Default::default(),
@@ -140,6 +142,7 @@ async fn live_sqlserver_xlsx_export_can_outlive_query_timeout_while_rows_keep_ar
         selected_columns: None,
         export_column_extras: None,
         column_comments: None,
+        header_comment_rows: false,
         auto_filter: None,
         identifier_quote: None,
         numeric_column_right_align: false,

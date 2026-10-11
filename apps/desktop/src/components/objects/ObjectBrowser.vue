@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { applyDdlStoragePreference } from "@/lib/sql/ddlStorage";
 import DatabaseActionsMenu from "@/components/objects/DatabaseActionsMenu.vue";
+import FirebirdObjectManager from "@/components/objects/FirebirdObjectManager.vue";
 import { useDatabaseBrowserMutation } from "@/lib/database/databaseBrowserActions";
 import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
 
@@ -66,7 +67,7 @@ import { translateBackendError } from "@/i18n/backend-errors";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SearchableSelect } from "@/components/ui/searchable-select";
-import { DropdownMenuCheckboxItem, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenuCheckboxItem, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuSub, DropdownMenuSubContent, DropdownMenuSubTrigger } from "@/components/ui/dropdown-menu";
 import ToolbarOverflowMenu from "@/components/ui/ToolbarOverflowMenu.vue";
 import { useToolbarOverflow } from "@/composables/useToolbarOverflow";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
@@ -104,7 +105,7 @@ import { buildRenameObjectSql, supportsObjectRename } from "@/lib/table/objectRe
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { autoRevealExportedPathIfConfigured, promptExportSavePath } from "@/lib/export/exportPath";
 import { generateDatabaseExportId } from "@/lib/export/databaseExport";
-import { buildXlsxHeaderOverrides, hasXlsxHeaderComments, type XlsxExportOptions, type XlsxHeaderMode } from "@/lib/export/xlsxHeader";
+import { buildXlsxHeaderOverrides, hasXlsxHeaderComments, xlsxHeaderUsesCommentRows, type XlsxExportOptions, type XlsxHeaderMode } from "@/lib/export/xlsxHeader";
 import { showSqlInsertModeDialog, type SqlInsertDialect, type SqlInsertMode } from "@/lib/export/sqlInsertMode";
 import { csvNullLiteralForMode } from "@/lib/export/csvNullMode";
 import { copyToClipboard, eventTargetAllowsAppClipboardShortcut } from "@/lib/common/clipboard";
@@ -222,6 +223,7 @@ const refreshTooltip = computed(() => {
   return shortcut ? `${t("grid.refresh")} (${shortcut})` : t("grid.refresh");
 });
 
+const firebirdManagerOpen = ref(false);
 const schemas = ref<string[]>([]);
 const selectedSchema = ref<string | undefined>(props.schema);
 const rows = ref<ObjectBrowserRow[]>([]);
@@ -448,12 +450,18 @@ const objectFilters = computed<ObjectFilter[]>(() =>
     .map(([filter]) => filter),
 );
 const showObjectFilter = computed(() => objectFilters.value.length > 2);
+// A scope that holds a single object kind makes "全部 14" and "表 14" the same number, so the
+// strip is dropped as redundant — which used to drop the only object count the toolbar could
+// show at all (t8y2/dbx#11624, the common MySQL "tables only" database). Keep that one kind's
+// count visible on its own instead; it stays a value, not a filter control, because with a
+// single kind there is no 全部 chip left for the user to reset the selection back to.
+const singleKindFilter = computed<ObjectFilter | null>(() => (objectFilters.value.length === 2 ? (objectFilters.value.find((filter) => filter !== "all") ?? null) : null));
 // Measured condensation for the header row: tier 1 moves the sort/view/checkbox
 // controls into the overflow menu, tier 2 additionally moves the object type
 // filter there and drops the database chip. See useToolbarOverflow for the
 // tier contract.
 const toolbarRef = ref<HTMLElement | null>(null);
-const { tier: toolbarTier } = useToolbarOverflow(toolbarRef, [() => props.database, () => selectedSchema.value, () => needsSchema.value, () => showObjectFilter.value]);
+const { tier: toolbarTier } = useToolbarOverflow(toolbarRef, [() => props.database, () => selectedSchema.value, () => needsSchema.value, () => showObjectFilter.value, () => singleKindFilter.value]);
 const showToolbarOverflow = computed(() => toolbarTier.value >= 1);
 const showInlineSortAndView = computed(() => toolbarTier.value < 1);
 const showInlineCheckboxToggle = computed(() => toolbarTier.value < 1);
@@ -2527,7 +2535,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "
       } else {
         const comments = result.columns.map((name) => columnInfos?.find((column) => column.name.toLocaleLowerCase() === name.toLocaleLowerCase())?.comment);
         const headerOverrides = buildXlsxHeaderOverrides(result.columns, comments, headerMode);
-        await api.exportQueryResultXlsx(filePath, row.name, result.columns, result.column_types ?? result.columns.map(() => ""), headerOverrides, result.rows, undefined, autoFilter, settingsStore.editorSettings.globalDateTimeExportFormat || undefined);
+        await api.exportQueryResultXlsx(filePath, row.name, result.columns, result.column_types ?? result.columns.map(() => ""), headerOverrides, result.rows, undefined, autoFilter, settingsStore.editorSettings.globalDateTimeExportFormat || undefined, xlsxHeaderUsesCommentRows(headerMode));
       }
       toast(t("grid.exported"));
       void autoRevealExportedPathIfConfigured(filePath);
@@ -2574,6 +2582,7 @@ async function exportTableData(row: ObjectBrowserRow, format: "csv" | "xlsx" | "
       nullLiteral: csvNullLiteralForMode(settingsStore.editorSettings.csvNullMode),
       columns,
       columnComments: format === "xlsx" ? columnComments : undefined,
+      headerCommentRows: format === "xlsx" ? xlsxHeaderUsesCommentRows(headerMode) : undefined,
       autoFilter: format === "xlsx" ? autoFilter : undefined,
       batchSize: settingsStore.editorSettings.exportBatchSize,
       skipCount: format === "sql",
@@ -3346,7 +3355,7 @@ async function loadObjects(options?: { allowCached?: boolean; preserveExistingRo
 async function loadSqlObjectBrowserRows(request: ObjectBrowserRowsLoadHandle) {
   const objects: ObjectInfo[] = await api.listObjects(request.scope.connectionId, request.scope.database, request.scope.schema, undefined, undefined, undefined, undefined, request.scope.catalog);
   return buildObjectBrowserRows({
-    objects,
+    objects: objects.filter((object) => object.object_type !== "INDEX"),
     database: request.scope.database,
     fallbackSchema: request.scope.schema,
     rowSchema: connectionObjectTreeNodeSchema(props.connection, props.database, selectedSchema.value),
@@ -3548,7 +3557,9 @@ watch(
     sourceEditing.value = false;
     sourceSaving.value = false;
     try {
-      await connectionStore.ensureConnected(props.connection.id);
+      // 被动唤醒（挂载/切上下文）：用户显式关掉的连接交给缓存对象列表与「刷新」按钮，
+      // 不在这里把它连回来。
+      await connectionStore.ensureConnected(props.connection.id, { skipIfClosedByUser: true });
     } catch (e) {
       console.warn("[DBX] ensureConnected failed for", props.connection.id, e);
     }
@@ -3831,8 +3842,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 </script>
 
 <template>
+  <FirebirdObjectManager v-if="effectiveDatabaseType === 'firebird'" v-model:open="firebirdManagerOpen" :connection-id="connection.id" :database="database" />
   <div ref="rootRef" data-object-browser-root class="flex h-full min-h-0 min-w-0 flex-col bg-background outline-none" tabindex="0" @keydown="onObjectBrowserKeydown">
     <div v-if="!isEventEditor" ref="toolbarRef" class="flex h-10 shrink-0 items-center gap-2 overflow-hidden border-b px-3">
+      <Button v-if="effectiveDatabaseType === 'firebird'" variant="outline" size="sm" @click="firebirdManagerOpen = true">{{ t("tree.firebirdObjectManager") }}</Button>
       <div class="flex min-w-12 items-center gap-2">
         <span class="inline-flex max-w-[14rem] min-w-0 items-center rounded border border-border bg-muted/50 px-2 py-0.5 text-xs font-medium truncate" :title="selectedSchema || props.database">
           {{ selectedSchema || props.database }}
@@ -3850,7 +3863,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             <X class="h-3 w-3" />
           </button>
         </div>
-        <div v-if="showObjectFilter && showInlineObjectFilter" class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
+        <div v-if="showObjectFilter && showInlineObjectFilter" data-object-filter-chips class="flex h-7 shrink-0 items-center rounded border bg-muted/20 p-0.5">
           <button
             v-for="filter in objectFilters"
             :key="filter"
@@ -3862,6 +3875,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             {{ filterLabel(filter) }}
           </button>
         </div>
+        <span v-else-if="singleKindFilter && showInlineObjectFilter" data-object-filter-count class="shrink-0 whitespace-nowrap text-xs tabular-nums text-muted-foreground">{{ filterLabel(singleKindFilter) }}</span>
       </div>
       <SearchableSelect
         v-if="needsSchema"
@@ -3945,6 +3959,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         <template v-if="showObjectFilter && toolbarTier >= 2">
           <DropdownMenuSeparator />
           <DropdownMenuCheckboxItem v-for="filter in objectFilters" :key="filter" :model-value="objectFilter === filter" @select.prevent @update:model-value="selectObjectFilter(filter)">{{ filterLabel(filter) }}</DropdownMenuCheckboxItem>
+        </template>
+        <template v-else-if="singleKindFilter && toolbarTier >= 2">
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel data-object-filter-count>{{ filterLabel(singleKindFilter) }}</DropdownMenuLabel>
         </template>
       </ToolbarOverflowMenu>
     </div>

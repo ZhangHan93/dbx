@@ -1625,6 +1625,51 @@ describe("connectionStore completion assistant", () => {
     expect(objects).toEqual([expect.objectContaining({ name: "CALCULATE_BONUS", schema: "HR", type: "function", parentSchema: "HR", parentName: "PAYROLL", dataType: undefined, applyName: "HR.CALCULATE_BONUS", boost: 0 })]);
   });
 
+  it("maps Oracle sequence objects from completion assistant", async () => {
+    const completionAssistantSearch = vi.fn().mockResolvedValue({
+      candidates: [{ name: "ORDER_SEQ", kind: "sequence", schema: "HR", data_type: "SEQUENCE" }],
+      incomplete: false,
+      fallback_used: false,
+    });
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch,
+      listObjects: vi.fn().mockResolvedValue([]),
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [oracleConnection()];
+    store.connectedIds.add("oracle-1");
+
+    const objects = await store.listCompletionObjects("oracle-1", "ORCL", "ORDER", 20, "HR", undefined, false, "APP", ["routine", "sequence"]);
+
+    expect(completionAssistantSearch).toHaveBeenCalledWith(expect.objectContaining({ object_kinds: ["routine", "sequence"], mask: "ORDER", schema: "APP" }));
+    expect(objects).toEqual([expect.objectContaining({ name: "ORDER_SEQ", schema: "HR", type: "sequence", dataType: undefined, applyName: "HR.ORDER_SEQ" })]);
+  });
+
+  it("maps Oracle sequence objects from listObjects in fallback path", async () => {
+    const listCompletionObjects = vi.fn().mockResolvedValue([{ name: "ORDER_SEQ", object_type: "SEQUENCE", schema: "HR" }]);
+
+    vi.doMock("@/lib/backend/tauriRuntime", () => ({ isTauriRuntime: () => false }));
+    vi.doMock("@/lib/backend/api", () => ({
+      checkConnectionHealth: vi.fn().mockResolvedValue(undefined),
+      completionAssistantSearch: vi.fn().mockRejectedValue(new Error("assistant disabled")),
+      listCompletionObjects,
+    }));
+
+    const { useConnectionStore } = await import("@/stores/connectionStore");
+    const store = useConnectionStore();
+    store.connections = [oracleConnection()];
+    store.connectedIds.add("oracle-1");
+
+    const objects = await store.listCompletionObjects("oracle-1", "ORCL", "ORDER", 20, "HR", undefined, false, "APP", ["routine", "sequence"]);
+
+    expect(objects).toEqual([expect.objectContaining({ name: "ORDER_SEQ", schema: "HR", type: "sequence" })]);
+  });
+
   it("loads PostgreSQL routines by prefix and preserves return metadata", async () => {
     const completionAssistantSearch = vi.fn().mockResolvedValue({
       candidates: [{ name: "st_area", kind: "function", schema: "public", data_type: "double precision", comment: "Returns an area" }],

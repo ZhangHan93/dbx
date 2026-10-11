@@ -1223,7 +1223,26 @@ async fn get_table_comment_core_for_session(
                             timeout,
                         )
                         .await?;
-                    return oracle_table_comment_from_query_result(result);
+                    return single_table_comment_from_query_result(result);
+                }
+                if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::SqlServer) {
+                    // JDBC `REMARKS` is always NULL on SQL Server, so the legacy Agent's
+                    // table list cannot supply the `MS_Description` written by the editor.
+                    let sql = db::sqlserver::sqlserver_table_comment_sql(schema, table);
+                    let timeout = agent_metadata_timeout(db_config.as_ref());
+                    let mut client = client.lock().await;
+                    let result = client
+                        .execute_query_with_timeout::<db::QueryResult>(
+                            agent_execute_query_params(
+                                &sql,
+                                Some(database),
+                                Some(schema),
+                                QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                            ),
+                            timeout,
+                        )
+                        .await?;
+                    return single_table_comment_from_query_result(result);
                 }
                 if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
                     let timeout = agent_metadata_timeout(db_config.as_ref());
@@ -1246,7 +1265,7 @@ async fn get_table_comment_core_for_session(
                             timeout,
                         )
                         .await?;
-                    return oracle_table_comment_from_query_result(result);
+                    return single_table_comment_from_query_result(result);
                 }
             }
         }
@@ -1327,7 +1346,7 @@ fn tdengine_table_comment_cache_key(database: &str, schema: &str, filter: &str) 
     serde_json::json!([database, schema, filter.trim().to_lowercase()]).to_string()
 }
 
-fn oracle_table_comment_from_query_result(result: db::QueryResult) -> Result<Option<String>, String> {
+fn single_table_comment_from_query_result(result: db::QueryResult) -> Result<Option<String>, String> {
     Ok(result
         .rows
         .first()
@@ -2150,9 +2169,7 @@ fn external_driver_statistics_query_plan(
     match dialect {
         ExternalDriverStatisticsDialect::Oracle => oracle_object_statistics_query_plan(schema),
         ExternalDriverStatisticsDialect::Dameng => dameng_object_statistics_query_plan(schema),
-        ExternalDriverStatisticsDialect::Kingbase => {
-            vec![("catalog", kingbase::object_statistics_sql(schema), true)]
-        }
+        ExternalDriverStatisticsDialect::Kingbase => kingbase::object_statistics_query_plan(schema),
     }
 }
 
@@ -3124,16 +3141,16 @@ mod tests {
         oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
         oracle_object_statistics_rows_only_sql, oracle_object_statistics_sql,
         oracle_object_statistics_user_segments_sql, oracle_synonym_target_from_query_result, oracle_synonym_target_sql,
-        oracle_table_comment_from_query_result, oracle_table_comment_sql, oracle_table_comments_sql,
-        presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
-        presto_like_information_schema_tables_sql, presto_like_tables_from_query_result,
-        reference_key_columns_from_indexes, reference_keys_from_indexes, replace_metadata_runtime,
-        should_append_oracle_style_comment_ddl, should_query_oracle_columns_via_sql_first,
-        table_comments_from_query_result, table_name_filter_matches, tdengine_table_comment_like_pattern,
-        tdengine_table_comment_sql, tdengine_table_comments_sql, uses_mongodb_agent_collection_listing,
-        visible_schema_filter, ExternalDriverStatisticsDialect, MetadataErrorAction, MysqlTableListSource,
-        OracleObjectRef, OracleSynonymResolver, ReferenceKeyInfo, TableNameFilter, ORACLE_CURRENT_SCHEMA_SQL,
-        ORACLE_SYNONYM_MAX_DEPTH, TDENGINE_COMMENT_SEARCH_TIMEOUT, TDENGINE_LIKE_PATTERN_MAX_BYTES,
+        oracle_table_comment_sql, oracle_table_comments_sql, presto_like_columns_from_query_result,
+        presto_like_information_schema_columns_sql, presto_like_information_schema_tables_sql,
+        presto_like_tables_from_query_result, reference_key_columns_from_indexes, reference_keys_from_indexes,
+        replace_metadata_runtime, should_append_oracle_style_comment_ddl, should_query_oracle_columns_via_sql_first,
+        single_table_comment_from_query_result, table_comments_from_query_result, table_name_filter_matches,
+        tdengine_table_comment_like_pattern, tdengine_table_comment_sql, tdengine_table_comments_sql,
+        uses_mongodb_agent_collection_listing, visible_schema_filter, ExternalDriverStatisticsDialect,
+        MetadataErrorAction, MysqlTableListSource, OracleObjectRef, OracleSynonymResolver, ReferenceKeyInfo,
+        TableNameFilter, ORACLE_CURRENT_SCHEMA_SQL, ORACLE_SYNONYM_MAX_DEPTH, TDENGINE_COMMENT_SEARCH_TIMEOUT,
+        TDENGINE_LIKE_PATTERN_MAX_BYTES,
     };
     use super::{list_databases_core, list_tables_core};
     use super::{
@@ -3334,6 +3351,7 @@ mod tests {
             visible_schemas: None,
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -4217,7 +4235,8 @@ done
         assert!(dameng.iter().all(|(_, _, accept_empty)| *accept_empty));
 
         let kingbase = external_driver_statistics_query_plan(ExternalDriverStatisticsDialect::Kingbase, "public");
-        assert_eq!(kingbase.len(), 1);
+        assert_eq!(kingbase.len(), 2);
+        assert!(kingbase[1].1.contains("current_setting('block_size')"));
         assert!(kingbase[0].1.contains("sys_catalog.sys_class"));
     }
 
@@ -5648,7 +5667,7 @@ for line in sys.stdin:
     }
 
     #[test]
-    fn oracle_table_comment_from_query_result_returns_optional_non_blank_comment() {
+    fn single_table_comment_from_query_result_returns_optional_non_blank_comment() {
         let result = db::QueryResult {
             columns: vec!["COMMENTS".to_string()],
             column_types: Vec::new(),
@@ -5667,7 +5686,7 @@ for line in sys.stdin:
             messages: Vec::new(),
         };
 
-        assert_eq!(oracle_table_comment_from_query_result(result).unwrap().as_deref(), Some("Customer table"));
+        assert_eq!(single_table_comment_from_query_result(result).unwrap().as_deref(), Some("Customer table"));
 
         let empty = db::QueryResult {
             columns: vec!["COMMENTS".to_string()],
@@ -5687,7 +5706,7 @@ for line in sys.stdin:
             messages: Vec::new(),
         };
 
-        assert_eq!(oracle_table_comment_from_query_result(empty).unwrap(), None);
+        assert_eq!(single_table_comment_from_query_result(empty).unwrap(), None);
     }
 
     #[test]
@@ -6214,6 +6233,87 @@ done
             elasticsearch_raw_body: None,
             messages: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn kingbase_object_statistics_falls_back_when_size_function_is_missing() {
+        let mut queries = Vec::new();
+        let stats = super::object_statistics_from_query_plan(
+            "Kingbase",
+            "core's",
+            super::kingbase::object_statistics_query_plan("core's"),
+            |sql| {
+                queries.push(sql.clone());
+                async move {
+                    if sql.contains("sys_total_relation_size") {
+                        Err("kb: function sys_total_relation_size(oid) does not exist".to_string())
+                    } else {
+                        Ok(statistics_query_result(vec![vec![
+                            serde_json::json!("ceshi"),
+                            serde_json::json!("core's"),
+                            serde_json::json!(100),
+                            serde_json::json!(630784),
+                        ]]))
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(queries.len(), 2);
+        assert!(queries[1].contains("CAST(c.relpages AS BIGINT) * CAST(current_setting('block_size') AS BIGINT)"));
+        assert!(queries[1].contains("n.nspname = 'core''s'"));
+        assert_eq!(stats[0].name, "ceshi");
+        assert_eq!(stats[0].schema.as_deref(), Some("core's"));
+        assert_eq!(stats[0].total_bytes, Some(630784));
+        assert_eq!(stats[0].estimated_rows, Some(100));
+    }
+
+    #[tokio::test]
+    async fn kingbase_object_statistics_keeps_successful_size_results() {
+        for bytes in [None, Some(0), Some(8192)] {
+            let mut calls = 0;
+            let stats = super::object_statistics_from_query_plan(
+                "Kingbase",
+                "public",
+                super::kingbase::object_statistics_query_plan("public"),
+                |_| {
+                    calls += 1;
+                    let rows = bytes
+                        .map(|size| {
+                            vec![vec![
+                                serde_json::json!("ceshi"),
+                                serde_json::json!("public"),
+                                serde_json::json!(0),
+                                serde_json::json!(size),
+                            ]]
+                        })
+                        .unwrap_or_default();
+                    async move { Ok(statistics_query_result(rows)) }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(stats.first().and_then(|stat| stat.total_bytes), bytes);
+        }
+    }
+
+    #[tokio::test]
+    async fn kingbase_object_statistics_reports_error_when_both_queries_fail() {
+        let mut calls = 0;
+        let result = super::object_statistics_from_query_plan(
+            "Kingbase",
+            "public",
+            super::kingbase::object_statistics_query_plan("public"),
+            |_| {
+                calls += 1;
+                async { Err("permission denied".to_string()) }
+            },
+        )
+        .await;
+        assert_eq!(calls, 2);
+        assert_eq!(result.unwrap_err(), "permission denied");
     }
 
     #[tokio::test]
@@ -7010,13 +7110,18 @@ async fn list_object_statistics_once(
             .await;
         }
         if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
-            let sql = kingbase::object_statistics_sql(schema);
-            return agent_list_object_statistics(
-                client,
-                database,
+            let timeout_duration = agent_metadata_timeout(db_config.as_ref());
+            return object_statistics_from_query_plan(
+                "Kingbase",
                 schema,
-                sql,
-                agent_metadata_timeout(db_config.as_ref()),
+                kingbase::object_statistics_query_plan(schema),
+                |sql| {
+                    let client = client.clone();
+                    async move {
+                        let mut client = client.lock().await;
+                        agent_object_statistics_query(&mut client, database, schema, &sql, timeout_duration).await
+                    }
+                },
             )
             .await;
         }
@@ -11379,7 +11484,7 @@ async fn external_driver_oracle_table_comment(
             agent_metadata_timeout(Some(config)),
         )
         .await?;
-    oracle_table_comment_from_query_result(result)
+    single_table_comment_from_query_result(result)
 }
 
 async fn db2_agent_table_ddl(

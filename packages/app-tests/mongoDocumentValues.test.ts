@@ -241,9 +241,31 @@ test("applies sorted Mongo grid edits to a cloned BSON baseline by document id",
   ]);
 });
 
-test("builds Mongo inserts with parsed date values", () => {
-  assert.deepEqual(buildMongoInsertDocument(["ignored", 'new Date("2026-06-10T13:59:31.287Z")'], ["_id", "createdAt"]), {
+test("builds Mongo inserts with parsed date values and omits empty _id", () => {
+  assert.deepEqual(buildMongoInsertDocument([null, 'new Date("2026-06-10T13:59:31.287Z")'], ["_id", "createdAt"]), {
     createdAt: { $date: "2026-06-10T13:59:31.287Z" },
+  });
+  assert.deepEqual(buildMongoInsertDocument(["", 'new Date("2026-06-10T13:59:31.287Z")'], ["_id", "createdAt"]), {
+    createdAt: { $date: "2026-06-10T13:59:31.287Z" },
+  });
+});
+
+test("builds Mongo inserts preserving custom _id values (#11523)", () => {
+  assert.deepEqual(buildMongoInsertDocument(["custom_id_1", "Lin"], ["_id", "name"]), {
+    _id: "custom_id_1",
+    name: "Lin",
+  });
+  assert.deepEqual(buildMongoInsertDocument(["42", "Lin"], ["_id", "name"]), {
+    _id: 42,
+    name: "Lin",
+  });
+  assert.deepEqual(buildMongoInsertDocument(['ObjectId("507f1f77bcf86cd799439011")', "Lin"], ["_id", "name"]), {
+    _id: { $oid: "507f1f77bcf86cd799439011" },
+    name: "Lin",
+  });
+  assert.deepEqual(buildMongoInsertDocument(["507f1f77bcf86cd799439011", "Lin"], ["_id", "name"]), {
+    _id: { $oid: "507f1f77bcf86cd799439011" },
+    name: "Lin",
   });
 });
 
@@ -289,6 +311,18 @@ test("projects original Mongo values without guessing types", () => {
 
 test("applies only explicit Mongo grid edits to copied original documents", () => {
   assert.deepEqual(buildMongoCopyDocumentFromOriginal({ _id: "1", count: "123", profile: { role: "admin" } }, ["1", "456", '{"role":"maintainer"}'], ["_id", "count", "profile"], [false, true, false], { excludePrimaryKeys: true }), {
+    count: 456,
+    profile: { role: "admin" },
+  });
+});
+
+test("applies custom _id when explicitly edited on copied original documents (#11523)", () => {
+  assert.deepEqual(buildMongoCopyDocumentFromOriginal({ _id: { $oid: "507f1f77bcf86cd799439011" }, count: "123", profile: { role: "admin" } }, ["custom_id_2", "456", '{"role":"maintainer"}'], ["_id", "count", "profile"], [true, true, false], { excludePrimaryKeys: true }), {
+    _id: "custom_id_2",
+    count: 456,
+    profile: { role: "admin" },
+  });
+  assert.deepEqual(buildMongoCopyDocumentFromOriginal({ _id: { $oid: "507f1f77bcf86cd799439011" }, count: "123", profile: { role: "admin" } }, ["", "456", '{"role":"maintainer"}'], ["_id", "count", "profile"], [true, true, false], { excludePrimaryKeys: true }), {
     count: 456,
     profile: { role: "admin" },
   });
@@ -405,7 +439,11 @@ test("keeps explicit Mongo null fields distinct from missing fields during grid 
     _id: "1",
     nullable: null,
   });
+  assert.deepEqual(buildMongoInsertDocument([null, MONGO_DOCUMENT_GRID_NULL, null], columns), {
+    nullable: null,
+  });
   assert.deepEqual(buildMongoInsertDocument(["1", MONGO_DOCUMENT_GRID_NULL, null], columns), {
+    _id: 1,
     nullable: null,
   });
   assert.deepEqual(buildMongoCopyInsertDocument(["1", MONGO_DOCUMENT_GRID_NULL, null], columns), {

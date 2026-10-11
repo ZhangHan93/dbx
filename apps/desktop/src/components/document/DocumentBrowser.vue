@@ -2660,7 +2660,7 @@ onMounted(async () => {
   try {
     // A restored tab issues no query, so a blocking health probe here would be
     // the only round trip left on the switch.
-    await connectionStore.ensureConnected(props.connectionId, restoredDocumentData ? { verifyHealth: false } : {});
+    await connectionStore.ensureConnected(props.connectionId, { ...(restoredDocumentData ? { verifyHealth: false } : {}), skipIfClosedByUser: true });
   } catch (e) {
     console.warn("[DBX] ensureConnected failed for", props.connectionId, e);
   }
@@ -2885,7 +2885,7 @@ defineExpose({ focusSearch });
               <span>{{ t("grid.transposeMultiRowToggle") }}</span>
             </div>
             <LightTooltip :text="t('grid.transposeMultiRowHint')" side="left" :side-offset="6" :delay="0" :open-on-focus="false">
-              <div class="grid w-32 grid-cols-2 rounded-md border bg-muted/40 p-0.5">
+              <div class="grid min-w-40 grid-cols-2 rounded-md border bg-muted/40 p-0.5">
                 <button
                   v-for="multiRow in [false, true]"
                   :key="String(multiRow)"

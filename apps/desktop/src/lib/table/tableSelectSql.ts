@@ -172,6 +172,7 @@ function requiresIdentifierQuote(databaseType: DatabaseType | undefined, name: s
     case "goldendb":
       return requiresMysqlIdentifierQuote(name);
     case "oracle":
+    case "oceanbase-oracle":
       return requiresOracleIdentifierQuote(name);
     case "dameng":
       return requiresDamengIdentifierQuote(name);

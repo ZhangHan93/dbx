@@ -1,4 +1,5 @@
 pub mod batch_progress;
+pub use dbx_drivers::query_messages;
 pub mod document_ops;
 pub mod hbase_ops;
 pub mod mongo_ops;
@@ -6836,28 +6837,7 @@ async fn execute_manual_txn_postgres_statement(
     sql: &str,
     row_limit: usize,
 ) -> Result<db::QueryResult, String> {
-    if db::postgres::postgres_statement_returns_rows(sql) {
-        db::postgres::execute_select_query_unnamed(conn, sql, std::time::Instant::now(), row_limit).await
-    } else {
-        let affected = conn.execute_typed(sql, &[]).await.map_err(|e| format!("Query failed: {e}"))?;
-        Ok(db::QueryResult {
-            columns: vec![],
-            column_types: Vec::new(),
-            column_sortables: vec![],
-            spatial_columns: vec![],
-            spatial_values: vec![],
-            rows: vec![],
-            affected_rows: affected,
-            execution_time_ms: 0,
-            server_execute_time_us: None,
-            query_timings_ms: None,
-            truncated: false,
-            session_id: None,
-            has_more: false,
-            elasticsearch_raw_body: None,
-            messages: Vec::new(),
-        })
-    }
+    db::postgres::execute_query_on_client_unnamed(conn, sql, row_limit).await
 }
 
 async fn execute_manual_txn_mysql_statement(
@@ -8176,6 +8156,7 @@ for line in sys.stdin:
             visible_schemas: None,
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,
@@ -11214,6 +11195,7 @@ for line in sys.stdin:
             visible_schemas: None,
             show_system_schemas: false,
             sidebar_auto_load_all_tables: false,
+            show_database_links: None,
             attached_databases: Vec::new(),
             init_script: None,
             color: None,

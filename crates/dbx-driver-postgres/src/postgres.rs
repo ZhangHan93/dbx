@@ -503,6 +503,26 @@ impl<'a> FromSql<'a> for PgRawBytes {
     }
 }
 
+struct PgJsonText(String);
+
+impl<'a> FromSql<'a> for PgJsonText {
+    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+        let text = if *ty == Type::JSONB {
+            match raw.split_first() {
+                Some((&1, text)) => text,
+                _ => return Err("unsupported PostgreSQL jsonb version".into()),
+            }
+        } else {
+            raw
+        };
+        Ok(PgJsonText(std::str::from_utf8(text)?.to_string()))
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        matches!(*ty, Type::JSON | Type::JSONB)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PgPoint {
     x: f64,
@@ -1103,6 +1123,9 @@ pub fn pg_value_to_json_classified(row: &impl ValueRow, idx: usize, col_type: Pg
             .map(|bytes| super::binary_value_to_json(&bytes))
             .unwrap_or(serde_json::Value::Null),
         PgColType::Json => {
+            if let Ok(PgJsonText(text)) = row.try_get::<_, PgJsonText>(idx) {
+                return serde_json::Value::String(text);
+            }
             if let Ok(v) = row.try_get::<_, serde_json::Value>(idx) {
                 return serde_json::Value::String(v.to_string());
             }
@@ -2537,6 +2560,8 @@ async fn stream_select_query_inner_with_mode(
     on_item: &mut impl FnMut(PostgresQueryStreamItem) -> Result<(), String>,
     force_unnamed: bool,
 ) -> Result<u64, String> {
+    let _ = drain_postgres_notices(client).await;
+    let _notice_subscription = subscribe_postgres_notices(client).await;
     let client = &EncodingClient::new(client);
     match stream_select_query_prepared(client, sql, row_limit, on_item, force_unnamed).await {
         Ok(rows) => Ok(rows),
@@ -2736,7 +2761,36 @@ fn postgres_connection_key_from_row(row: &tokio_postgres::Row) -> Option<Postgre
 /// Notice buffers for live connections, keyed by connection identity. Entries
 /// are weak so they disappear once the pooled connection (and its driver
 /// task) is dropped.
-type PostgresNoticeBuffers = HashMap<PostgresConnectionKey, Weak<Mutex<Vec<QueryMessage>>>>;
+type PostgresNoticeBuffers = HashMap<PostgresConnectionKey, Weak<Mutex<PostgresNoticeBuffer>>>;
+
+#[derive(Default)]
+struct PostgresNoticeBuffer {
+    messages: dbx_driver_support::query_messages::QueryMessageBuffer,
+    sink: Option<dbx_driver_support::query_messages::QueryMessageSink>,
+}
+
+struct PostgresNoticeSubscription(Arc<Mutex<PostgresNoticeBuffer>>);
+
+impl Drop for PostgresNoticeSubscription {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).sink = None;
+    }
+}
+
+fn capture_postgres_notice(buffer: &Mutex<PostgresNoticeBuffer>, message: QueryMessage) {
+    let mut buffer = buffer.lock().unwrap_or_else(|error| error.into_inner());
+    if let (Some(message), Some(sink)) = (buffer.messages.push(message), buffer.sink.as_ref()) {
+        sink(message);
+    }
+}
+
+async fn subscribe_postgres_notices(client: &deadpool_postgres::Client) -> Option<PostgresNoticeSubscription> {
+    let key = postgres_client_key(&EncodingClient::new(client)).await?;
+    let buffer = postgres_notice_buffers().lock().unwrap_or_else(|error| error.into_inner()).get(&key)?.upgrade()?;
+    buffer.lock().unwrap_or_else(|error| error.into_inner()).sink =
+        dbx_driver_support::query_messages::current_query_message_sink();
+    Some(PostgresNoticeSubscription(buffer))
+}
 
 fn postgres_notice_buffers() -> &'static Mutex<PostgresNoticeBuffers> {
     static BUFFERS: OnceLock<Mutex<PostgresNoticeBuffers>> = OnceLock::new();
@@ -2917,7 +2971,7 @@ where
             // No query can complete before the connection is being driven, so
             // the notice buffer is handed to the driver task through a slot
             // that is filled once the backend PID is known.
-            let notice_buffer = Arc::new(Mutex::new(None::<Arc<Mutex<Vec<QueryMessage>>>>));
+            let notice_buffer = Arc::new(Mutex::new(None::<Arc<Mutex<PostgresNoticeBuffer>>>));
             let task_buffer = Arc::clone(&notice_buffer);
             let conn_task = tokio::spawn(async move {
                 loop {
@@ -2933,7 +2987,7 @@ where
                             let buffer = task_buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
                             match buffer {
                                 Some(buffer) => {
-                                    buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(message);
+                                    capture_postgres_notice(&buffer, message);
                                 }
                                 None => {
                                     log::info!("[postgres][notice] {}: {}", message.severity, message.message);
@@ -2956,7 +3010,7 @@ where
             // by the driver task instead. Never fail the connection over this.
             if let Ok(row) = client.query_one(POSTGRES_CONNECTION_IDENTITY_SQL, &[]).await {
                 if let Some(key) = postgres_connection_key_from_row(&row) {
-                    let buffer = Arc::new(Mutex::new(Vec::new()));
+                    let buffer = Arc::new(Mutex::new(PostgresNoticeBuffer::default()));
                     let mut buffers = postgres_notice_buffers().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                     buffers.retain(|_, weak| weak.strong_count() > 0);
                     buffers.insert(key, Arc::downgrade(&buffer));
@@ -3021,7 +3075,7 @@ fn take_notices_for_key(key: &PostgresConnectionKey) -> Vec<QueryMessage> {
     let Some(buffer) = buffer else {
         return Vec::new();
     };
-    let notices = std::mem::take(&mut *buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let notices = buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).messages.take();
     notices
 }
 
@@ -8675,6 +8729,8 @@ pub async fn execute_query_with_max_rows(
     // by this statement are attached to its result.
     let _ = drain_postgres_notices(client).await;
 
+    let _notice_subscription = subscribe_postgres_notices(client).await;
+
     let result = if postgres_statement_returns_rows(sql) {
         execute_select_query(client, sql, start, row_limit).await
     } else {
@@ -9509,6 +9565,8 @@ async fn execute_query_with_max_rows_inner(
     // raised by this statement are attached to its result.
     let _ = drain_postgres_notices(client).await;
 
+    let _notice_subscription = subscribe_postgres_notices(client).await;
+
     let result = if postgres_statement_returns_rows(sql) {
         if prefer_text_protocol {
             execute_select_text(client, sql, start, row_limit, None, progress_clock.as_deref()).await
@@ -9550,6 +9608,14 @@ async fn execute_query_with_max_rows_inner(
             Err(error)
         }
     }
+}
+
+pub async fn execute_query_on_client_unnamed(
+    client: &deadpool_postgres::Client,
+    sql: &str,
+    max_rows: usize,
+) -> Result<QueryResult, String> {
+    execute_query_with_max_rows_inner(client, sql, Some(max_rows), false, None, true).await
 }
 
 // Sibling of `postgres_indexes_for_relations_sql` (~line 3288), for a single
@@ -11322,6 +11388,78 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL database"]
+    async fn postgres_query_messages_stream_and_survive_cancel_and_error() {
+        use dbx_driver_support::query_messages::{with_query_messages, QueryMessagesCallback};
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect_with_local_timezone(&url, Duration::from_secs(10), "UTC").await.unwrap();
+        for outcome in ["success", "error", "cancel"] {
+            let emitted = Arc::new(Mutex::new(Vec::new()));
+            let output = Arc::clone(&emitted);
+            let token = CancellationToken::new();
+            let cancel = token.clone();
+            let callback: QueryMessagesCallback = Arc::new(move |messages| {
+                output.lock().unwrap().extend(messages);
+                if outcome == "cancel" {
+                    cancel.cancel();
+                }
+            });
+            let ending =
+                if outcome == "error" { "RAISE EXCEPTION 'expected failure';" } else { "RAISE NOTICE 'second';" };
+            let sql = format!("DO $$ BEGIN RAISE NOTICE 'first'; PERFORM pg_sleep(2); {ending} END $$");
+            let budget = crate::execution::DbOperationBudget::with_defaults();
+            let query = with_query_messages(
+                Some(callback),
+                execute_query_with_max_rows_and_cancel(&pool, &sql, None, Some(token), budget, None, false),
+            );
+            let mut query = std::pin::pin!(query);
+            if outcome != "cancel" {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        tokio::select! {
+                            result = query.as_mut() => panic!("query finished before displaying its first notice: {result:?}"),
+                            _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                                if !emitted.lock().unwrap().is_empty() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }).await.unwrap();
+                assert_eq!(emitted.lock().unwrap()[0].message, "first");
+            }
+            let result = query.await;
+            if outcome == "success" {
+                assert_eq!(result.unwrap().messages.len(), 2);
+                assert_eq!(emitted.lock().unwrap().len(), 2);
+            } else {
+                assert!(result.is_err());
+                assert_eq!(emitted.lock().unwrap().len(), 1);
+                assert_eq!(emitted.lock().unwrap()[0].message, "first");
+            }
+            assert!(execute_query_with_max_rows(&pool, "SELECT 1", None).await.unwrap().messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn postgres_notice_subscriptions_are_connection_scoped_and_removed_on_drop() {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&received);
+        let first = Arc::new(Mutex::new(PostgresNoticeBuffer {
+            sink: Some(Arc::new(move |message| output.lock().unwrap().push(message))),
+            ..Default::default()
+        }));
+        let second = Mutex::new(PostgresNoticeBuffer::default());
+        let subscription = PostgresNoticeSubscription(Arc::clone(&first));
+        capture_postgres_notice(&first, test_query_message("first connection"));
+        capture_postgres_notice(&second, test_query_message("second connection"));
+        assert_eq!(received.lock().unwrap().len(), 1);
+        drop(subscription);
+        capture_postgres_notice(&first, test_query_message("after cancellation"));
+        assert_eq!(received.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn postgres_connection_identity_normalizes_vendor_numeric_types_to_text() {
         assert!(POSTGRES_CONNECTION_IDENTITY_SQL.contains("pg_backend_pid()::text"));
@@ -11388,7 +11526,9 @@ mod tests {
     #[test]
     fn take_notices_for_key_returns_buffered_notices_and_empties_buffer() {
         let key = ("test-host".to_string(), "9000001".to_string(), "9000001".to_string());
-        let buffer = Arc::new(Mutex::new(vec![test_query_message("first"), test_query_message("second")]));
+        let buffer = Arc::new(Mutex::new(PostgresNoticeBuffer::default()));
+        capture_postgres_notice(&buffer, test_query_message("first"));
+        capture_postgres_notice(&buffer, test_query_message("second"));
         postgres_notice_buffers()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -11403,7 +11543,7 @@ mod tests {
 
         // The buffer was drained but stays registered while the connection lives.
         assert!(take_notices_for_key(&key).is_empty());
-        buffer.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).push(test_query_message("third"));
+        capture_postgres_notice(&buffer, test_query_message("third"));
         let notices = take_notices_for_key(&key);
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].message, "third");
@@ -11413,8 +11553,10 @@ mod tests {
     fn take_notices_for_key_prunes_dead_buffers_and_misses_return_empty() {
         let live_key = ("test-host".to_string(), "9000002".to_string(), "9000002".to_string());
         let dead_key = ("test-host".to_string(), "9000003".to_string(), "9000003".to_string());
-        let live = Arc::new(Mutex::new(vec![test_query_message("live")]));
-        let dead = Arc::new(Mutex::new(vec![test_query_message("dead")]));
+        let live = Arc::new(Mutex::new(PostgresNoticeBuffer::default()));
+        capture_postgres_notice(&live, test_query_message("live"));
+        let dead = Arc::new(Mutex::new(PostgresNoticeBuffer::default()));
+        capture_postgres_notice(&dead, test_query_message("dead"));
         {
             let mut buffers = postgres_notice_buffers().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             buffers.insert(live_key.clone(), Arc::downgrade(&live));
@@ -11442,8 +11584,10 @@ mod tests {
         // keeps notice attribution separate.
         let key_a = ("server-a".to_string(), "5432".to_string(), "42".to_string());
         let key_b = ("server-b".to_string(), "5432".to_string(), "42".to_string());
-        let buffer_a = Arc::new(Mutex::new(vec![test_query_message("from-a")]));
-        let buffer_b = Arc::new(Mutex::new(vec![test_query_message("from-b")]));
+        let buffer_a = Arc::new(Mutex::new(PostgresNoticeBuffer::default()));
+        capture_postgres_notice(&buffer_a, test_query_message("from-a"));
+        let buffer_b = Arc::new(Mutex::new(PostgresNoticeBuffer::default()));
+        capture_postgres_notice(&buffer_b, test_query_message("from-b"));
         {
             let mut buffers = postgres_notice_buffers().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             buffers.insert(key_a.clone(), Arc::downgrade(&buffer_a));
@@ -11505,6 +11649,43 @@ mod tests {
         assert!(Vec::<Option<serde_json::Value>>::accepts(&Type::JSONB_ARRAY));
         assert!(!Vec::<Option<serde_json::Value>>::accepts(&Type::TEXT_ARRAY));
         assert!(!Vec::<Option<serde_json::Value>>::accepts(&Type::INT4_ARRAY));
+    }
+
+    #[test]
+    fn postgres_json_text_keeps_server_formatting() {
+        let json = PgJsonText::from_sql(&Type::JSON, br#"{"k1":      12, "k1": 2}"#).unwrap();
+        let jsonb = PgJsonText::from_sql(&Type::JSONB, &pg_jsonb_binary(br#"{"k1": 12}"#)).unwrap();
+
+        assert_eq!(json.0, r#"{"k1":      12, "k1": 2}"#);
+        assert_eq!(jsonb.0, r#"{"k1": 12}"#);
+        assert!(PgJsonText::from_sql(&Type::JSONB, &[2, b'1']).is_err());
+        assert!(!PgJsonText::accepts(&Type::TEXT));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DBX_TEST_POSTGRES_URL pointing at a PostgreSQL database"]
+    async fn postgres_query_json_cells_match_server_text_output() {
+        let url = std::env::var("DBX_TEST_POSTGRES_URL").expect("DBX_TEST_POSTGRES_URL");
+        let pool = connect_with_local_timezone(&url, Duration::from_secs(10), "UTC")
+            .await
+            .expect("connect PostgreSQL database");
+        let client = pool.get().await.expect("checkout PostgreSQL database");
+        let sql = r#"SELECT '{"k1":      12, "b": [1,2]}'::json AS j, '{"k1":      12, "b": [1,2]}'::jsonb AS jb"#;
+
+        for prefer_text_protocol in [false, true] {
+            let result = execute_query_with_max_rows_inner(&client, sql, None, prefer_text_protocol, None, false)
+                .await
+                .expect("select json values");
+
+            assert_eq!(
+                result.rows[0],
+                vec![
+                    serde_json::json!(r#"{"k1":      12, "b": [1,2]}"#),
+                    serde_json::json!(r#"{"b": [1, 2], "k1": 12}"#),
+                ],
+                "prefer_text_protocol={prefer_text_protocol}"
+            );
+        }
     }
 
     #[test]

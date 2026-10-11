@@ -1652,6 +1652,7 @@ export type TreeNodeType =
   | "package-body"
   | "group-columns"
   | "group-indexes"
+  | "group-database-indexes"
   | "group-fkeys"
   | "group-triggers"
   | "group-events"
@@ -1665,6 +1666,8 @@ export type TreeNodeType =
   | "group-materialized-views"
   | "group-procedures"
   | "group-functions"
+  | "group-internal-functions"
+  | "group-udf-functions"
   | "group-types"
   | "group-sequences"
   | "group-synonyms"
@@ -2126,6 +2129,7 @@ export interface QueryTab {
     columnName: string;
   };
   executionId?: string;
+  liveQueryMessages?: QueryMessage[];
   /** Ephemeral result run targeted by the current execution; null means a new run is being produced. */
   executingResultRunId?: string | null;
   isExplaining?: boolean;

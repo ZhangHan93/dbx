@@ -333,6 +333,7 @@ export interface DesktopSettings {
 export interface McpGlobalPolicy {
   readOnly: boolean;
   allowDangerousSql: boolean;
+  promptHighRiskSql: boolean;
   allowedConnectionIds: string[] | null;
   allowedGroupIds: string[];
   allowedToolNames: string[] | null;
@@ -1972,6 +1973,12 @@ export interface ExecuteMultiProgress {
   executionTimeMs: number;
   affectedRows: number;
   error?: BackendError;
+}
+
+export async function subscribeQueryMessages(executionId: string, onMessages: (messages: import("@/types/database").QueryMessage[]) => void): Promise<() => void> {
+  return listen<{ executionId: string; messages: import("@/types/database").QueryMessage[] }>("query-messages", (event) => {
+    if (event.payload.executionId === executionId) onMessages(event.payload.messages);
+  });
 }
 
 export async function executeMultiWithProgress(
@@ -6182,6 +6189,8 @@ export interface TableExportRequest {
   /** 与 `columns` 对齐的列 EXTRA 元数据（identity 等），用于 SQL INSERT 导出的 `SET IDENTITY_INSERT`。 */
   columnExtras?: Array<string | null | undefined>;
   columnComments?: Array<string | null> | null;
+  /** xlsx 专用：注释作为第二行表头（第 1 行列名、第 2 行注释、数据从第 3 行开始）。 */
+  headerCommentRows?: boolean;
   primaryKeys?: string[];
   /** 导出 SQL 时是否排除主键列（对应数据提取设置里的“排除主键”）。 */
   excludePrimaryKeys?: boolean;
@@ -6248,6 +6257,8 @@ export interface QueryResultExportRequest {
   timeoutSecs?: number;
   keysetOptimizationEnabled: boolean;
   clientSessionId?: string;
+  /** Open manual transaction to read through, so the export sees its uncommitted changes. */
+  txnSessionId?: string;
   executionId?: string;
   dateTimeFormat?: string;
   exportTableName?: string;
@@ -6262,6 +6273,8 @@ export interface QueryResultExportRequest {
   exportColumnExtras?: Array<string | null | undefined>;
   numericColumnRightAlign?: boolean;
   columnComments?: Array<string | null> | null;
+  /** xlsx 专用：注释作为第二行表头（第 1 行列名、第 2 行注释、数据从第 3 行开始）。 */
+  headerCommentRows?: boolean;
   autoFilter?: boolean;
   identifierQuote?: string;
   /** 导出 SQL 时是否排除主键列（对应数据提取设置里的“排除主键”）。 */
@@ -6430,6 +6443,7 @@ export async function exportQueryResultXlsx(
   numericColumnRightAlign?: boolean,
   autoFilter?: boolean,
   dateTimeFormat?: string,
+  headerCommentRows?: boolean,
 ): Promise<void> {
   return invoke("export_query_result_xlsx", {
     request: {
@@ -6442,6 +6456,7 @@ export async function exportQueryResultXlsx(
       numericColumnRightAlign,
       autoFilter,
       dateTimeFormat,
+      headerCommentRows,
     },
   });
 }
@@ -6456,6 +6471,7 @@ export async function exportQueryResultsXlsx(
     rows: readonly (readonly XlsxCellValue[])[];
     numericColumnRightAlign?: boolean;
     autoFilter?: boolean;
+    headerCommentRows?: boolean;
   }[],
   autoFilter?: boolean,
   dateTimeFormat?: string,

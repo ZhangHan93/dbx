@@ -844,6 +844,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
           currentSchema: props.schema,
           keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
           functionCase: settingsStore.editorSettings.sqlFormatter.functionCase,
+          identifierCase: settingsStore.editorSettings.sqlFormatter.identifierCase,
           autoAliasTables: settingsStore.editorSettings.autoAliasTables,
           tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
           quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
@@ -908,6 +909,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
           currentSchema: props.schema,
           keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
           functionCase: settingsStore.editorSettings.sqlFormatter.functionCase,
+          identifierCase: settingsStore.editorSettings.sqlFormatter.identifierCase,
           autoAliasTables: settingsStore.editorSettings.autoAliasTables,
           tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
           quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
@@ -1140,7 +1142,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       }
     }
 
-    const cteDefs = analyzedCtes?.sql === fullDoc ? analyzedCtes.definitions : extractCteDefinitions(fullDoc);
+    const cteDefs = analyzedCtes?.sql === fullDoc ? analyzedCtes.definitions : extractCteDefinitions(fullDoc, props.databaseType);
     for (const refTable of completionContext.referencedTables) {
       if (refTable.columns?.length) {
         columnsByTable.set(
@@ -1213,6 +1215,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       currentSchema: scope.schema,
       keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
       functionCase: settingsStore.editorSettings.sqlFormatter.functionCase,
+      identifierCase: settingsStore.editorSettings.sqlFormatter.identifierCase,
       autoAliasTables: settingsStore.editorSettings.autoAliasTables,
       tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
       quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
@@ -1408,6 +1411,12 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
 
   function completionObjectKindsForContext(completionContext: ReturnType<typeof getSqlCompletionContext>): CompletionAssistantObjectKind[] {
     if (completionContext.contextKind === "exec") return ["procedure"];
+    if (isOracleCompletionDatabase(props.databaseType)) {
+      if (completionContext.suggestColumns && completionContext.referencedTables.length > 0 && !completionContext.qualifier) {
+        return ["function", "sequence"];
+      }
+      return ["routine", "sequence"];
+    }
     if (completionContext.suggestColumns && completionContext.referencedTables.length > 0 && !completionContext.qualifier) return ["function"];
     return ["routine"];
   }
@@ -1562,7 +1571,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
     }
 
     // Populate CTE columns from parsed definitions
-    const cteDefs = analyzedCtes?.sql === fullDoc ? analyzedCtes.definitions : extractCteDefinitions(fullDoc);
+    const cteDefs = analyzedCtes?.sql === fullDoc ? analyzedCtes.definitions : extractCteDefinitions(fullDoc, props.databaseType);
     for (const refTable of refs) {
       if (refTable.columns) continue;
       const cteDef = cteDefs.find((c) => c.name.toLowerCase() === refTable.name.toLowerCase());
@@ -1678,6 +1687,7 @@ export function useQueryEditorCompletion(options: QueryEditorCompletionOptions) 
       currentSchema: scope.schema,
       keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
       functionCase: settingsStore.editorSettings.sqlFormatter.functionCase,
+      identifierCase: settingsStore.editorSettings.sqlFormatter.identifierCase,
       autoAliasTables: settingsStore.editorSettings.autoAliasTables,
       tableCompletionSchemaQualification: settingsStore.editorSettings.tableCompletionSchemaQualification,
       quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,

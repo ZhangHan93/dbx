@@ -1,5 +1,6 @@
 import { hasShortDataGridSqlPage } from "@/lib/dataGrid/dataGridPagination";
 import { createQueryRequestTiming } from "@/lib/queryRequestTiming";
+import { mergeQueryMessages, queryResultMessages } from "@/lib/query/queryResultMessages";
 import { appendNeo4jNodeCells, extractNeo4jNodeCells } from "@/lib/neo4j/neo4jNodeResult";
 import { UPDATE_RESTORE_KEY, assertUpdateAllowsInteraction } from "@/lib/app/updatePreparation";
 import { defineStore } from "pinia";
@@ -297,6 +298,12 @@ interface TableDataRefreshTarget {
 
 function tabClientSessionId(tab: Pick<QueryTab, "id">, suffix?: (typeof BACKGROUND_CLIENT_SESSION_SUFFIXES)[number]): string {
   return suffix ? `${tab.id}:${suffix}` : tab.id;
+}
+
+// The export session is a separate connection, so it only sees committed data.
+// An open manual transaction is passed along for the backend to read through.
+function exportTxnSessionId(tab: Pick<QueryTab, "autoCommit" | "txnSessionId">): string | undefined {
+  return tab.autoCommit === false ? tab.txnSessionId : undefined;
 }
 
 function resultRunCacheKey(tabId: string, runId: string): string {
@@ -903,11 +910,14 @@ function bindColumnsForSource(
       if (!column.sourceName) return column;
       if (column.sourceKey) {
         if (column.sourceKey !== source.key) return column;
-        if (dbType === "oracle" && !column.sourceNameQuoted && column.sourceName.toUpperCase() === "ROWID") return column;
+        if ((dbType === "oracle" || dbType === "oceanbase-oracle") && !column.sourceNameQuoted && column.sourceName.toUpperCase() === "ROWID") return column;
         const canonicalName = resolveSourceColumnName(dbType, column.sourceName, column.sourceNameQuoted, tableColumns);
         return { ...column, sourceName: canonicalName };
       }
       if (column.sourceQualifier) return column;
+      if (dbType === "oceanbase-oracle" && !column.sourceNameQuoted && column.sourceName.toUpperCase() === "ROWID" && editableQuerySources(analysis).length === 1) {
+        return { ...column, sourceKey: source.key };
+      }
       const matchingSources = allSourceColumns.flatMap((entry) => {
         const canonicalName = resolveSourceColumnName(dbType, column.sourceName!, column.sourceNameQuoted, entry.columns);
         return canonicalName ? [{ source: entry.source, canonicalName }] : [];
@@ -1759,6 +1769,7 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   function clearResultPayload(tab: QueryTab, options: { evicted?: boolean; preserveCacheSnapshot?: boolean } = {}) {
+    if (!tab.isExecuting) tab.liveQueryMessages = undefined;
     tab.result = undefined;
     tab.results = undefined;
     tab.activeResultIndex = undefined;
@@ -4431,7 +4442,9 @@ export const useQueryStore = defineStore("query", () => {
           // A user-initiated disconnect that closed these tabs already owns
           // the teardown — don't stack a second one on top of it.
           if (connectionStore.hasDisconnectInFlight(connectionId)) return;
-          await connectionStore.disconnect(connectionId);
+          // 系统侧释放（页签关闭触发的回收）不算用户关闭：写标记会让用户重新打开
+          // 这个插件页签时连不上。
+          await connectionStore.disconnect(connectionId, { markClosedByUser: false });
         } catch (error) {
           console.warn("[DBX][plugin-tab-close:disconnect]", connectionId, error);
         } finally {
@@ -5401,10 +5414,12 @@ export const useQueryStore = defineStore("query", () => {
       pendingSqlServerTransactionEnds.set(id, ending);
       return ending;
     }
+    const sessionId = tab.txnSessionId;
     try {
-      await api.commitManualTransaction(tab.txnSessionId);
+      await api.commitManualTransaction(sessionId);
     } finally {
-      clearManualTransactionSession(tab);
+      // A mode or target switch may have started a replacement transaction.
+      if (tab.txnSessionId === sessionId) clearManualTransactionSession(tab);
     }
   }
 
@@ -6278,13 +6293,15 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   function loadedEditableSourceFromColumns(target: EditableSourceMetadataTarget, loadedColumns: Awaited<ReturnType<typeof loadTableColumns>>): LoadedEditableSource {
+    const usesReportedSchema = target.request.databaseType === "vastbase" || target.request.databaseType === "kingbase";
+    const writeSchema = usesReportedSchema && !target.writeSchema ? loadedColumns.schema : target.writeSchema;
     return {
       source: target.source,
       analysis: target.analysis,
       tableMeta: {
         catalog: target.request.catalog,
         database: target.request.database,
-        schema: target.writeSchema,
+        schema: writeSchema,
         tableName: target.request.tableName,
         tableType: loadedColumns.tableType,
         columns: loadedColumns.columns,
@@ -6327,7 +6344,7 @@ export const useQueryStore = defineStore("query", () => {
     const selectedColumns = new Set(
       analysis.columns.flatMap((column) => {
         if (!column.sourceName || column.sourceKey !== sourceKey) return [];
-        if (databaseType === "oracle" && !column.sourceNameQuoted && column.sourceName.toUpperCase() === "ROWID") return [DBX_ROWID_COLUMN, column.sourceName];
+        if ((databaseType === "oracle" || databaseType === "oceanbase-oracle") && !column.sourceNameQuoted && column.sourceName.toUpperCase() === "ROWID") return [DBX_ROWID_COLUMN, column.sourceName];
         return [column.sourceName];
       }),
     );
@@ -6353,9 +6370,9 @@ export const useQueryStore = defineStore("query", () => {
   async function resolveOracleRowIdSafety(tab: QueryTab, loaded: LoadedEditableSource, databaseType: DatabaseType): Promise<boolean> {
     if (oracleRowIdIsSafeForQuery(tab, loaded)) return true;
     if (loaded.tableMeta.tableType?.trim()) return false;
-    // Never enumerate an Oracle schema on the query execution path: large
+    // Never enumerate an Oracle/OB schema on the query execution path: large
     // schemas can make this optional editability check take minutes (#8462).
-    if (databaseType === "oracle") return false;
+    if (databaseType === "oracle" || databaseType === "oceanbase-oracle") return false;
 
     const connection = useConnectionStore().getConfig(tab.connectionId!);
     const schema = loaded.tableMeta.schema?.trim() || tab.schema?.trim() || connection?.default_schema?.trim() || "";
@@ -6390,7 +6407,9 @@ export const useQueryStore = defineStore("query", () => {
     const unchanged = { sql, metadataSql: sql, hiddenPrimaryKeys: [], largeValuePreview };
     const missingPrimaryKeys =
       declaredPrimaryKeys.length === 0
-        ? primaryKeys.filter((primaryKey) => !(databaseType === "oracle" && primaryKey === DBX_ROWID_COLUMN && metadataAnalysis.columns.some((column) => column.sourceKey === loaded.source.key && !column.sourceNameQuoted && column.sourceName?.toUpperCase() === "ROWID")))
+        ? primaryKeys.filter(
+            (primaryKey) => !((databaseType === "oracle" || databaseType === "oceanbase-oracle") && primaryKey === DBX_ROWID_COLUMN && metadataAnalysis.columns.some((column) => column.sourceKey === loaded.source.key && !column.sourceNameQuoted && column.sourceName?.toUpperCase() === "ROWID")),
+          )
         : missingPrimaryKeysForSource(databaseType, primaryKeys, metadataAnalysis, loaded.source.key);
     if (missingPrimaryKeys.length === 0) return unchanged;
     const primaryKeySet = new Set(primaryKeys);
@@ -6402,7 +6421,7 @@ export const useQueryStore = defineStore("query", () => {
       databaseType,
       primaryKeys: missingPrimaryKeys,
       existingResultNames: metadataAnalysis.selectStar ? loaded.tableMeta.columns.map((column) => column.name) : metadataAnalysis.columns.map((column) => column.resultName),
-      sourceExpressions: missingPrimaryKeys.includes(DBX_ROWID_COLUMN) && (databaseType === "oracle" || databaseType === "xugu") ? { [DBX_ROWID_COLUMN]: databaseType === "oracle" ? "ROWIDTOCHAR(ROWID)" : "ROWID" } : undefined,
+      sourceExpressions: missingPrimaryKeys.includes(DBX_ROWID_COLUMN) && (databaseType === "oracle" || databaseType === "oceanbase-oracle" || databaseType === "xugu") ? { [DBX_ROWID_COLUMN]: databaseType === "xugu" ? "ROWID" : "ROWIDTOCHAR(ROWID)" } : undefined,
     });
     if (!rewritten) return unchanged;
     queryExecutionLog("info", "hidden-primary-keys", {
@@ -6500,9 +6519,9 @@ export const useQueryStore = defineStore("query", () => {
       if (loaded.tableMeta.columns.length === 0) return unchanged;
       if (loaded.tableMeta.tableType?.toUpperCase().includes("VIEW")) return unchanged;
       const primaryKeys = loaded.tableMeta.primaryKeys;
-      const syntheticRowId = (databaseType === "oracle" || databaseType === "xugu") && usesSyntheticRowIdKey(databaseType, primaryKeys, loaded.tableMeta.tableType);
+      const syntheticRowId = (databaseType === "oracle" || databaseType === "oceanbase-oracle" || databaseType === "xugu") && usesSyntheticRowIdKey(databaseType, primaryKeys, loaded.tableMeta.tableType);
       // Base tables without a natural identifier use the same ROWID identity
-      // as table-data tabs (Oracle and Xugu). Confirm the object is a base
+      // as table-data tabs (Oracle, OceanBase Oracle and Xugu). Confirm the object is a base
       // table because selecting ROWID from a view can fail with ORA-01445.
       if (syntheticRowId && !(await resolveOracleRowIdSafety(tab, loaded, databaseType))) return unchanged;
       const declaredPrimaryKeys = syntheticRowId ? [] : primaryKeys;
@@ -7096,6 +7115,7 @@ export const useQueryStore = defineStore("query", () => {
     }
     tab.executionId = executionId;
     const tableDataNativeSelectionBlockOwner = tab.mode === "data" ? {} : undefined;
+    tab.liveQueryMessages = [];
     if (tableDataNativeSelectionBlockOwner) beginDataGridNativeSelectionBlock(tableDataNativeSelectionBlockOwner);
     const previousDisplayedSql = tab.resultBaseSql ?? tab.lastExecutedSql ?? tab.sql;
     tab.lastExecutedSql = sql;
@@ -7147,6 +7167,7 @@ export const useQueryStore = defineStore("query", () => {
     let countSql: string | undefined;
     let exactQueryRowBound: number | undefined;
     let useAgentResultSession = false;
+    let unsubscribeQueryMessages: (() => void) | undefined;
     let paginationRowNumberColumn: string | undefined;
     let executionDispatched = false;
     let clientRequestStartedAt: number | undefined;
@@ -7159,6 +7180,14 @@ export const useQueryStore = defineStore("query", () => {
     // the row/column locate flow. These locals live inside the try block.
     let errorLocateContext: { databaseType: DatabaseType | undefined; parameterOptions: SqlParameterOptions | undefined; sourceOffset: number | undefined; executedSql: string | undefined } | undefined;
     try {
+      if (isTauriRuntime()) {
+        unsubscribeQueryMessages = await api.subscribeQueryMessages(executionId, (messages) => {
+          const current = findExecutionTab(id);
+          if (current?.executionId === executionId && current.isExecuting) {
+            current.liveQueryMessages = [...(current.liveQueryMessages ?? []), ...messages].slice(0, 1001);
+          }
+        });
+      }
       await waitForTabSessionReset(id);
       const connStore = useConnectionStore();
       const executionTarget = resumedExecutionTarget ?? options?.executionTarget;
@@ -8543,9 +8572,18 @@ export const useQueryStore = defineStore("query", () => {
         syncDisplayedResultRun(current, queryBaseSql, captureResultRun);
       }
     } finally {
+      unsubscribeQueryMessages?.();
       if (tableDataNativeSelectionBlockOwner) finishDataGridNativeSelectionBlock(tableDataNativeSelectionBlockOwner);
       const current = findExecutionTab(id);
       if (current?.executionId === executionId) {
+        if (producedResult && current.result && current.liveQueryMessages?.length) {
+          const results = current.results?.length ? current.results : [current.result];
+          const completed = results.flatMap(queryResultMessages);
+          const missing = mergeQueryMessages(completed, current.liveQueryMessages).slice(completed.length);
+          current.result.messages = [...queryResultMessages(current.result), ...missing];
+          current.liveQueryMessages = undefined;
+        }
+        if (!current.liveQueryMessages?.length) current.liveQueryMessages = undefined;
         const liveBatch = liveBatchSqlExecutions.get(current);
         if (liveBatch?.executionId === executionId) current.batchSqlExecution = liveBatch;
         finishBatchSqlExecution(current, executionId, current.isCancelling === true);
@@ -9822,6 +9860,7 @@ export const useQueryStore = defineStore("query", () => {
       keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
       csvQuoteMode: settings.csvQuoteMode,
       clientSessionId,
+      txnSessionId: exportTxnSessionId(tab),
       nullLiteral: csvNullLiteralForMode(settings.csvNullMode),
       executionId: uuid(),
       exportTableName: options.format === "sql" && hasUniqueInsertTarget ? options.exportTableName : undefined,
@@ -9864,6 +9903,7 @@ export const useQueryStore = defineStore("query", () => {
       keysetOptimizationEnabled: settings.queryExportKeysetOptimizationEnabled,
       csvQuoteMode: settings.csvQuoteMode,
       clientSessionId: `${tabClientSessionId(tab, "export")}:${exportId}`,
+      txnSessionId: exportTxnSessionId(tab),
       nullLiteral: csvNullLiteralForMode(settings.csvNullMode),
       executionId: uuid(),
       numericColumnRightAlign: settings.numericColumnRightAlign,
