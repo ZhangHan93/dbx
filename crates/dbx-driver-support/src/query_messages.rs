@@ -59,6 +59,10 @@ impl QueryMessageBuffer {
         std::mem::take(&mut self.messages)
     }
 
+    pub fn contains_code(&self, code: &str) -> bool {
+        self.messages.iter().any(|message| message.code.as_deref() == Some(code))
+    }
+
     pub fn take(&mut self) -> Vec<QueryMessage> {
         let messages = self.drain();
         *self = Self::default();

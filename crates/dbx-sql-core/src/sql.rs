@@ -82,6 +82,15 @@ pub struct SqlFileRequest {
     /// and (on PostgreSQL) other trigger-enforced constraints.
     #[serde(default)]
     pub skip_relational_constraints: bool,
+    /// Whether the backend writes a JSONL failure log for this execution
+    /// (dbx#11619). Absent in requests from older frontends, which must keep
+    /// logging enabled, so the serde default is `true`.
+    #[serde(default = "sql_file_failure_log_enabled_by_default")]
+    pub failure_log_enabled: bool,
+}
+
+fn sql_file_failure_log_enabled_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +253,14 @@ impl SqlDialectProfile {
 
         if matches!(db_type, DatabaseType::SapHana) {
             return Self::sap_hana();
+        }
+
+        if matches!(db_type, DatabaseType::DuckDb) {
+            return Self {
+                supports_backslash_escaped_quotes: false,
+                supports_postgres_escape_strings: true,
+                ..Self::default()
+            };
         }
 
         if Self::is_postgres_string_lexer_database(db_type) {
@@ -430,6 +447,13 @@ pub struct SqlFileProgress {
     /// When processing multiple files, the name of the current file.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_name: Option<String>,
+    /// Full source SQL behind a `StatementFailed` event, used by the backend to
+    /// write the failure log. It is deliberately never serialized: the frontend
+    /// only ever needs the 120-char summary, and shipping every failing statement
+    /// over IPC would bloat the progress stream it already throttles.
+    #[serde(skip)]
+    #[serde(default)]
+    pub failure_sql: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3478,6 +3502,26 @@ mod tests {
     };
 
     #[test]
+    fn sql_file_request_keeps_failure_logging_on_when_the_field_is_absent() {
+        // Older frontends never send the flag; their imports must keep writing
+        // the failure log (dbx#11619), so the serde default is "enabled".
+        let base = serde_json::json!({
+            "executionId": "exec-1",
+            "connectionId": "conn-1",
+            "database": "shop",
+            "filePath": "/tmp/dump.sql",
+            "continueOnError": false
+        });
+        let legacy: SqlFileRequest = serde_json::from_value(base.clone()).unwrap();
+        assert!(legacy.failure_log_enabled);
+
+        let mut explicit_off = base;
+        explicit_off["failureLogEnabled"] = serde_json::Value::Bool(false);
+        let disabled: SqlFileRequest = serde_json::from_value(explicit_off).unwrap();
+        assert!(!disabled.failure_log_enabled);
+    }
+
+    #[test]
     fn sql_file_request_schema_is_optional_and_round_trips_when_present() {
         let legacy = serde_json::json!({
             "executionId": "legacy",
@@ -3838,6 +3882,16 @@ mod tests {
         assert_eq!(
             split_sql_statements_for_database(sql, DatabaseType::DuckDb),
             vec![r#"SELECT E'it\'s;ok'"#, r#"SELECT e'path\\;name'"#, "SELECT 2"]
+        );
+    }
+
+    #[test]
+    fn duckdb_plain_strings_keep_windows_paths_and_following_statements_separate() {
+        let sql = r#"SET VARIABLE path = 'C:\path\'; SET VARIABLE next = 'value'; SELECT 1;"#;
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::DuckDb),
+            vec![r#"SET VARIABLE path = 'C:\path\'"#, "SET VARIABLE next = 'value'", "SELECT 1"]
         );
     }
 
@@ -4634,9 +4688,9 @@ SELECT 2;";
             assert!(profile.supports_postgres_escape_strings);
         }
 
-        // Engines without PostgreSQL string literals keep the historical escape
-        // rule until their own evidence is recorded.
-        assert!(SqlDialectProfile::for_database_type(DatabaseType::DuckDb).supports_backslash_escaped_quotes);
+        let duckdb = SqlDialectProfile::for_database_type(DatabaseType::DuckDb);
+        assert!(!duckdb.supports_backslash_escaped_quotes);
+        assert!(duckdb.supports_postgres_escape_strings);
         assert!(SqlDialectProfile::for_database_type(DatabaseType::ClickHouse).supports_backslash_escaped_quotes);
 
         for db_type in [

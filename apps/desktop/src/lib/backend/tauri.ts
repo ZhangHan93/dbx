@@ -158,6 +158,7 @@ import type { SchemaDiffPreparation, SchemaDiffPreparationOptions, SchemaSyncSql
 import type { BuildCreatePartitionedTableSqlOptions, BuildTableOwnerChangeSqlOptions, BuildTableStructureChangeSqlOptions, BuildSingleColumnAlterSqlOptions, SqliteTableStructureChangePreview, TablePartitionSqlOptions, TableStructureChangeSql } from "@/lib/table/tableStructureEditorSql";
 import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/database/databaseSearch";
+import type { DatabaseStructureSearchSql, DatabaseStructureSearchSqlOptions } from "@/lib/database/databaseStructureSearch";
 import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput } from "@/lib/table/objectSourceEditor";
 import type { BuildViewDdlInput } from "@/lib/table/viewDdl";
 import type { BuildRenameObjectSqlOptions } from "@/lib/table/objectRenameSql";
@@ -2214,6 +2215,14 @@ export async function buildTableSelectSql(options: BuildTableSelectSqlOptions): 
 
 export async function buildDatabaseSearchSql(options: DatabaseSearchSqlOptions): Promise<DatabaseSearchSql | null> {
   return invoke("build_database_search_sql", { options });
+}
+
+export async function buildDatabaseStructureSearchSql(options: DatabaseStructureSearchSqlOptions): Promise<DatabaseStructureSearchSql | null> {
+  return invoke("build_database_structure_search_sql", { options });
+}
+
+export async function supportsDatabaseStructureSearch(databaseType?: DatabaseType, driverProfile?: string): Promise<boolean> {
+  return invoke("supports_database_structure_search", { databaseType, driverProfile });
 }
 
 export async function buildSearchResultWhere(options: SearchResultWhereOptions): Promise<string> {
@@ -5596,6 +5605,47 @@ export interface SqlFileProgress {
 
 export async function previewSqlFile(filePath: string): Promise<SqlFilePreview> {
   return invoke("preview_sql_file", { filePath });
+}
+
+export type SqlFileFailureLogStatus = "available" | "degraded" | "unavailable";
+
+/** Health of one execution's failure log (dbx#11619). */
+export interface SqlFileFailureLogInfo {
+  status: SqlFileFailureLogStatus;
+  reason?: string;
+  /** Desktop only: the local log file, used by "open log folder". */
+  path?: string;
+}
+
+/** Stable identity of one failure row, matching what the backend logged. */
+export interface SqlFileFailureLogKey {
+  fileIndex: number;
+  statementIndex: number;
+}
+
+export interface SqlFileFailureLogTextPayload {
+  text?: string;
+  /** The derived text exceeded `limitBytes`; the caller should export to a file. */
+  tooLarge: boolean;
+  limitBytes: number;
+}
+
+export interface SqlFileFailureLogExportPayload {
+  records: number;
+  bytes: number;
+  format: string;
+}
+
+export async function sqlFileFailureLogInfo(executionId: string): Promise<SqlFileFailureLogInfo | null> {
+  return invoke("sql_file_failure_log_info", { executionId });
+}
+
+export async function exportSqlFileFailureLog(executionId: string, format: string, targetPath: string, keys?: SqlFileFailureLogKey[]): Promise<SqlFileFailureLogExportPayload> {
+  return invoke("export_sql_file_failure_log", { executionId, format, targetPath, keys });
+}
+
+export async function readSqlFileFailureLogText(executionId: string, format?: string, keys?: SqlFileFailureLogKey[]): Promise<SqlFileFailureLogTextPayload> {
+  return invoke("read_sql_file_failure_log_text", { executionId, format, keys });
 }
 
 export async function executeSqlFile(request: SqlFileRequest): Promise<void> {

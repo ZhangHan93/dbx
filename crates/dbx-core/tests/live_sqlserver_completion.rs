@@ -1030,6 +1030,7 @@ async fn live_sqlserver_table_structure_default_changes_drop_existing_constraint
         foreign_table: false,
         is_gaussdb_m_mode: false,
         table_collation: None,
+        primary_key_name: None,
     });
     assert_eq!(result.warnings, Vec::<String>::new());
     assert_eq!(result.statements.len(), 4);
@@ -1320,6 +1321,7 @@ async fn live_sqlserver_sql_file_import_executes_go_batches() {
         selected_tables: None,
         part_cooldown_ms: 0,
         skip_relational_constraints: false,
+        failure_log_enabled: true,
     };
     let done_seen = AtomicBool::new(false);
 

@@ -38,6 +38,7 @@ import { translateBackendError } from "@/i18n/backend-errors";
 import XlsxHeaderDialog from "@/components/export/XlsxHeaderDialog.vue";
 import i18n from "@/i18n";
 import { buildXlsxHeaderOverrides, hasXlsxHeaderComments, xlsxHeaderUsesCommentRows, type XlsxExportOptions, type XlsxHeaderMode } from "@/lib/export/xlsxHeader";
+import { isPartiallyLoadedCopy, partialLoadCopyHintKey, type PartialLoadCopyInfo } from "@/lib/dataGrid/copyPartialLoadHint";
 
 /**
  * Format metadata for backend table exports. Each entry maps a format key
@@ -160,6 +161,8 @@ export interface UseDataGridExportOptions {
    * slow query is never re-run just to export rows that are already on screen.
    */
   hasCompleteLocalResult?: ComputedRef<boolean>;
+  /** Present when the grid cannot guarantee the whole result set is loaded; drives the partial-copy hint. */
+  partialLoadCopyInfo?: ComputedRef<PartialLoadCopyInfo | null>;
   /**
    * The raw in-memory QueryResult to use for "export all" when
    * hasCompleteLocalResult is true. Exports the original query result (all
@@ -245,6 +248,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     fullExportResult,
     queryResultExportRequest,
     hasCompleteLocalResult,
+    partialLoadCopyInfo,
     completeLocalResult,
     allExportResults,
     currentResultLabel,
@@ -872,6 +876,7 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     },
     buildMongoInsert: buildMongoExtractorInsert,
     buildMongoUpdate: buildMongoExtractorUpdate,
+    partialLoadInfo: partialLoadCopyInfo,
     canBuildMongoUpdate: canBuildMongoExtractorUpdate,
     externalCellValue: (value, columnIndex) => {
       const externalValue = options.externalCellValue?.(value as CellValue, columnIndex);
@@ -885,7 +890,11 @@ export function useDataGridExport(options: UseDataGridExportOptions) {
     const rows = (await resolveVisibleRowValues(displayItems.value.filter((item) => !item.isDraft))).map((item) => item.data);
     // formatTsv 引用处理解码后文本中可能出现的制表符/换行；内部副本仍用原始 rows（hex）保证回粘无损。
     const decodedRows = rows.map((row) => row.map((cell, index) => externalCellValue(binaryClipboardCellValue(cell, index), index)));
-    await copyText(formatTsv(columns.value, decodedRows), { rows, header: columns.value });
+    const copied = await copyText(formatTsv(columns.value, decodedRows), { rows, header: columns.value });
+    const partialLoadInfo = options.partialLoadCopyInfo?.value;
+    if (copied && partialLoadInfo && isPartiallyLoadedCopy(partialLoadInfo)) {
+      toast(t(partialLoadCopyHintKey(partialLoadInfo), { loaded: partialLoadInfo.loadedRows, total: partialLoadInfo.totalRows ?? undefined }), 5000);
+    }
   }
 
   // --- Export functions ---
