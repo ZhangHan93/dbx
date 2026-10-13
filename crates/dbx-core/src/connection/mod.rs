@@ -1476,6 +1476,22 @@ impl AppState {
         self.connection_liveness.subscribe()
     }
 
+    /// A locator belongs to its original workload session; never recreate it during lookup.
+    pub(crate) async fn existing_workload_pool_for_session(
+        &self,
+        connection_id: &str,
+        database: Option<&str>,
+        client_session_id: Option<&str>,
+    ) -> Option<(String, PoolKind)> {
+        let config = self.configs.read().await.get(connection_id).cloned()?;
+        let base_key = base_pool_key_for_config(Some(&config), connection_id, database, None, false);
+        let key = pool_key_for_session_role(Some(&config), base_key, client_session_id, AgentSessionRole::Workload);
+        if self.pool_credential_owner_mismatch(&config, &key).await {
+            return None;
+        }
+        self.pool_handle(&key).await.map(|pool| (key, pool))
+    }
+
     /// Find an already-registered metadata/workload pool for a metadata read.
     /// Unlike `get_or_create_metadata_pool_for_session`, this is a pure lookup:
     /// it never validates credentials, starts an agent, or opens a transport.
@@ -2468,7 +2484,9 @@ impl AppState {
     pub async fn shutdown(&self, deadline: Duration) {
         self.invalidate_all_connection_lifecycles();
         self.running_queries.cancel_all();
-        let removed_pools = self.drain_all_connection_pools().await;
+        let mut removed_pools = self.drain_all_connection_pools().await;
+        #[cfg(feature = "mq-admin")]
+        self.persist_removed_mqtt_history(&mut removed_pools).await;
         self.transaction_sessions.write().await.clear();
 
         let shutdown = async {
@@ -5940,8 +5958,10 @@ impl AppState {
     pub async fn remove_connection_pools(&self, connection_id: &str) {
         self.invalidate_connection_lifecycle(connection_id);
         self.rollback_manual_transaction_sessions(connection_id).await;
-        let removed = self.drain_connection_pools(connection_id).await;
+        let mut removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
+        #[cfg(feature = "mq-admin")]
+        self.persist_removed_mqtt_history(&mut removed).await;
         self.pool_routing_control().close_removed(removed).await;
     }
 
@@ -5964,9 +5984,30 @@ impl AppState {
     pub async fn remove_connection_pools_detached(&self, connection_id: &str) {
         self.invalidate_connection_lifecycle(connection_id);
         self.rollback_manual_transaction_sessions(connection_id).await;
-        let removed = self.drain_connection_pools(connection_id).await;
+        let mut removed = self.drain_connection_pools(connection_id).await;
         self.clear_metadata_gates_for_connection(connection_id).await;
+        #[cfg(feature = "mq-admin")]
+        self.persist_removed_mqtt_history(&mut removed).await;
         self.pool_routing_control().close_removed_in_background(removed);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    async fn persist_removed_mqtt_history(&self, removed: &mut Vec<(String, PoolKind)>) {
+        let mut remaining = Vec::with_capacity(removed.len());
+        for (pool_key, pool) in std::mem::take(removed) {
+            match pool {
+                PoolKind::Mqtt(client) => {
+                    let _history_guard = client.lock_message_history().await;
+                    client.disconnect().await;
+                    let messages = client.get_messages(None, usize::MAX).await;
+                    if let Err(error) = self.storage.reconcile_mqtt_message_history(&pool_key, &messages).await {
+                        log::warn!("Failed to persist MQTT history while closing '{pool_key}': {error}");
+                    }
+                }
+                pool => remaining.push((pool_key, pool)),
+            }
+        }
+        *removed = remaining;
     }
 
     /// Close and roll back every manual-transaction session of a connection
@@ -8323,6 +8364,56 @@ mod tests {
         state.shutdown(Duration::from_millis(100)).await;
         assert!(shutdown.cancellation().is_cancelled());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn mqtt_history_is_persisted_at_every_connection_teardown_boundary() {
+        use crate::mqtt::client::MqttClient;
+        use crate::mqtt::types::{MqttMessage, MqttMessageDirection};
+
+        async fn install_client(state: &AppState, connection_id: &str, timestamp: u64) {
+            let message = MqttMessage {
+                topic: format!("devices/{connection_id}"),
+                payload_base64: "dGFpbA==".to_string(),
+                payload_text: Some("tail".to_string()),
+                qos: 1,
+                retain: false,
+                received_at_ms: timestamp,
+                direction: MqttMessageDirection::Received,
+            };
+            let client = MqttClient::test_client_with_messages(vec![message]).await;
+            state
+                .update_connection_pools(|connections| {
+                    connections.insert(connection_id.to_string(), PoolKind::Mqtt(client));
+                })
+                .await;
+        }
+
+        let (removed_state, removed_dir) = test_app_state().await;
+        install_client(&removed_state, "removed", 1).await;
+        removed_state.remove_connection_pools("removed").await;
+        let removed_history = removed_state.storage.load_mqtt_message_history("removed").await.unwrap();
+        assert_eq!(removed_history.len(), 1);
+        assert_eq!(removed_history[0].topic, "devices/removed");
+
+        let (detached_state, detached_dir) = test_app_state().await;
+        install_client(&detached_state, "detached", 2).await;
+        detached_state.remove_connection_pools_detached("detached").await;
+        let detached_history = detached_state.storage.load_mqtt_message_history("detached").await.unwrap();
+        assert_eq!(detached_history.len(), 1);
+        assert_eq!(detached_history[0].topic, "devices/detached");
+
+        let (shutdown_state, shutdown_dir) = test_app_state().await;
+        install_client(&shutdown_state, "shutdown", 3).await;
+        shutdown_state.shutdown(Duration::from_millis(100)).await;
+        let shutdown_history = shutdown_state.storage.load_mqtt_message_history("shutdown").await.unwrap();
+        assert_eq!(shutdown_history.len(), 1);
+        assert_eq!(shutdown_history[0].topic, "devices/shutdown");
+
+        let _ = std::fs::remove_dir_all(removed_dir);
+        let _ = std::fs::remove_dir_all(detached_dir);
+        let _ = std::fs::remove_dir_all(shutdown_dir);
     }
 
     #[tokio::test]

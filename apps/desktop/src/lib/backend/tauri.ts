@@ -2,6 +2,7 @@ import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { Channel } from "@tauri-apps/api/core";
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
 import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTypes";
+import type { DamengDumpKind, DamengDumpRequest, DamengDumpProgress } from "./damengDumpTypes";
 import type { UserSkillRootSettings, UserSkillsListResult, UserSkillsReadResult } from "@/types/userSkills";
 import type { DatabaseBackupCommand, DatabaseBackupBackgroundStatus } from "@/lib/backup/backgroundDatabaseBackup";
 
@@ -916,6 +917,10 @@ export interface WebMcpHttpSettings {
   allowedOrigins: string[];
 }
 
+export interface WebCapabilities {
+  passwordViewerEnabled: boolean;
+}
+
 export async function loadMcpHttpServerSettings(): Promise<McpHttpServerSettings> {
   return invoke("load_mcp_http_server_settings");
 }
@@ -942,6 +947,10 @@ export async function saveWebMcpHttpSettings(_settings: WebMcpHttpSettings): Pro
 
 export async function rotateWebMcpToken(): Promise<WebMcpHttpStatus> {
   throw new Error("Web MCP settings are available only in DBX Web");
+}
+
+export async function loadWebCapabilities(): Promise<WebCapabilities> {
+  return { passwordViewerEnabled: true };
 }
 
 export async function loadMaxAgentTurns(): Promise<number> {
@@ -1325,8 +1334,8 @@ export interface SqlFileEntry {
   children: SqlFileEntry[];
 }
 
-export async function listSqlFilesInFolder(folderPath: string, fileFilter?: string): Promise<SqlFileEntry[]> {
-  return invoke("list_sql_files_in_folder", { folderPath, fileFilter });
+export async function listSqlFilesInFolder(folderPath: string, fileFilter?: string, includeEmptyDirectories?: boolean): Promise<SqlFileEntry[]> {
+  return invoke("list_sql_files_in_folder", { folderPath, fileFilter, includeEmptyDirectories });
 }
 
 export async function createSqlFileInFolder(rootPath: string, directoryPath: string, fileName: string): Promise<string> {
@@ -1339,6 +1348,18 @@ export async function renameSqlFileInFolder(rootPath: string, filePath: string, 
 
 export async function deleteSqlFileInFolder(rootPath: string, filePath: string): Promise<void> {
   return invoke("delete_sql_file_in_folder", { rootPath, filePath });
+}
+
+export async function createSqlFolderInFolder(rootPath: string, directoryPath: string, folderName: string): Promise<string> {
+  return invoke("create_sql_folder_in_folder", { rootPath, directoryPath, folderName });
+}
+
+export async function renameSqlFolderInFolder(rootPath: string, folderPath: string, folderName: string): Promise<string> {
+  return invoke("rename_sql_folder_in_folder", { rootPath, folderPath, folderName });
+}
+
+export async function deleteSqlFolderInFolder(rootPath: string, folderPath: string): Promise<void> {
+  return invoke("delete_sql_folder_in_folder", { rootPath, folderPath });
 }
 
 export interface GlobalSearchRequest {
@@ -1804,7 +1825,7 @@ export async function listSchemaInfos(connectionId: string, database: string): P
 export async function getCustomTypeDetails(connectionId: string, database: string, schema: string, name: string): Promise<CustomTypeDetails> {
   return invoke("get_custom_type_details", { connectionId, database, schema, name });
 }
-export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string, clientSessionId?: string): Promise<ColumnInfo[]> {
+export async function getColumns(connectionId: string, database: string, schema: string, table: string, catalog?: string, clientSessionId?: string, currentSchema?: string): Promise<ColumnInfo[]> {
   return invoke("get_columns", {
     connectionId,
     database,
@@ -1812,6 +1833,7 @@ export async function getColumns(connectionId: string, database: string, schema:
     table,
     catalog,
     clientSessionId,
+    currentSchema,
   });
 }
 
@@ -2042,6 +2064,27 @@ export async function cancelConditionalUpdate(executionId: string): Promise<Cond
   return invoke("cancel_conditional_update", { executionId });
 }
 
+export async function readLargeValueChunk(request: import("./http").LargeValueRequest): Promise<import("./http").LargeValueChunk> {
+  return invoke("read_large_value_chunk", { request });
+}
+
+export async function releaseLargeValue(request: import("./http").LargeValueRequest): Promise<boolean> {
+  return invoke("release_large_value", { request });
+}
+
+export async function downloadLargeValue(request: import("./http").LargeValueRequest, filePath: string, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  await invoke("download_large_value", { request, filePath });
+  // A native command may already have persisted the file; this only retires its local caller.
+  signal?.throwIfAborted();
+}
+
+export async function exportSnapshotResult(request: import("./http").SnapshotExportRequest, filePath: string, signal?: AbortSignal): Promise<void> {
+  signal?.throwIfAborted();
+  await invoke("export_snapshot_result", { request, filePath });
+  signal?.throwIfAborted();
+}
+
 export async function closeQuerySession(connectionId: string, database: string, sessionId: string, clientSessionId?: string, catalog?: string): Promise<boolean> {
   return invoke("close_query_session", {
     connectionId,
@@ -2061,7 +2104,7 @@ export async function closeClientConnectionSession(connectionId: string, databas
   });
 }
 
-export async function executeBatch(connectionId: string, database: string, statements: string[], schema?: string, timeoutSecs?: number, useTransaction?: boolean): Promise<QueryResult> {
+export async function executeBatch(connectionId: string, database: string, statements: string[], schema?: string, timeoutSecs?: number, useTransaction?: boolean, boundStatements?: BlobBoundStatement[]): Promise<QueryResult> {
   return invoke("execute_batch", {
     connectionId,
     database,
@@ -2069,6 +2112,7 @@ export async function executeBatch(connectionId: string, database: string, state
     schema,
     timeoutSecs,
     useTransaction,
+    boundStatements,
   });
 }
 
@@ -2086,13 +2130,14 @@ export async function executeScriptWith2pc(connectionId: string, database: strin
   });
 }
 
-export async function executeInTransaction(connectionId: string, database: string, statements: string[], schema?: string, catalog?: string): Promise<QueryResult> {
+export async function executeInTransaction(connectionId: string, database: string, statements: string[], schema?: string, catalog?: string, boundStatements?: BlobBoundStatement[]): Promise<QueryResult> {
   return invoke("execute_in_transaction", {
     connectionId,
     database,
     statements,
     schema,
     catalog,
+    boundStatements,
   });
 }
 
@@ -2112,6 +2157,7 @@ export async function executeInManualTransaction(
   classificationSql?: string,
   executionId?: string,
   timeoutSecs?: number,
+  boundStatements?: BlobBoundStatement[],
 ): Promise<QueryResult[]> {
   return invokeBackend("execute_in_manual_transaction", {
     txnSessionId,
@@ -2125,6 +2171,7 @@ export async function executeInManualTransaction(
     classificationSql,
     executionId,
     timeoutSecs,
+    boundStatements,
   });
 }
 
@@ -2393,12 +2440,19 @@ export interface DataGridSaveGuard {
   message: string;
 }
 
+export interface BlobBoundStatement {
+  previewSql: string;
+  sql: string;
+  blobParameters: string[];
+}
+
 export interface DataGridSavePreparation {
   validationError?: string;
   statements: string[];
   rollbackStatements: string[];
   executionSchema?: string;
   keylessGuards?: DataGridSaveGuard[];
+  boundStatements?: BlobBoundStatement[];
 }
 
 export async function prepareDataGridSave(options: DataGridSaveStatementOptions, driverProfile?: string): Promise<DataGridSavePreparation> {
@@ -3616,8 +3670,8 @@ export async function redisHashFieldSetExpireAt(connectionId: string, db: number
   return invoke("redis_hash_field_set_expire_at", { connectionId, db, keyRaw, field, expireAt });
 }
 
-export async function redisListPush(connectionId: string, db: number, keyRaw: string, value: string, ttl?: number): Promise<void> {
-  return invoke("redis_list_push", { connectionId, db, keyRaw, value, ttl });
+export async function redisListPush(connectionId: string, db: number, keyRaw: string, value: string, ttl?: number, side?: "left" | "right"): Promise<void> {
+  return invoke("redis_list_push", { connectionId, db, keyRaw, value, ttl, side });
 }
 
 export async function redisListSet(connectionId: string, db: number, keyRaw: string, index: number, value: string): Promise<void> {
@@ -6242,8 +6296,8 @@ export interface TableExportRequest {
   /** xlsx 专用：注释作为第二行表头（第 1 行列名、第 2 行注释、数据从第 3 行开始）。 */
   headerCommentRows?: boolean;
   primaryKeys?: string[];
-  /** 导出 SQL 时是否排除主键列（对应数据提取设置里的“排除主键”）。 */
-  excludePrimaryKeys?: boolean;
+  /** SQL INSERT 导出使用的数据提取器主键模式。 */
+  primaryKeyMode?: "include" | "exclude-generated" | "exclude-all";
   whereInput?: string;
   orderBy?: string;
   skipCount?: boolean;
@@ -6327,8 +6381,8 @@ export interface QueryResultExportRequest {
   headerCommentRows?: boolean;
   autoFilter?: boolean;
   identifierQuote?: string;
-  /** 导出 SQL 时是否排除主键列（对应数据提取设置里的“排除主键”）。 */
-  excludePrimaryKeys?: boolean;
+  /** SQL INSERT 导出使用的数据提取器主键模式。 */
+  primaryKeyMode?: "include" | "exclude-generated" | "exclude-all";
   /** 结果集对应的原表主键列名，由前端从表元数据带入。 */
   primaryKeys?: string[];
 }
@@ -6465,6 +6519,53 @@ export async function databaseExportDestinationNeedsConfirmation(directory: stri
 
 export async function recordDatabaseExportDestination(directory: string): Promise<void> {
   await invoke("record_database_export_destination", { directory });
+}
+
+export async function startDamengDump(request: DamengDumpRequest, onProgress: (progress: DamengDumpProgress) => void): Promise<DamengDumpProgress> {
+  let unlisten: UnlistenFn | undefined;
+  let settled = false;
+  let resolveTerminal: (progress: DamengDumpProgress) => void = () => {};
+  let rejectTerminal: (error: unknown) => void = () => {};
+
+  const terminalProgress = new Promise<DamengDumpProgress>((resolve, reject) => {
+    resolveTerminal = resolve;
+    rejectTerminal = reject;
+  });
+
+  const finish = (callback: () => void) => {
+    if (settled) return;
+    settled = true;
+    unlisten?.();
+    callback();
+  };
+
+  try {
+    unlisten = await listen<DamengDumpProgress>("dameng-dump-progress", (event) => {
+      if (event.payload.taskId !== request.taskId) return;
+      onProgress(event.payload);
+      if (event.payload.status === "error") {
+        finish(() => rejectTerminal(new BackendErrorException(event.payload.error || "Dameng dump failed")));
+      } else if (event.payload.status === "done" || event.payload.status === "cancelled") {
+        finish(() => resolveTerminal(event.payload));
+      }
+    });
+    await invoke("start_dameng_dump", { request });
+    return await terminalProgress;
+  } catch (error) {
+    if (!settled) {
+      settled = true;
+      unlisten?.();
+    }
+    throw error instanceof BackendErrorException ? error : new BackendErrorException(error);
+  }
+}
+
+export async function cancelDamengDump(taskId: string): Promise<void> {
+  await invoke("cancel_dameng_dump", { taskId });
+}
+
+export async function resolveDamengDumpTool(binDir: string, kind: DamengDumpKind): Promise<string> {
+  return invoke("resolve_dameng_dump_tool", { binDir, kind });
 }
 
 export async function exportQueryResultCsv(filePath: string, columns: string[], rows: readonly (readonly XlsxCellValue[])[], csvQuoteMode: CsvQuoteMode = "all", nullLiteral?: string): Promise<void> {
