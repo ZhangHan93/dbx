@@ -118,7 +118,7 @@ import { isTauriCommandUnavailable, normalizeConnectionTestResult } from "@/lib/
 import type { AnnotationFile, SchemaSnapshot } from "@/docs/types";
 import type { CollectionInfo } from "@/types/database";
 import type { SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
-import type { AiChatSelectionState, AiConfig, AiConfigItem, AiEffortCapability, AiEffortLevel, AiTestConnectionResult } from "@/types/ai";
+import type { AiChatSelectionState, AiConfig, AiConfigItem, AiEffortCapability, AiEffortLevel, AiTestConnectionResult, CcSwitchImportResult } from "@/types/ai";
 import type { SalesforceCurrentUser, SalesforceOAuthAuthorizeParams, SalesforceOAuthDevicePollResult, SalesforceOAuthDeviceStartResult, SalesforceOAuthRefreshResult, SalesforceOAuthToken } from "@/types/salesforce";
 import type { QueryEditability } from "@/lib/sql/sqlAnalysis";
 import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
@@ -861,6 +861,10 @@ export async function deleteAiConfig(configId: string): Promise<void> {
   return invoke("delete_ai_config", { configId });
 }
 
+export async function loadCcSwitchAiConfigs(): Promise<CcSwitchImportResult> {
+  return invoke("load_cc_switch_ai_configs");
+}
+
 export async function loadAiConfig(): Promise<AiConfig | null> {
   return invoke("load_ai_config");
 }
@@ -1092,6 +1096,15 @@ export async function completeAppClose(action: "quit" | "hide"): Promise<void> {
 
 export async function requestAppClose(): Promise<void> {
   return invoke("request_app_close_from_window_controls");
+}
+
+/**
+ * #11787：告诉宿主快捷键录入态是否开启。Windows 上宿主据此关掉 WebView2 的浏览器加速键
+ * （F5/Ctrl+R 重载、Ctrl+F 查找、Ctrl+P 打印、Ctrl+± 缩放、F12 DevTools……），让这批键
+ * 在录入期间落到页面被录入态吞掉；退出录入即恢复。其余平台是空实现。
+ */
+export async function setShortcutRecording(recording: boolean): Promise<void> {
+  return invoke("set_shortcut_recording", { recording });
 }
 
 export interface DriverStoreMigrationResult {

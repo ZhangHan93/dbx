@@ -300,6 +300,7 @@ pub struct MigrationPreflight {
     pub migration_id: String,
     pub state: MigrationState,
     pub needs_migration: bool,
+    pub key_recovery_required: bool,
     pub key_provider_available: bool,
     pub key_status: MigrationKeyStatus,
     /// Desktop may provision a new local key only for plaintext-only data.
@@ -326,10 +327,9 @@ pub struct MigrationPreflight {
 
 impl MigrationPreflight {
     pub fn is_ready(&self) -> bool {
-        // A brand-new desktop profile has no secrets and may provision its
-        // first key lazily. Strict headless profiles report missing keys as
-        // `needs_migration`, so no additional provider check is needed here.
-        !self.needs_migration && matches!(self.state, MigrationState::Succeeded | MigrationState::NotRequired)
+        !self.needs_migration
+            && !self.key_recovery_required
+            && matches!(self.state, MigrationState::Succeeded | MigrationState::NotRequired)
     }
 }
 
@@ -1441,6 +1441,44 @@ impl Storage {
         self
     }
 
+    pub async fn prepare_portable_secret_key(&self) -> Result<bool, String> {
+        self.prepare_portable_secret_key_with(SecretCodec::from_platform_store).await
+    }
+
+    async fn prepare_portable_secret_key_with<F>(&self, platform_key: F) -> Result<bool, String>
+    where
+        F: FnOnce() -> Result<Option<SecretCodec>, String>,
+    {
+        if !matches!(self.secret_key_policy, SecretKeyPolicy::ManagedDataDir) {
+            return Err("Portable key preparation requires a managed data-directory key".to_string());
+        }
+        match SecretCodec::resolve(SecretKeyPolicy::ManagedDataDir, self.data_dir(), false) {
+            Ok(_) => return Ok(false),
+            Err(error) if error == "MISSING_MANAGED_KEY" => {}
+            Err(error) => return Err(error),
+        }
+        let has_ciphertext = self
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM connection_secrets WHERE secret_enc IS NOT NULL AND secret_enc <> '')",
+                    [],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .await?;
+        if !has_ciphertext {
+            return Ok(false);
+        }
+        let Some(codec) = platform_key()? else {
+            return Ok(false);
+        };
+        self.validate_existing_encrypted_data(codec).await.map_err(|_| "SECRET_KEY_MISMATCH".to_string())?;
+        codec.persist_managed_data_dir_key(self.data_dir())?;
+        self.invalidate_secret_codec();
+        Ok(true)
+    }
+
     /// Compatibility builder for callers that require an externally managed key.
     pub fn require_persistent_key(self) -> Self {
         self.with_secret_key_policy(SecretKeyPolicy::ExternalOnly)
@@ -1852,11 +1890,12 @@ impl Storage {
         let source_changed = stored.source_fingerprint.as_deref().is_some_and(|value| value != current_fingerprint);
         let state = if matches!(stored.state, MigrationState::Failed | MigrationState::Running) {
             stored.state.clone()
-        } else if fatal_key_error
-            || missing_required_key
-            || missing_existing_key
-            || (has_legacy_data
-                && (source_changed || matches!(stored.state, MigrationState::Succeeded | MigrationState::NotRequired)))
+        } else if has_legacy_data
+            && (fatal_key_error
+                || missing_required_key
+                || missing_existing_key
+                || source_changed
+                || matches!(stored.state, MigrationState::Succeeded | MigrationState::NotRequired))
         {
             MigrationState::Pending
         } else if !has_legacy_data && matches!(stored.state, MigrationState::Pending) {
@@ -1864,11 +1903,10 @@ impl Storage {
         } else {
             stored.state.clone()
         };
-        let needs_migration = fatal_key_error
-            || missing_required_key
-            || missing_existing_key
-            || matches!(state, MigrationState::Failed | MigrationState::Running)
+        let needs_migration = matches!(state, MigrationState::Failed | MigrationState::Running)
             || (has_legacy_data && !matches!(state, MigrationState::Succeeded | MigrationState::NotRequired));
+        let key_recovery_required =
+            !needs_migration && (fatal_key_error || missing_required_key || missing_existing_key);
         let (error_code, error_message) = if let Some(code) = key_error_code.clone() {
             let message = match code.as_str() {
                 "MISSING_MANAGED_KEY" => {
@@ -1915,6 +1953,7 @@ impl Storage {
             migration_id: SECRET_STORE_MIGRATION_ID.to_string(),
             state,
             needs_migration,
+            key_recovery_required,
             key_provider_available,
             key_status,
             key_creation_allowed,
@@ -7312,6 +7351,47 @@ impl Storage {
         self.delete_state(&key).await
     }
 
+    /// Remove one exact message from a connection's persisted MQTT history.
+    #[cfg(feature = "mq-admin")]
+    pub async fn delete_mqtt_message_history_entry(
+        &self,
+        connection_id: &str,
+        message: &MqttMessage,
+    ) -> Result<(), String> {
+        let key = format!("{MQTT_MESSAGE_HISTORY_STATE_KEY_PREFIX}{connection_id}");
+        let message_identity = mqtt_history_message_identity(message);
+        self.with_conn(move |conn| {
+            let tx =
+                conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
+            let current: Option<Vec<u8>> = tx
+                .query_row("SELECT value FROM state_store WHERE key = ?1", [&key], |row| row.get(0))
+                .optional()
+                .map_err(|error| error.to_string())?;
+            let Some(bytes) = current else {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(());
+            };
+            let mut messages: Vec<MqttMessage> = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+            if let Some(index) =
+                messages.iter().position(|candidate| mqtt_history_message_identity(candidate) == message_identity)
+            {
+                messages.remove(index);
+                if messages.is_empty() {
+                    tx.execute("DELETE FROM state_store WHERE key = ?1", [&key]).map_err(|error| error.to_string())?;
+                } else {
+                    let value = serde_json::to_vec(&messages).map_err(|error| error.to_string())?;
+                    tx.execute(
+                        "UPDATE state_store SET value = ?1, version = version + 1 WHERE key = ?2",
+                        params![value, key],
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+            tx.commit().map_err(|error| error.to_string())
+        })
+        .await
+    }
+
     /// Update only the persisted driver identity for an existing connection.
     /// This is used after runtime driver fallback and deliberately leaves all
     /// other connection metadata and separately stored secrets untouched.
@@ -10283,16 +10363,73 @@ mod tests {
             .unwrap()
             .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
         storage.set_secret("connection", "password", "secret").await.unwrap();
+        storage.set_migration_state(super::MigrationState::Succeeded, None, None, None, None).await.unwrap();
         let key_path = managed_key_path(dir.path());
         std::fs::remove_file(&key_path).unwrap();
 
         let status = storage.inspect_data_migration().await.unwrap();
-        assert!(status.needs_migration);
+        assert_eq!(status.state, super::MigrationState::Succeeded);
+        assert!(!status.needs_migration);
+        assert!(status.key_recovery_required);
+        assert!(!status.is_ready());
         assert!(!status.key_creation_allowed);
         assert_eq!(status.error_code.as_deref(), Some("ENCRYPTED_DATA_KEY_MISSING"));
         assert!(!key_path.exists());
         assert_eq!(storage.start_data_migration().await.unwrap_err(), "ENCRYPTED_DATA_KEY_MISSING");
         assert!(!key_path.exists());
+    }
+
+    #[tokio::test]
+    async fn portable_storage_copies_only_the_matching_platform_key_into_its_data_dir() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open_unmigrated(&directory.path().join("dbx.db"))
+            .await
+            .unwrap()
+            .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
+        let platform_codec = super::SecretCodec::new([7; 32]);
+        let encrypted = platform_codec.encrypt("connection", "password", "portable-secret").unwrap();
+        storage
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO connection_secrets (connection_id, key, secret, secret_enc) VALUES ('connection', 'password', '', ?1)",
+                    [encrypted],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert!(storage.prepare_portable_secret_key_with(|| Ok(Some(platform_codec))).await.unwrap());
+        assert!(managed_key_path(directory.path()).is_file());
+        assert_eq!(storage.get_secret("connection", "password").await.unwrap().as_deref(), Some("portable-secret"));
+    }
+
+    #[tokio::test]
+    async fn portable_storage_never_persists_a_platform_key_that_cannot_decrypt_its_data() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open_unmigrated(&directory.path().join("dbx.db"))
+            .await
+            .unwrap()
+            .with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
+        let encrypted = super::SecretCodec::new([7; 32]).encrypt("connection", "password", "portable-secret").unwrap();
+        storage
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO connection_secrets (connection_id, key, secret, secret_enc) VALUES ('connection', 'password', '', ?1)",
+                    [encrypted],
+                )
+                .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.prepare_portable_secret_key_with(|| Ok(Some(super::SecretCodec::new([8; 32])))).await.unwrap_err(),
+            "SECRET_KEY_MISMATCH"
+        );
+        assert!(!managed_key_path(directory.path()).exists());
     }
 
     #[tokio::test]
@@ -11787,6 +11924,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }
@@ -11868,6 +12006,7 @@ mod tests {
             read_only: false,
             is_production: false,
             production_databases: vec![],
+            production_badge_scope: None,
             database_info: None,
         }
     }

@@ -20,6 +20,7 @@ mod webview2_recovery;
 mod window_state_guard;
 
 use commands::connection::AppState;
+use dbx_core::persistence::secret_codec::SecretKeyPolicy;
 use dbx_core::sql_dialect::dialect_loader::{register_core_dialects, DialectPluginLoader, DialectRegistry};
 use dbx_core::sql_dialect::hot_reload::DialectHotReload;
 use dbx_core::storage::{maybe_import_user_data_db, DesktopIconTheme, DesktopSettings, Storage};
@@ -114,8 +115,6 @@ const BLACK_APP_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/ico
 const MACOS_DEFAULT_APP_ICON: &[u8] = include_bytes!("../icons/icon.icns");
 #[cfg(target_os = "macos")]
 const MACOS_DARK_APP_ICON: &[u8] = include_bytes!("../icons/icon-macos-dark.icns");
-#[cfg(target_os = "macos")]
-static MACOS_APP_APPEARANCE_DARK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn apply_debug_log_level(debug_logging_enabled: bool) {
     log::set_max_level(if debug_logging_enabled { log::LevelFilter::Debug } else { log::LevelFilter::Off });
@@ -1039,21 +1038,6 @@ pub(crate) fn apply_desktop_icon_theme(app: &tauri::AppHandle, icon_theme: Deskt
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-pub(crate) fn apply_macos_app_appearance_icon(
-    app: &tauri::AppHandle,
-    is_dark: bool,
-    selected_icon_theme: DesktopIconTheme,
-) -> tauri::Result<()> {
-    MACOS_APP_APPEARANCE_DARK.store(is_dark, std::sync::atomic::Ordering::Release);
-    let icon_theme = if is_dark || selected_icon_theme == DesktopIconTheme::Black {
-        DesktopIconTheme::Black
-    } else {
-        DesktopIconTheme::Default
-    };
-    apply_macos_app_icon_theme(app, icon_theme, true)
-}
-
 fn apply_desktop_tray_icon_theme(app: &tauri::AppHandle, _icon_theme: DesktopIconTheme) -> tauri::Result<()> {
     if let Some(_tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
         #[cfg(target_os = "windows")]
@@ -1082,15 +1066,7 @@ fn apply_desktop_tray_icon_theme(app: &tauri::AppHandle, _icon_theme: DesktopIco
 
 pub(crate) fn apply_desktop_settings(app: &tauri::AppHandle, desktop_settings: &DesktopSettings) -> tauri::Result<()> {
     apply_debug_log_level(desktop_settings.debug_logging_enabled);
-    #[cfg(target_os = "macos")]
-    let icon_theme = if MACOS_APP_APPEARANCE_DARK.load(std::sync::atomic::Ordering::Acquire) {
-        DesktopIconTheme::Black
-    } else {
-        desktop_settings.icon_theme
-    };
-    #[cfg(not(target_os = "macos"))]
-    let icon_theme = desktop_settings.icon_theme;
-    apply_desktop_icon_theme(app, icon_theme)?;
+    apply_desktop_icon_theme(app, desktop_settings.icon_theme)?;
     if should_setup_desktop_tray(std::env::consts::OS, desktop_settings.show_tray_icon, linux_appindicator_available())
     {
         if let Some(tray) = app.tray_by_id(DESKTOP_TRAY_ID) {
@@ -1648,6 +1624,7 @@ pub fn run() {
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(window_state_guard::persisted_main_window_state_flags())
+                .skip_initial_state("main")
                 .build(),
         );
 
@@ -1685,6 +1662,7 @@ pub fn run() {
             create_linux_main_window(app)?;
             eprintln!("[STARTUP] plugins registered in {:?}", startup_begin.elapsed());
             append_startup_probe(format!("setup entered after {:?}", startup_begin.elapsed()));
+            window_state_guard::restore_main_window_state(app.handle());
 
             if should_show_main_window_before_setup_tasks() {
                 prepare_main_window_for_display(app.handle());
@@ -1700,6 +1678,7 @@ pub fn run() {
                 app.path().app_data_dir().map_err(|e| e.to_string()).expect("Failed to resolve app data dir");
             let data_dir_resolution = data_dir::resolve_data_dir_with_mode(default_data_dir);
             let data_dir = data_dir_resolution.data_dir.clone();
+            let portable_mode = data_dir_resolution.is_portable_mode();
             std::fs::create_dir_all(&data_dir).expect("Failed to create data dir");
             let data_dir_mode = startup_data_dir_mode(&data_dir_resolution.mode);
             append_startup_probe(format!("data dir ready mode={data_dir_mode}"));
@@ -1718,7 +1697,18 @@ pub fn run() {
             let t = Instant::now();
             append_startup_probe(format!("opening storage file=dbx.db data_dir_mode={data_dir_mode}"));
             let storage = tauri::async_runtime::block_on(async {
-                let s = Storage::open_unmigrated(&db_path).await.expect("Failed to open storage");
+                let mut s = Storage::open_unmigrated(&db_path).await.expect("Failed to open storage");
+                if portable_mode {
+                    s = s.with_secret_key_policy(SecretKeyPolicy::ManagedDataDir);
+                    match s.prepare_portable_secret_key().await {
+                        Ok(true) => append_startup_probe("portable key copied from the platform credential store"),
+                        Ok(false) => {}
+                        Err(error) => {
+                            log::warn!("[STARTUP] portable key preparation failed: {error}");
+                            append_startup_probe(format!("portable key preparation failed: {error}"));
+                        }
+                    }
+                }
                 eprintln!("[STARTUP]   Storage::open in {:?}", t.elapsed());
                 append_startup_probe(format!("storage opened in {:?}", t.elapsed()));
                 let t2 = Instant::now();
@@ -1732,9 +1722,6 @@ pub fn run() {
             let migration_gate = Arc::new(migration_gate::MigrationGate::new(migration_ready));
             app.manage(migration_gate.clone());
             let desktop_settings = tauri::async_runtime::block_on(storage.load_desktop_settings()).unwrap_or_default();
-            #[cfg(target_os = "macos")]
-            let app_appearance =
-                tauri::async_runtime::block_on(storage.load_app_appearance_settings()).unwrap_or_default();
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     .timezone_strategy(tauri_plugin_log::TimezoneStrategy::UseLocal)
@@ -1886,20 +1873,6 @@ pub fn run() {
             ) {
                 setup_desktop_tray(app, desktop_settings.icon_theme)?;
             }
-            #[cfg(target_os = "macos")]
-            match app_appearance.theme_mode.as_deref() {
-                Some("dark" | "soft-dark") => {
-                    apply_macos_app_appearance_icon(app.handle(), true, desktop_settings.icon_theme)?;
-                }
-                Some("light" | "soft-light") => {
-                    apply_macos_app_appearance_icon(app.handle(), false, desktop_settings.icon_theme)?;
-                }
-                // System mode is resolved by the renderer's matchMedia listener
-                // as soon as startup hydration finishes. Leave the persisted
-                // bundle icon intact until then to avoid briefly forcing light.
-                _ => {}
-            }
-            #[cfg(not(target_os = "macos"))]
             apply_desktop_icon_theme(app.handle(), desktop_settings.icon_theme)?;
             #[cfg(target_os = "macos")]
             apply_macos_development_dock_badge(app.handle())?;
@@ -2009,6 +1982,7 @@ pub fn run() {
             commands::ai_multi_config::set_default_ai_config,
             commands::ai_multi_config::save_ai_config_item,
             commands::ai_multi_config::delete_ai_config,
+            commands::cc_switch::load_cc_switch_ai_configs,
             commands::prompt_template::load_prompt_templates,
             commands::prompt_template::save_prompt_template,
             commands::prompt_template::delete_prompt_template,
@@ -2028,7 +2002,6 @@ pub fn run() {
             commands::app_settings::save_max_retries,
             commands::app_settings::load_app_appearance_settings,
             commands::app_settings::update_app_appearance_settings,
-            commands::app_settings::set_macos_app_icon_appearance,
             commands::app_settings::set_app_locale,
             commands::app_settings::complete_app_close,
             commands::app_settings::mark_frontend_ready,
@@ -2451,6 +2424,7 @@ pub fn run() {
             commands::saved_sql::saved_sql_storage_dir,
             commands::saved_sql::open_saved_sql_storage_dir,
             commands::saved_sql::sync_saved_sql_directory,
+            commands::shortcut_recording::set_shortcut_recording,
             commands::fs_open::reveal_path_in_file_manager,
             commands::fs_open::is_sqlite_database_file,
             commands::fs_open::delete_database_backup_files,
@@ -2718,6 +2692,8 @@ pub fn run() {
             commands::mqtt_cmd::mqtt_get_messages,
             #[cfg(feature = "mq-admin")]
             commands::mqtt_cmd::mqtt_clear_messages,
+            #[cfg(feature = "mq-admin")]
+            commands::mqtt_cmd::mqtt_delete_message,
             commands::history::save_history,
             commands::history::load_history,
             commands::history::search_history,

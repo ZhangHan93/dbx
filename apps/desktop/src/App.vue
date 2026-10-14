@@ -74,7 +74,7 @@ import { disposeAllSqlServerActivityTraces } from "@/lib/sqlserver/sqlServerActi
 import { useVisibilityChange } from "@/composables/useVisibilityChange";
 import { useExternalSqlFileChanges } from "@/composables/useExternalSqlFileChanges";
 import { useWebDavAutoUpload } from "@/composables/useWebDavAutoUpload";
-import { readSyncMethod, readWebDavAutoUploadConfig, readWebDavBackupSelection } from "@/lib/webdav/webdavAutoUploadConfig";
+import { readSyncMethod, readWebDavAutoUploadConfig, readWebDavBackupSelection, recordWebDavSyncSuccess } from "@/lib/webdav/webdavAutoUploadConfig";
 import { useScheduledDatabaseBackups } from "@/composables/useScheduledDatabaseBackups";
 import { shouldDrawDesktopWindowFrame, shouldDrawLinuxFloatingFrame, useWindowControls } from "@/composables/useWindowControls";
 import { createOpenTabsRestorationBarrier, initializeDesktopOpenTabs, initializeOpenTabs, type OpenTabsRestorationBarrier } from "@/lib/app/openTabsStartup";
@@ -118,9 +118,12 @@ import { restoreGlobalNavigationEntry } from "@/lib/navigation/globalNavigationE
 import {
   isBrowserReloadShortcut,
   isBrowserTaskManagerShortcut,
+  isCaretBrowsingShortcut,
+  shouldBlockCaretBrowsing,
   isCloseAllTabsShortcut,
   isCloseOtherTabsShortcut,
   isCloseTabShortcut,
+  isReopenClosedTabShortcut,
   isCloseWindowShortcut,
   isDisconnectAllActiveConnectionsShortcut,
   isEditTableStructureShortcut,
@@ -156,6 +159,7 @@ import { initialTabSwitcherSelection, moveTabSwitcherSelection, tabSwitcherOrder
 import { createModifierDoubleTapShortcutController, isModifierDoubleTapShortcut, matchesModifierDoubleTapShortcut } from "@/lib/editor/modifierDoubleTapShortcut";
 import { createTabSwitcherKeyboardController } from "@/lib/tabs/tabSwitcherKeyboard";
 import { formatShortcutDisplay } from "@/lib/editor/shortcutDisplay";
+import { isShortcutEditingKeydown, isShortcutEditingTarget } from "@/lib/editor/shortcutRecorder";
 import { supportsSqlFileExecution } from "@/lib/database/databaseCapabilities";
 import { classifyAiSqlExecution } from "@/lib/ai/aiSqlExecutionPolicy";
 import { buildAppendedEditorSql, buildDeduplicatedAppendedEditorSql } from "@/lib/ai/aiSqlAppend";
@@ -1295,6 +1299,7 @@ async function openImmediateSync() {
     const selection = readWebDavBackupSelection();
     const includeSecrets = Boolean((selection?.includeSecrets ?? secretsStatus.enabled) && secretsStatus.enabled && secretsStatus.hasSavedPassphrase);
     const summary = await api.webdavSyncUpload(webDavConfig, settingsStore.editorSettings, undefined, includeSecrets, selection);
+    recordWebDavSyncSuccess(webDavConfig);
     toast(t("settings.syncUploadSuccess", { bytes: summary.bytes, path: summary.remotePath }), 3000);
   } catch (error: any) {
     toast(error?.message || String(error), 5000);
@@ -4076,11 +4081,11 @@ watch(
 );
 
 function canCaptureModifierDoubleTapSearch(e: KeyboardEvent): boolean {
-  const target = e.target instanceof Element ? e.target : document.activeElement;
   const shortcuts = settingsStore.editorSettings.shortcuts;
   const enabled = isModifierDoubleTapShortcut(shortcuts.quickOpen) || isModifierDoubleTapShortcut(shortcuts.globalSearch);
-  // Capture runs before the settings input can stop propagation.
-  if (e.defaultPrevented || showTabSwitcher.value || !enabled || target?.closest("[data-shortcut-input], [data-sql-shortcut-input]")) {
+  // Capture runs before the settings input can stop propagation, so it can only tell
+  // by the focused element; see isShortcutEditingKeydown (#11787 added the recorder).
+  if (e.defaultPrevented || showTabSwitcher.value || !enabled || isShortcutEditingKeydown(e)) {
     modifierDoubleTapSearch.reset();
     return false;
   }
@@ -4106,8 +4111,7 @@ function handleTabSwitcherKeydownCapture(e: KeyboardEvent) {
 
 function handleGlobalSearchKeydownCapture(e: KeyboardEvent) {
   if (canCaptureModifierDoubleTapSearch(e)) modifierDoubleTapSearch.handleKeydown(e);
-  const target = e.target instanceof Element ? e.target : document.activeElement;
-  if (target?.closest("[data-shortcut-input], [data-sql-shortcut-input]")) return;
+  if (isShortcutEditingKeydown(e)) return;
   if (e.defaultPrevented || !isGlobalSearchShortcut(e, settingsStore.editorSettings.shortcuts)) return;
   e.preventDefault();
   e.stopPropagation();
@@ -4118,6 +4122,10 @@ function handleGlobalSearchKeydownCapture(e: KeyboardEvent) {
 function handleAuxiliarySearchKeydownCapture(e: KeyboardEvent) {
   if (e.defaultPrevented || !isFocusSearchShortcut(e, settingsStore.editorSettings.shortcuts)) return;
   const target = e.target instanceof Element ? e.target : document.activeElement instanceof Element ? document.activeElement : null;
+  // 快捷键录入表面（每行录入框、SQL 录入框、#11787 的录入态）自己拥有键盘：焦点搜索键
+  // 默认就是 Mod+F，若在这里把焦点抢到设置页顶部的全局搜索框，用户正在录入的 Ctrl+F
+  // 会被中断（录入态随焦点丢失退出），等于「录入期间执行了真实快捷键命令」。
+  if (isShortcutEditingTarget(target)) return;
   if (!focusSearchInAuxiliarySurface(target)) return;
   e.preventDefault();
   e.stopPropagation();
@@ -4155,6 +4163,16 @@ const tabSwitcherKeyboard = createTabSwitcherKeyboardController({
 
 function handleNativeSelectAll(e: KeyboardEvent) {
   if (isBrowserTaskManagerShortcut(e)) {
+    e.preventDefault();
+    e.stopPropagation();
+    return;
+  }
+  if (
+    shouldBlockCaretBrowsing(e, {
+      caretBrowsingEnabled: settingsStore.editorSettings.caretBrowsingEnabled,
+      shortcuts: settingsStore.editorSettings.shortcuts,
+    })
+  ) {
     e.preventDefault();
     e.stopPropagation();
     return;
@@ -4436,6 +4454,12 @@ async function handleKeydown(e: KeyboardEvent) {
     await closeActiveSurface();
     return;
   }
+  if (isReopenClosedTabShortcut(e, shortcuts)) {
+    e.preventDefault();
+    e.stopPropagation();
+    queryStore.reopenClosedTab();
+    return;
+  }
   if (isSaveShortcut(e, shortcuts) && e.target instanceof Element && isObjectSourceSaveShortcutTarget(e.target)) {
     return;
   }
@@ -4496,6 +4520,11 @@ async function handleKeydown(e: KeyboardEvent) {
     }
   }
   if (isBrowserTaskManagerShortcut(e)) {
+    e.preventDefault();
+    e.stopPropagation();
+    return;
+  }
+  if (!settingsStore.editorSettings.caretBrowsingEnabled && isCaretBrowsingShortcut(e)) {
     e.preventDefault();
     e.stopPropagation();
     return;
@@ -5009,6 +5038,10 @@ onUnmounted(() => {
                   @open-plugin-center="
                     closeSettingsPage();
                     openPluginCenterPage();
+                  "
+                  @open-cc-switch-plugin-center="
+                    closeSettingsPage();
+                    openPluginCenterPage({ pluginId: 'cc-switch' });
                   "
                   @open-mcp-settings="openSettings('mcp')"
                   @ai-config-deep-link-handled="settingsAiConfigDraft = null"

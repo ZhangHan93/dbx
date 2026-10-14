@@ -2322,6 +2322,10 @@ export async function deleteAiConfig(configId: string): Promise<void> {
   return del(`/api/ai/config/${configId}`);
 }
 
+export async function loadCcSwitchAiConfigs(): Promise<import("@/types/ai").CcSwitchImportResult> {
+  throw new Error("ccSwitchImportDesktopOnly");
+}
+
 export async function loadDesktopSettings(): Promise<DesktopSettings> {
   try {
     const raw = safeLocalStorageGet(DESKTOP_SETTINGS_STORAGE_KEY);
@@ -2547,6 +2551,11 @@ export async function completeAppClose(_action: "quit" | "hide"): Promise<void> 
 }
 
 export async function requestAppClose(): Promise<void> {
+  return undefined;
+}
+
+/** #11787：Web 形态没有宿主层可配合（浏览器自行处理 Ctrl+W/Ctrl+T 等保留键），空实现。 */
+export async function setShortcutRecording(_recording: boolean): Promise<void> {
   return undefined;
 }
 
