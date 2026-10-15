@@ -2007,6 +2007,7 @@ impl AppState {
             &config.username,
             &config.password,
             config.database.as_deref(),
+            config.url_params.as_deref(),
             connect_timeout,
         )
         .await?;
@@ -2047,6 +2048,7 @@ impl AppState {
             &config.username,
             &config.password,
             config.database.as_deref(),
+            config.url_params.as_deref(),
             connect_timeout,
         )
         .await?;

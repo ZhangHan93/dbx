@@ -848,6 +848,20 @@ pub fn build_executable_object_source_statements(
 }
 
 #[tauri::command]
+pub fn validate_oracle_executable_object_source(
+    input: dbx_core::object_source_sql::OracleObjectSourceValidationInput,
+) -> Result<(), String> {
+    dbx_core::object_source_sql::validate_oracle_executable_object_source(input)
+}
+
+#[tauri::command]
+pub fn fingerprint_oracle_routine_object_source(
+    input: dbx_core::object_source_sql::EditableObjectSourceSqlInput,
+) -> Result<String, String> {
+    dbx_core::object_source_sql::fingerprint_oracle_routine_object_source(input)
+}
+
+#[tauri::command]
 pub fn build_executable_object_source_sql(
     input: dbx_core::object_source_sql::EditableObjectSourceSqlInput,
 ) -> Result<String, String> {
@@ -869,15 +883,49 @@ pub fn build_routine_rename_object_source_statements(
 }
 
 #[tauri::command]
+pub fn rewrite_oracle_routine_references(
+    input: dbx_core::object_source_sql::OracleRoutineReferenceRewriteInput,
+) -> Result<String, String> {
+    dbx_core::object_source_sql::rewrite_oracle_routine_references(input)
+}
+
+#[tauri::command]
+pub fn rewrite_oracle_table_references(
+    input: dbx_core::object_source_sql::OracleTableReferenceRewriteInput,
+) -> Result<String, String> {
+    dbx_core::object_source_sql::rewrite_oracle_table_references(input)
+}
+
+#[tauri::command]
 pub fn build_view_ddl_sql(input: dbx_core::object_source_sql::BuildViewDdlInput) -> Result<String, String> {
     Ok(dbx_core::object_source_sql::build_view_ddl_sql(input))
 }
 
 #[tauri::command]
+pub fn parse_oracle_object_name(input: String) -> Result<String, String> {
+    dbx_core::oracle_view_rename::parse_oracle_object_name(&input)
+}
+
+#[tauri::command]
+pub fn build_oracle_view_rename_source(
+    input: dbx_core::oracle_view_rename::OracleViewRenameSourceInput,
+) -> Result<dbx_core::oracle_view_rename::OracleViewRenameSource, String> {
+    dbx_core::oracle_view_rename::build_oracle_view_rename_source(input)
+}
+
+#[tauri::command]
+pub fn review_oracle_view_rename_source(
+    input: dbx_core::oracle_view_rename::OracleViewRenameSourceInput,
+) -> dbx_core::oracle_view_rename::OracleViewRenameSourceReview {
+    dbx_core::oracle_view_rename::review_oracle_view_rename_source(input)
+}
+
+#[tauri::command]
 pub fn build_table_structure_change_sql(
     options: dbx_core::table_structure_sql::TableStructureSqlOptions,
+    starrocks: Option<dbx_core::table_structure_sql::StarRocksAlterOptions>,
 ) -> Result<dbx_core::table_structure_sql::TableStructureSqlResult, String> {
-    Ok(dbx_core::table_structure_sql::build_table_structure_change_sql(options))
+    Ok(dbx_core::table_structure_sql::build_table_structure_change_sql_with_context(options, starrocks))
 }
 
 #[tauri::command]
@@ -919,8 +967,14 @@ pub async fn apply_sqlite_table_structure_change(
 #[tauri::command]
 pub fn build_create_table_sql(
     options: dbx_core::table_structure_sql::TableStructureSqlOptions,
+    server_version: Option<String>,
+    dialect_options: Option<dbx_core::table_structure_sql::CreateTableDialectOptions>,
 ) -> Result<dbx_core::table_structure_sql::TableStructureSqlResult, String> {
-    Ok(dbx_core::table_structure_sql::build_create_table_sql(options))
+    Ok(dbx_core::table_structure_sql::build_create_table_sql_with_dialect_options(
+        options,
+        server_version.as_deref(),
+        dialect_options.unwrap_or_default(),
+    ))
 }
 
 #[tauri::command]

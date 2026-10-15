@@ -14,7 +14,7 @@ pub use dbx_core::update::UpdateInfo;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
-use tauri_plugin_updater::{Update, UpdaterExt};
+use tauri_plugin_updater::{Update, UpdaterBuilder, UpdaterExt};
 
 const OFFICIAL_UPDATE_ENDPOINTS: [&str; 2] = [
     "https://dl.dbxio.com/releases/latest/latest.json",
@@ -50,6 +50,11 @@ fn fork_local_update_info() -> UpdateInfo {
         release_url: FORK_RELEASE_URL.to_string(),
         release_notes: String::new(),
     }
+}
+
+fn dbx_updater_builder(app: &AppHandle) -> UpdaterBuilder {
+    let cleanup_app = app.clone();
+    app.updater_builder().on_before_exit(move || crate::cleanup_before_updater_forced_exit(&cleanup_app))
 }
 
 #[derive(Debug, Deserialize)]
@@ -417,7 +422,7 @@ fn package_kind(app: &AppHandle) -> Result<String, String> {
     if crate::data_dir::is_portable_mode() {
         return Ok("portable".into());
     }
-    Ok(app.updater_builder().build().map_err(|e| e.to_string())?.package_kind().into())
+    Ok(dbx_updater_builder(app).build().map_err(|e| e.to_string())?.package_kind().into())
 }
 
 fn validate_cache_target(record: &CacheRecord, portable_mode: bool, package_kind: &str) -> Result<(), String> {
@@ -451,8 +456,7 @@ fn restore_cached(app: &AppHandle) -> Result<Option<CachedUpdate>, String> {
             )?;
             ReadyUpdate::Portable { archive: bytes, version }
         } else {
-            let update = app
-                .updater_builder()
+            let update = dbx_updater_builder(app)
                 .build()
                 .map_err(|e| e.to_string())?
                 .restore_update(record.manifest.clone().ok_or("Missing cached release metadata")?)
@@ -592,8 +596,9 @@ async fn download_update_inner(
     for endpoint_url in endpoint_urls {
         endpoints.push(endpoint_url.parse().map_err(|e| format!("Invalid update endpoint: {e}"))?);
     }
-    let mut builder =
-        app.updater_builder().endpoints(endpoints).map_err(|e| format!("Failed to configure updater endpoint: {e}"))?;
+    let mut builder = dbx_updater_builder(app)
+        .endpoints(endpoints)
+        .map_err(|e| format!("Failed to configure updater endpoint: {e}"))?;
 
     if let Some(proxy_url) = dbx_core::update::system_proxy_url() {
         let proxy = proxy_url.parse().map_err(|e| format!("Invalid system proxy URL: {e}"))?;
