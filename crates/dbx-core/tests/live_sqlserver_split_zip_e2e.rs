@@ -228,6 +228,7 @@ async fn manual_e2e_sqlserver_default_split_zip_export_then_import_skip_relation
         // before the import and `WITH NOCHECK CHECK CONSTRAINT ALL` after.
         skip_relational_constraints: true,
         failure_log_enabled: true,
+        encoding: Default::default(),
     };
 
     let file_path_refs: Vec<&std::path::Path> = extracted_paths.iter().map(|path| path.as_path()).collect();

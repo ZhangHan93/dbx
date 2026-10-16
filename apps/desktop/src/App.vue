@@ -122,6 +122,7 @@ import {
   isCaretBrowsingShortcut,
   shouldBlockCaretBrowsing,
   isCloseAllTabsShortcut,
+  isSaveAllTabsShortcut,
   isCloseOtherTabsShortcut,
   isCloseTabShortcut,
   isReopenClosedTabShortcut,
@@ -130,6 +131,7 @@ import {
   isEditTableStructureShortcut,
   isExecuteSqlInNewResultTabShortcut,
   isExecuteSqlShortcut,
+  isDefaultQueryShortcutTarget,
   isFocusSearchShortcut,
   isFocusWhereShortcut,
   isGoToColumnShortcut,
@@ -144,6 +146,7 @@ import {
   isRefreshDataShortcut,
   isSaveShortcut,
   isSendSelectionToAiShortcut,
+  isSidebarFocusedTarget,
   isSwitchToNextTabShortcut,
   isSwitchToPreviousTabShortcut,
   isToggleResultsPaneShortcut,
@@ -492,6 +495,7 @@ provide(OPEN_PLUGIN_AI_CONVERSATION, (request) => {
 });
 const appSidebarRef = ref<InstanceType<typeof AppSidebar> | null>(null);
 const appTabBarRef = ref<InstanceType<typeof AppTabBar> | null>(null);
+const settingsPageRef = ref<InstanceType<typeof EditorSettingsPage> | null>(null);
 const contentAreaRef = ref<InstanceType<typeof SqlEditorWorkspace> | null>(null);
 const lastFocusedAuxiliarySurface = ref<AuxiliarySearchSurface>(null);
 const lastFocusedSidebarSurface = ref(false);
@@ -1148,6 +1152,7 @@ provide(EDITOR_TOOLBAR_ACTIONS, {
   compressSql: compressActiveSql,
   toggleSqlKeywordCase,
   saveSql: (tabId: string) => void openSaveSqlDialog(tabId),
+  saveAllTabs: (tabIds?: string[]) => void handleSaveAllTabs(tabIds),
   openSqlFile,
   importResultArchive,
   pasteSqlInCondition: pasteClipboardAsSqlInCondition,
@@ -1376,6 +1381,16 @@ function activateOpenSpecialPageFallback() {
 }
 
 function closeSettingsPage() {
+  if (settingsPageRef.value) {
+    activateSettingsPage();
+    settingsPageRef.value.requestClose();
+    return;
+  }
+  // An async settings page that has not mounted cannot have an edited draft.
+  finishCloseSettingsPage();
+}
+
+function finishCloseSettingsPage() {
   settingsPageTabOpen.value = false;
   if (settingsReturnSurface.value === "driverStore" && driverStoreTabOpen.value) {
     activateMainContentSurface("driverStore");
@@ -1475,7 +1490,7 @@ async function checkAllUpdates() {
 }
 
 function openDriverStoreFromUpdate(target?: DriverStoreTab) {
-  closeSettingsPage();
+  finishCloseSettingsPage();
   openDriverStorePage(target);
 }
 
@@ -2501,24 +2516,33 @@ async function saveTabForCloseAll(tabId: string): Promise<boolean> {
 
   const existing = tab.savedSqlId ? savedSqlStore.getFile(tab.savedSqlId) : undefined;
   const target = savedSqlTargetForSave(tab);
-  try {
-    const saved = await savedSqlStore.saveFile({
-      id: existing?.id,
-      connectionId: target.connectionId,
-      folderId: existing?.folderId,
-      name: existing?.name || defaultSavedSqlName(tab.title),
-      database: target.database,
-      catalog: target.catalog,
-      schema: target.schema,
-      sql: await formattedSqlForSave(tab),
-    });
-    queryStore.linkSavedSql(tab.id, saved.id, saved.name);
-    queryStore.markTabClean(tab);
-    return true;
-  } catch (e: any) {
-    toast(t("savedSql.saveFailed", { message: savedSqlErrorMessage(e, t) }), 5000);
-    return false;
+  let saveName = existing?.name || defaultSavedSqlName(tab.title);
+  for (let attempt = 0; attempt < SAVE_SQL_NAME_ATTEMPTS; attempt++) {
+    try {
+      const saved = await savedSqlStore.saveFile({
+        id: existing?.id,
+        connectionId: target.connectionId,
+        folderId: existing?.folderId,
+        name: saveName,
+        database: target.database,
+        catalog: target.catalog,
+        schema: target.schema,
+        sql: await formattedSqlForSave(tab),
+      });
+      queryStore.linkSavedSql(tab.id, saved.id, saved.name);
+      queryStore.markTabClean(tab);
+      return true;
+    } catch (e: any) {
+      const conflict = e as { code?: unknown; suggestedName?: unknown } | null;
+      if (conflict?.code === "SAVED_SQL_NAME_CONFLICT" && typeof conflict.suggestedName === "string" && conflict.suggestedName !== saveName && attempt < SAVE_SQL_NAME_ATTEMPTS - 1) {
+        saveName = conflict.suggestedName;
+        continue;
+      }
+      toast(t("savedSql.saveFailed", { message: savedSqlErrorMessage(e, t) }), 5000);
+      return false;
+    }
   }
+  return false;
 }
 
 async function handleSaveAllPendingTabClose() {
@@ -2538,6 +2562,31 @@ async function handleSaveAllPendingTabClose() {
 
   const result = queryStore.completePendingCloseAfterSaveAll();
   if (result === "app") continuePendingAppCloseAfterSave();
+}
+
+async function handleSaveAllTabs(targetTabIds?: string[]) {
+  await queryStore.flushDefaultQueries();
+  const pool = targetTabIds ? queryStore.tabs.filter((t) => targetTabIds.includes(t.id)) : queryStore.tabs;
+  const dirtyTabs = pool.filter((t) => queryStore.isTabDirty(t));
+  if (!dirtyTabs.length) return;
+
+  const previousActiveTabId = queryStore.activeTabId;
+  let savedCount = 0;
+
+  for (const tab of dirtyTabs) {
+    const saved = await saveTabForCloseAll(tab.id);
+    if (!saved) break;
+    savedCount += 1;
+  }
+
+  if (previousActiveTabId && queryStore.tabs.some((t) => t.id === previousActiveTabId)) {
+    queryStore.activateTab(previousActiveTabId);
+  }
+
+  const hadLibrarySaves = dirtyTabs.some((t) => !t.externalSqlPath && !t.objectSource && t.mode !== "structure");
+  if (hadLibrarySaves && savedCount > 0) {
+    notifySqlLibrarySaved();
+  }
 }
 
 async function handleSaveTab(tabId: string) {
@@ -3155,6 +3204,7 @@ function openConnectionSettings(connectionId: string, initialTab: ConfigTab = "c
 
 interface NewQueryOptions {
   preferredSource?: NewQueryContextSource;
+  openDefault?: boolean;
 }
 
 async function newQuery(options: NewQueryOptions = {}) {
@@ -3207,6 +3257,25 @@ async function newQuery(options: NewQueryOptions = {}) {
       } else {
         queryStore.createTab(target.connectionId, "", `${conn.name}:keys`, connectionTarget.kind);
       }
+    } catch (e: any) {
+      toast(
+        t("connection.connectFailed", {
+          message: translateBackendError(t, e),
+        }),
+        5000,
+      );
+    }
+    return;
+  }
+  if (options.openDefault) {
+    try {
+      await connectionStore.ensureConnected(target.connectionId);
+      let database = target.database;
+      if (target.shouldRefreshDefaultDatabase || !database) {
+        const databaseOptions = await getDatabaseOptions(target.connectionId);
+        database = resolveDefaultDatabase(conn, databaseOptions);
+      }
+      await queryStore.openDefaultQuery({ connectionId: target.connectionId, database, catalog: target.catalog });
     } catch (e: any) {
       toast(
         t("connection.connectFailed", {
@@ -4530,8 +4599,7 @@ async function handleKeydown(e: KeyboardEvent) {
     // Otherwise Ctrl+F from empty space in the sidebar incorrectly opens the
     // search belonging to the active table/query tab.
     const target = e.target instanceof Element ? e.target : null;
-    const targetIsDocument = !target || target === document.body || target === document.documentElement;
-    const sidebarFocused = target?.closest("[data-app-sidebar]") || (targetIsDocument && lastFocusedSidebarSurface.value);
+    const sidebarFocused = isSidebarFocusedTarget(target, lastFocusedSidebarSurface.value);
     const focused = sidebarFocused ? appSidebarRef.value?.focusSearch(target) : focusSearchInAuxiliarySurface(target) || contentAreaRef.value?.focusSearch(target) || appSidebarRef.value?.focusSearch(target);
     if (focused) {
       e.preventDefault();
@@ -4554,8 +4622,7 @@ async function handleKeydown(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     const target = e.target instanceof Element ? e.target : null;
-    const targetIsDocument = !target || target === document.body || target === document.documentElement;
-    const sidebarFocused = target?.closest("[data-app-sidebar]") || (targetIsDocument && lastFocusedSidebarSurface.value);
+    const sidebarFocused = isSidebarFocusedTarget(target, lastFocusedSidebarSurface.value);
     void newQuery({ preferredSource: sidebarFocused ? "sidebar" : undefined });
     return;
   }
@@ -4609,6 +4676,12 @@ async function handleKeydown(e: KeyboardEvent) {
     appTabBarRef.value?.closeAllTabs();
     return;
   }
+  if (isSaveAllTabsShortcut(e, shortcuts)) {
+    e.preventDefault();
+    e.stopPropagation();
+    void handleSaveAllTabs();
+    return;
+  }
   if (isDisconnectAllActiveConnectionsShortcut(e, shortcuts)) {
     e.preventDefault();
     e.stopPropagation();
@@ -4649,6 +4722,13 @@ async function handleKeydown(e: KeyboardEvent) {
   }
   // CodeMirror ignores keydown events after an IME composition changes the
   // document, so this app-level fallback must share the editor shortcut guard.
+  const defaultQueryShortcutTarget = isDefaultQueryShortcutTarget(e.target, lastFocusedSidebarSurface.value);
+  if (isExecuteSqlShortcut(e, shortcuts) && defaultQueryShortcutTarget) {
+    e.preventDefault();
+    e.stopPropagation();
+    void newQuery({ preferredSource: "sidebar", openDefault: true });
+    return;
+  }
   if (activeTab.value?.mode === "query" && isExecuteSqlInNewResultTabShortcut(e, shortcuts) && e.target instanceof Element && e.target.closest("[data-query-editor-root]")) {
     e.preventDefault();
     e.stopPropagation();
@@ -5096,7 +5176,7 @@ onUnmounted(() => {
           :show-logout="!isDesktop && needsAuth"
           @new-connection="showConnectionDialog = true"
           @expand-sidebar="setSidebarOpen(true)"
-          @new-query="newQuery"
+          @new-query="newQuery({ preferredSource: lastFocusedSidebarSurface ? 'sidebar' : undefined })"
           @set-theme-mode="setThemeMode"
           @toggle-ai="toggleRightSidebarPanel('ai')"
           @toggle-history="toggleRightSidebarPanel('history')"
@@ -5132,6 +5212,7 @@ onUnmounted(() => {
             @open-settings="(initialTab) => openSettings(initialTab ?? 'appearance')"
             @add-to-ai="addToAi"
             @mousedown="rememberSidebarSearchSurface"
+            @focusin="rememberSidebarSearchSurface"
           />
 
           <div
@@ -5139,6 +5220,7 @@ onUnmounted(() => {
             v-show="isSpecialPageActive || (!isAiPanelMaximized && !isHistoryPanelMaximized) || isZenMode"
             :class="isDetachedWindowContext ? 'flex-1 min-w-0 overflow-hidden bg-background' : isClassicLayout ? 'flex-1 min-w-0 overflow-hidden' : 'flex-1 min-w-0 overflow-hidden rounded-md border border-border/80 bg-background'"
             @mousedown="rememberEditorContentSurface"
+            @focusin="rememberEditorContentSurface"
           >
             <div class="h-full flex min-h-0 min-w-0 flex-col">
               <AppTabBar
@@ -5191,6 +5273,7 @@ onUnmounted(() => {
                 <EditorSettingsPage
                   v-if="settingsPageTabOpen"
                   v-show="settingsStore.settingsPageActive"
+                  ref="settingsPageRef"
                   variant="page"
                   :open="settingsPageTabOpen"
                   :initial-tab="settingsInitialTab"
@@ -5208,13 +5291,13 @@ onUnmounted(() => {
                   :mcp-update-available="toolbarMcpUpdateAvailable"
                   :plugin-update-count="componentUpdates.pluginUpdateCount.value"
                   class="flex-1 min-h-0"
-                  @update:open="(open: boolean) => (open ? activateSettingsPage() : closeSettingsPage())"
+                  @update:open="(open: boolean) => (open ? activateSettingsPage() : finishCloseSettingsPage())"
                   @check-updates="checkAllUpdates"
                   @update-all="updateAllAvailable"
                   @open-update-center="handleToolbarUpdateClick"
                   @open-driver-store="openDriverStoreFromUpdate"
                   @open-plugin-center="
-                    closeSettingsPage();
+                    finishCloseSettingsPage();
                     openPluginCenterPage();
                   "
                   @open-cc-switch-plugin-center="

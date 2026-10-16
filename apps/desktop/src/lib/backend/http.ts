@@ -1,3 +1,4 @@
+import type { SqlFileEncoding } from "./tauri";
 import type { StarRocksAlterOptions } from "@/lib/table/starrocksAlterOptions";
 import type { CreateTableDialectOptions } from "@/lib/table/starrocksPhysicalOptions";
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
@@ -1094,6 +1095,10 @@ export async function deleteSavedSqlFolder(id: string): Promise<void> {
 
 export async function saveSavedSqlFile(file: SavedSqlFile): Promise<SavedSqlFile> {
   return post("/api/saved-sql", file);
+}
+
+export async function saveDefaultQueryContent(id: string, sql: string, updatedAt: string): Promise<void> {
+  return post(`/api/saved-sql/${encodeURIComponent(id)}/default-content`, { sql, updatedAt });
 }
 
 export async function deleteSavedSqlFile(id: string): Promise<void> {
@@ -2879,19 +2884,23 @@ export async function setAiGlobalCustomInstructions(content: string): Promise<vo
 // SQL File Execution
 // ---------------------------------------------------------------------------
 
-export async function previewSqlFile(fileOrPath: string | File): Promise<SqlFilePreview> {
+export async function previewSqlFile(fileOrPath: string | File, encoding?: SqlFileEncoding): Promise<SqlFilePreview> {
   if (typeof fileOrPath === "string") {
     // In web mode a raw path is not useful; throw a clear error
     throw new Error("previewSqlFile in web mode requires a File object, not a file path");
   }
   const formData = new FormData();
   formData.append("file", fileOrPath);
-  const res = await fetch(apiUrl("/api/sql-file/preview"), {
+  const res = await fetch(apiUrl(`/api/sql-file/preview${encoding ? `?encoding=${encodeURIComponent(encoding)}` : ""}`), {
     method: "POST",
     body: formData,
   });
   if (!res.ok) throw await backendResponseError(res);
   return res.json();
+}
+
+export async function refreshSqlFilePreview(filePath: string, encoding: SqlFileEncoding): Promise<Pick<SqlFilePreview, "preview" | "canExecuteWithoutSelectedDatabase" | "establishesDatabaseContext">> {
+  return post("/api/sql-file/preview/refresh", { filePath, encoding });
 }
 
 export async function releaseSqlFilePreview(cleanupToken: string): Promise<void> {
@@ -2929,8 +2938,8 @@ export async function executeSqlFile(request: SqlFileRequest): Promise<void> {
   return post("/api/sql-file/execute", { request });
 }
 
-export async function inspectSqlFileTables(filePath: string): Promise<SqlFileTable[]> {
-  return post("/api/sql-file/tables", { filePath });
+export async function inspectSqlFileTables(filePath: string, encoding?: SqlFileEncoding): Promise<SqlFileTable[]> {
+  return post("/api/sql-file/tables", { filePath, encoding });
 }
 
 export async function executeSqlFiles(request: SqlFileRequest, filePaths: string[]): Promise<void> {
@@ -3070,11 +3079,12 @@ export async function saveGlobalSearchSettings(settings: GlobalSearchSettings): 
 // ---------------------------------------------------------------------------
 
 export async function startTransfer(request: TransferRequest, onProgress: (progress: TransferProgress) => void, onStarted?: () => void): Promise<void> {
+  const { operationTimeoutSecs, ...backendRequest } = request;
   // 1. POST to start the transfer
   const res = await fetch(apiUrl("/api/transfer/start"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ request }),
+    body: JSON.stringify({ request: backendRequest, operationTimeoutSecs }),
   });
   if (!res.ok) throw await backendResponseError(res);
   onStarted?.();
@@ -3809,8 +3819,8 @@ export async function redisScanValues(connectionId: string, db: number, cursor: 
   });
 }
 
-export async function redisGetValue(connectionId: string, db: number, keyRaw: string): Promise<RedisValue> {
-  return post("/api/redis/get-value", { connectionId, db, keyRaw });
+export async function redisGetValue(connectionId: string, db: number, keyRaw: string, previewLimitBytes?: number): Promise<RedisValue> {
+  return post("/api/redis/get-value", { connectionId, db, keyRaw, previewLimitBytes });
 }
 
 export async function redisGetRawValue(connectionId: string, db: number, keyRaw: string): Promise<RedisBlob> {

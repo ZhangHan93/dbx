@@ -57,6 +57,7 @@ import { createConnectionNoteVisibilityDraft, persistConnectionNoteVisibilityDra
 import { REDIS_SCAN_PAGE_SIZE_DEFAULT, REDIS_SCAN_PAGE_SIZE_MIN, REDIS_SCAN_PAGE_SIZE_MAX, REDIS_SCAN_PAGE_SIZE_OPTIONS } from "@/lib/redis/redisKeyPattern";
 import { normalizeRedisKeyTemplates, redisKeyTemplatesToTextarea } from "@/lib/redis/redisKeyTemplates";
 import { normalizeRedisDatabaseValue } from "@/lib/redis/redisDatabaseIndex";
+import { REDIS_VALUE_PREVIEW_LIMIT_KIB_MAX, REDIS_VALUE_PREVIEW_LIMIT_KIB_MIN, normalizeRedisValuePreviewLimitKiB } from "@/lib/redis/redisValuePreviewLimit";
 import { normalizeGlobalConnectTimeoutSecs, normalizeGlobalQueryTimeoutSecs, useSettingsStore } from "@/stores/settingsStore";
 import { useToast } from "@/composables/useToast";
 import DatabaseIcon from "@/components/icons/DatabaseIcon.vue";
@@ -297,6 +298,7 @@ const showConnectionNotesInSidebar = computed({
 });
 const editGlobalConnectTimeoutSecs = ref(settingsStore.editorSettings.globalConnectTimeoutSecs);
 const editGlobalQueryTimeoutSecs = ref(settingsStore.editorSettings.globalQueryTimeoutSecs);
+const editRedisValuePreviewLimitKiB = ref(settingsStore.editorSettings.redisValuePreviewLimitKiB);
 const open = defineModel<boolean>("open", { default: false });
 const isDesktop = isTauriRuntime();
 
@@ -3088,6 +3090,7 @@ watch(
     resetConnectionNoteVisibilityDraft(connectionNoteVisibilityDraft, settingsStore.editorSettings.sidebarShowConnectionNotes);
     editGlobalConnectTimeoutSecs.value = settingsStore.editorSettings.globalConnectTimeoutSecs;
     editGlobalQueryTimeoutSecs.value = settingsStore.editorSettings.globalQueryTimeoutSecs;
+    editRedisValuePreviewLimitKiB.value = settingsStore.editorSettings.redisValuePreviewLimitKiB;
     if (syncAction === "hydrate" && config) {
       appliedConnectionUpdate = connectionUpdate;
       if (connectionUpdate) applyingConnectionUpdate = true;
@@ -6239,6 +6242,7 @@ function resetForm(options: { preservePickerState?: boolean } = {}) {
   resetConnectionNoteVisibilityDraft(connectionNoteVisibilityDraft, settingsStore.editorSettings.sidebarShowConnectionNotes);
   editGlobalConnectTimeoutSecs.value = settingsStore.editorSettings.globalConnectTimeoutSecs;
   editGlobalQueryTimeoutSecs.value = settingsStore.editorSettings.globalQueryTimeoutSecs;
+  editRedisValuePreviewLimitKiB.value = settingsStore.editorSettings.redisValuePreviewLimitKiB;
   selectedTransportLayerId.value = null;
   draggedTransportLayerId.value = null;
   selectedType.value = "mysql";
@@ -6687,6 +6691,13 @@ async function persistGlobalTimeoutDrafts() {
   });
 }
 
+async function persistGlobalRedisValuePreviewLimit() {
+  const next = normalizeRedisValuePreviewLimitKiB(editRedisValuePreviewLimitKiB.value);
+  editRedisValuePreviewLimitKiB.value = next;
+  if (next === settingsStore.editorSettings.redisValuePreviewLimitKiB) return;
+  await settingsStore.updateEditorSettingsAndPersist({ redisValuePreviewLimitKiB: next });
+}
+
 async function persistConnectionNoteVisibilityDraft() {
   await persistConnectionNoteVisibilityDraftState(connectionNoteVisibilityDraft, settingsStore.editorSettings.sidebarShowConnectionNotes, (value) => settingsStore.updateEditorSettingsAndPersist({ sidebarShowConnectionNotes: value }));
 }
@@ -6738,6 +6749,7 @@ async function save(options: SaveConnectionOptions = {}): Promise<boolean> {
       await ensureRequiredGaussdbMJdbcRuntime(updated);
       validateConnectionUpdateTarget();
       await persistGlobalTimeoutDrafts();
+      await persistGlobalRedisValuePreviewLimit();
       await store.updateConnection(updated);
       savedConfig = updated;
       connectionSaved = true;
@@ -6747,6 +6759,7 @@ async function save(options: SaveConnectionOptions = {}): Promise<boolean> {
       await ensureRequiredAgentDriverInstalled(config);
       await ensureRequiredGaussdbMJdbcRuntime(config);
       await persistGlobalTimeoutDrafts();
+      await persistGlobalRedisValuePreviewLimit();
       await store.addConnection(config, selectedConnectionGroupId.value);
       savedConfig = config;
       connectionSaved = true;
@@ -10545,6 +10558,16 @@ function openExternalUrl(url: string) {
                     <p class="text-xs text-muted-foreground">{{ t("settings.redisScanPageSizeDescription") }}</p>
                   </div>
                 </div>
+                <div v-if="form.db_type === 'redis'" class="grid grid-cols-4 items-start gap-4">
+                  <Label for="redis-value-preview-limit-input" :class="connectionLabelTopClass">{{ t("settings.redisValuePreviewLimit") }}</Label>
+                  <div class="col-span-3 space-y-1">
+                    <div class="flex items-center gap-2">
+                      <Input id="redis-value-preview-limit-input" v-model.number="editRedisValuePreviewLimitKiB" type="number" :min="REDIS_VALUE_PREVIEW_LIMIT_KIB_MIN" :max="REDIS_VALUE_PREVIEW_LIMIT_KIB_MAX" step="1" class="h-8 w-32 text-xs" />
+                      <span class="text-xs text-muted-foreground">KiB</span>
+                    </div>
+                    <p class="text-xs text-muted-foreground">{{ t("settings.redisValuePreviewLimitDescription") }}</p>
+                  </div>
+                </div>
               </div>
             </TabsContent>
 
@@ -11189,7 +11212,24 @@ function openExternalUrl(url: string) {
 .connection-dialog-content {
   display: flex;
   flex-direction: column;
+  height: min(800px, calc(var(--dbx-viewport-height) - 2rem));
+  /* legacy WebViews without dvh support clamp through the viewport variable */
   max-height: calc(var(--dbx-viewport-height) - 2rem);
+  overflow: hidden;
+}
+
+.connection-dialog-content [data-slot="tabs-list"] {
+  flex-shrink: 0;
+}
+
+.connection-dialog-content [data-slot="tabs-content"] {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.connection-dialog-content .connection-dialog-footer {
+  flex-shrink: 0;
 }
 
 .connection-dialog-content--config {

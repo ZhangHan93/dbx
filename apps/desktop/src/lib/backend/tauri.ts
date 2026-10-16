@@ -537,6 +537,9 @@ export interface QueryPaginationExecutionPlanOptions {
   pagination: QueryPagination;
   useAgentCursor: boolean;
   firstPageUsesActualSql?: boolean;
+  /** Optimizer hint injected into the generated count (dbx_count) and page (dbx_page) SQL.
+   *  Example: GaussDB parallel execution hint: + set(query_dop 8). */
+  executionHint?: string;
 }
 
 export interface QueryPaginationExecutionPlan {
@@ -560,6 +563,7 @@ export interface SortedQuerySqlOptions {
   columnIndex: number;
   column: string;
   direction: QuerySortDirection;
+  tieBreakerColumnIndexes?: number[];
 }
 
 export interface QuerySqlBuildResult {
@@ -3272,6 +3276,10 @@ export async function saveSavedSqlFile(file: SavedSqlFile): Promise<SavedSqlFile
   return invoke("save_saved_sql_file", { file });
 }
 
+export async function saveDefaultQueryContent(id: string, sql: string, updatedAt: string): Promise<void> {
+  return invoke("save_default_query_content", { id, sql, updatedAt });
+}
+
 export async function deleteSavedSqlFile(id: string): Promise<void> {
   return invoke("delete_saved_sql_file", { id });
 }
@@ -3639,8 +3647,8 @@ export async function redisScanValues(connectionId: string, db: number, cursor: 
   });
 }
 
-export async function redisGetValue(connectionId: string, db: number, keyRaw: string): Promise<RedisValue> {
-  return invoke("redis_get_value", { connectionId, db, keyRaw });
+export async function redisGetValue(connectionId: string, db: number, keyRaw: string, previewLimitBytes?: number): Promise<RedisValue> {
+  return invoke("redis_get_value", { connectionId, db, keyRaw, previewLimitBytes });
 }
 
 export async function redisGetRawValue(connectionId: string, db: number, keyRaw: string): Promise<RedisBlob> {
@@ -5661,7 +5669,10 @@ export async function deleteHistoryEntry(id: string): Promise<void> {
 // --- SQL File Execution ---
 export type SqlFileStatus = "started" | "running" | "statementDone" | "statementFailed" | "done" | "error" | "cancelled";
 
+export type SqlFileEncoding = "auto" | "utf8" | "gbk" | "utf16Le" | "utf16Be";
+
 export interface SqlFileRequest {
+  encoding?: SqlFileEncoding;
   executionId: string;
   connectionId: string;
   database: string;
@@ -5679,8 +5690,8 @@ export interface SqlFileTable {
   name: string;
 }
 
-export async function inspectSqlFileTables(filePath: string): Promise<SqlFileTable[]> {
-  return invoke("inspect_sql_file_tables", { filePath });
+export async function inspectSqlFileTables(filePath: string, encoding?: SqlFileEncoding): Promise<SqlFileTable[]> {
+  return invoke("inspect_sql_file_tables", { filePath, encoding });
 }
 
 export interface SqlFilePreview {
@@ -5693,6 +5704,11 @@ export interface SqlFilePreview {
   packageFilePaths?: string[];
   packagePartCount?: number;
   cleanupToken?: string;
+}
+
+export async function refreshSqlFilePreview(filePath: string, encoding: SqlFileEncoding): Promise<Pick<SqlFilePreview, "preview" | "canExecuteWithoutSelectedDatabase" | "establishesDatabaseContext">> {
+  const result = await previewSqlFile(filePath, encoding);
+  return { preview: result.preview, canExecuteWithoutSelectedDatabase: result.canExecuteWithoutSelectedDatabase, establishesDatabaseContext: result.establishesDatabaseContext };
 }
 
 export async function releaseSqlFilePreview(_cleanupToken: string): Promise<void> {}
@@ -5714,8 +5730,8 @@ export interface SqlFileProgress {
   fileName?: string;
 }
 
-export async function previewSqlFile(filePath: string): Promise<SqlFilePreview> {
-  return invoke("preview_sql_file", { filePath });
+export async function previewSqlFile(filePath: string, encoding?: SqlFileEncoding): Promise<SqlFilePreview> {
+  return invoke("preview_sql_file", { filePath, encoding });
 }
 
 export type SqlFileFailureLogStatus = "available" | "degraded" | "unavailable";
@@ -5806,6 +5822,8 @@ export interface TransferRequest {
   quoteTargetColumnNames: boolean;
   ownershipPolicy?: TransferOwnershipPolicy;
   batchSize: number;
+  /** Per-operation timeout for this transfer. Undefined inherits each connection; 0 disables the limit. */
+  operationTimeoutSecs?: number;
   /**
    * Optional per-source-table transfer filter.
    * Key = source table name; value = a bare `WHERE` predicate
@@ -5869,6 +5887,7 @@ export interface TransferProgress {
 }
 
 export async function startTransfer(request: TransferRequest, onProgress: (progress: TransferProgress) => void, onStarted?: () => void): Promise<void> {
+  const { operationTimeoutSecs, ...backendRequest } = request;
   return new Promise((resolve, reject) => {
     let unlisten: UnlistenFn | null = null;
     void (async () => {
@@ -5882,7 +5901,7 @@ export async function startTransfer(request: TransferRequest, onProgress: (progr
           }
         });
 
-        await invoke("start_transfer", { request });
+        await invoke("start_transfer", { request: backendRequest, operationTimeoutSecs });
         onStarted?.();
       } catch (e) {
         unlisten?.();

@@ -183,6 +183,7 @@ export const loadSavedSqlFile = forward("loadSavedSqlFile");
 export const saveSavedSqlFolder = forward("saveSavedSqlFolder");
 export const deleteSavedSqlFolder = forward("deleteSavedSqlFolder");
 export const saveSavedSqlFile = forward("saveSavedSqlFile");
+export const saveDefaultQueryContent = forward("saveDefaultQueryContent");
 export const deleteSavedSqlFile = forward("deleteSavedSqlFile");
 export const savedSqlStorageDir = forward("savedSqlStorageDir");
 export const openSavedSqlStorageDir = forward("openSavedSqlStorageDir");
@@ -483,6 +484,7 @@ export const listLocalSshKeys = forward("listLocalSshKeys");
 
 // SQL File Execution
 export const previewSqlFile = forward("previewSqlFile");
+export const refreshSqlFilePreview = forward("refreshSqlFilePreview");
 export const releaseSqlFilePreview = forward("releaseSqlFilePreview");
 export const executeSqlFile = forward("executeSqlFile");
 export const sqlFileFailureLogInfo = forward("sqlFileFailureLogInfo");
