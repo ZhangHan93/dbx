@@ -5093,7 +5093,7 @@ fn format_send_message_result(
         "Message sent to {}.\ntopic: {}\npartition: {}\noffset: {}",
         system_kind.as_str(),
         result.topic,
-        result.partition,
+        result.partition.map(|value| value.to_string()).unwrap_or_else(|| "unknown".into()),
         result.offset
     );
     if let Some(timestamp) = result.timestamp.as_deref() {
@@ -6775,10 +6775,22 @@ mod tests {
 
     #[cfg(feature = "mq-admin")]
     #[test]
+    fn format_proxy_send_result_marks_unreported_partition_unknown() {
+        let result: dbx_core::mq::SendMessageResponse = serde_json::from_value(serde_json::json!({
+            "topic": "orders", "offset": 0
+        }))
+        .unwrap();
+        let output = format_send_message_result(&dbx_core::mq::MqSystemKind::RocketMq, &result);
+        assert!(output.contains("partition: unknown"));
+        assert!(!output.contains("partition: 0"));
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[test]
     fn format_send_message_result_is_concise_and_includes_delivery_metadata() {
         let result = dbx_core::mq::SendMessageResponse {
             topic: "orders".to_string(),
-            partition: 2,
+            partition: Some(2),
             offset: 41,
             timestamp: Some("1700000000000".to_string()),
         };

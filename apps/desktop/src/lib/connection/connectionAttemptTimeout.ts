@@ -28,6 +28,7 @@ const DRIVER_STARTUP_FLOOR_TYPES = new Set<DatabaseType>([
   "exasol",
   "oceanbase-oracle",
   "gbase",
+  "gbase8s",
   "access",
   // odbc / odbc32 走自研 native agent（self-contained 单文件 exe）：首次冷启动要解压并加载
   // .NET runtime，与 access / jdbc 同理属于"驱动启动慢"，需要 30s 下限。否则默认 10s 会让

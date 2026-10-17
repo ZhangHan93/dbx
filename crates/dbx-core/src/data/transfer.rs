@@ -4276,6 +4276,7 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
         "time" => "TIME".into(),
         "datetime" => match target_db {
             target_db if is_postgres_transfer_dialect(target_db) => "TIMESTAMP".into(),
+            DatabaseType::H2 => "TIMESTAMP".into(),
             DatabaseType::ClickHouse => "DateTime64(6)".into(),
             _ => "DATETIME".into(),
         },
@@ -13691,6 +13692,8 @@ for line in sys.stdin:
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
             idle_timeout_secs: 60,
+            manual_transaction_timeout_secs: 300,
+            idle_disconnect_secs: 0,
             keepalive_interval_secs: 0,
             ssl: false,
             ca_cert_path: String::new(),
@@ -13809,6 +13812,26 @@ for line in sys.stdin:
         assert_eq!(map_column_type("BINARY LARGE OBJECT", &DatabaseType::H2, &DatabaseType::Postgres), "BYTEA");
         assert_eq!(map_column_type("BINARY VARYING(64)", &DatabaseType::H2, &DatabaseType::Mysql), "BLOB");
         assert_eq!(map_column_type("DECIMAL(12,2)", &DatabaseType::Mysql, &DatabaseType::H2), "DECIMAL(12,2)");
+    }
+
+    #[test]
+    fn h2_transfer_maps_datetime_columns_to_timestamp() {
+        for source_type in ["datetime", "DATETIME", "datetime(6)"] {
+            let columns = vec![test_column("create_at", source_type), test_column("last_update", source_type)];
+            let ddl = generate_create_table_ddl(
+                &columns,
+                "agent_hist",
+                "levault",
+                "PUBLIC",
+                &DatabaseType::H2,
+                &DatabaseType::Mysql,
+                None,
+                None,
+            );
+            assert!(ddl.contains("\"create_at\" TIMESTAMP"), "{ddl}");
+            assert!(ddl.contains("\"last_update\" TIMESTAMP"), "{ddl}");
+            assert!(!ddl.contains("DATETIME"), "{ddl}");
+        }
     }
 
     #[test]
@@ -20919,6 +20942,8 @@ SELECT 1 FROM dual"#
             connect_timeout_secs: 5,
             query_timeout_secs: 30,
             idle_timeout_secs: 60,
+            manual_transaction_timeout_secs: 300,
+            idle_disconnect_secs: 0,
             keepalive_interval_secs: 0,
             ssl: false,
             ca_cert_path: String::new(),

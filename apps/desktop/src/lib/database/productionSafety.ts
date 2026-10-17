@@ -62,6 +62,7 @@ const SCHEMA_FIRST_QUALIFIER_TYPES = new Set<DatabaseType>([
   "xugu",
   "oscar",
   "gbase",
+  "gbase8s",
   "saphana",
   "sqlserver",
   "snowflake",
