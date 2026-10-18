@@ -378,6 +378,18 @@ export function isGlobalSearchShortcut(event: ShortcutLikeEvent, shortcuts?: Par
   return matchesShortcut(event, actionShortcut("globalSearch", shortcuts));
 }
 
+export function isOpenConnectionPickerShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("openConnectionPicker", shortcuts));
+}
+
+export function isOpenDatabasePickerShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("openDatabasePicker", shortcuts));
+}
+
+export function isOpenSchemaPickerShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>): boolean {
+  return matchesShortcut(event, actionShortcut("openSchemaPicker", shortcuts));
+}
+
 export function isNavigateTabHistoryBackShortcut(event: ShortcutLikeEvent, shortcuts?: Partial<ShortcutSettings>, platform = globalThis.navigator?.platform || ""): boolean {
   return matchesShortcut(event, actionShortcut("navigateTabHistoryBack", shortcuts, platform), platform);
 }

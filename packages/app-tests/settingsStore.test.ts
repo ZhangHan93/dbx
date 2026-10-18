@@ -1141,9 +1141,11 @@ test("normalizes legacy AI config and fills provider defaults", () => {
     provider: "opencode-cli",
     opencodeCliPath: " /opt/homebrew/bin/opencode ",
     opencodeCliEnv: { HTTPS_PROXY: "http://proxy:9800" },
+    opencodeCliVersion: " v2 ",
   } as any);
   assert.equal(openCode.opencodeCliPath, "/opt/homebrew/bin/opencode");
   assert.deepEqual(openCode.opencodeCliEnv, { HTTPS_PROXY: "http://proxy:9800" });
+  assert.equal(openCode.opencodeCliVersion, "v2");
   assert.equal(openCode.model, "default");
   const grokCli = normalizeAiConfig({
     provider: "grok-cli",

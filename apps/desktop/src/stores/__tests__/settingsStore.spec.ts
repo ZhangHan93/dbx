@@ -66,6 +66,15 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ webLogoPosition: undefined }).webLogoPosition).toBe("left");
   });
 
+  it("defaults queryResultExportFileNameSource to result-label and validates options (#12092)", () => {
+    expect(DEFAULT_EDITOR_SETTINGS.queryResultExportFileNameSource).toBe("result-label");
+    expect(normalizeEditorSettings({}).queryResultExportFileNameSource).toBe("result-label");
+    expect(normalizeEditorSettings({ queryResultExportFileNameSource: "tab-title" }).queryResultExportFileNameSource).toBe("tab-title");
+    expect(normalizeEditorSettings({ queryResultExportFileNameSource: "result-label" }).queryResultExportFileNameSource).toBe("result-label");
+    expect(normalizeEditorSettings({ queryResultExportFileNameSource: "invalid" as any }).queryResultExportFileNameSource).toBe("result-label");
+    expect(normalizeEditorSettings({ queryResultExportFileNameSource: undefined }).queryResultExportFileNameSource).toBe("result-label");
+  });
+
   it("defaults caretBrowsingEnabled to false and normalizes boolean values (#11827)", () => {
     expect(DEFAULT_EDITOR_SETTINGS.caretBrowsingEnabled).toBe(false);
     expect(normalizeEditorSettings({}).caretBrowsingEnabled).toBe(false);
@@ -1058,6 +1067,20 @@ describe("normalizeEditorSettings - continueOnErrorOnBatch", () => {
   });
 });
 
+describe("normalizeEditorSettings - pinResultTabOnClick", () => {
+  it("defaults pinResultTabOnClick to true", () => {
+    expect(normalizeEditorSettings({}).pinResultTabOnClick).toBe(true);
+  });
+
+  it("preserves an explicitly disabled value", () => {
+    expect(normalizeEditorSettings({ pinResultTabOnClick: false }).pinResultTabOnClick).toBe(false);
+  });
+
+  it("treats non-boolean values as enabled", () => {
+    expect(normalizeEditorSettings({ pinResultTabOnClick: "no" } as any).pinResultTabOnClick).toBe(true);
+  });
+});
+
 describe("normalizeEditorSettings - clickTableNavigationTarget", () => {
   it("defaults clickTableNavigationTarget to 'data'", () => {
     expect(normalizeEditorSettings({}).clickTableNavigationTarget).toBe("data");
@@ -1454,6 +1477,7 @@ describe("settingsStore AI API key normalization", () => {
         provider: "opencode-cli",
         opencodeCliPath: "  /opt/homebrew/bin/opencode  ",
         opencodeCliEnv: { HTTPS_PROXY: "http://127.0.0.1:7890", EMPTY: null as unknown as string },
+        opencodeCliVersion: "  v2  ",
       }),
     ).toMatchObject({
       provider: "opencode-cli",
@@ -1461,6 +1485,7 @@ describe("settingsStore AI API key normalization", () => {
       model: "default",
       opencodeCliPath: "/opt/homebrew/bin/opencode",
       opencodeCliEnv: { HTTPS_PROXY: "http://127.0.0.1:7890", EMPTY: "" },
+      opencodeCliVersion: "v2",
     });
   });
 

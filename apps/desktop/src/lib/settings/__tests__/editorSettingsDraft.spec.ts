@@ -62,6 +62,12 @@ describe("EDITOR_SETTINGS_DRAFT_KEYS", () => {
     expect(draft.caretBrowsingEnabled).toBe(true);
   });
 
+  it("includes queryResultExportFileNameSource (#12092)", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("queryResultExportFileNameSource");
+    const draft = editorSettingsDraftFromSettings(makeSettings({ queryResultExportFileNameSource: "tab-title" } as Partial<EditorSettings>));
+    expect(draft.queryResultExportFileNameSource).toBe("tab-title");
+  });
+
   it("includes continueOnErrorOnBatch", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("continueOnErrorOnBatch");
   });

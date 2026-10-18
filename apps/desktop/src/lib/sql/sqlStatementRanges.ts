@@ -267,6 +267,7 @@ const DATABASE_SOFT_STATEMENT_KEYWORDS: Partial<Record<DatabaseType, readonly st
   dameng: ["FLASHBACK", "LOCK", "PURGE"],
   gaussdb: ["DO", "LOCK"],
   "oceanbase-oracle": ["FLASHBACK", "LOCK", "PURGE"],
+  firebird: ["RECREATE"],
   redis: [],
   mongodb: [],
   elasticsearch: [],
@@ -672,13 +673,18 @@ export function splitSqlStatementRanges(sql: string, databaseType?: DatabaseType
         const resolvedOraclePlSqlStatementEnd = oraclePlSqlStatementEnd;
         const isOraclePlSql = typeof resolvedOraclePlSqlStatementEnd === "number";
         const isSapHanaScriptBlock = isSapHanaScriptBlockDatabase(databaseType) && statementStart !== -1 && startsWithSapHanaScriptBlock(sql.slice(statementStart, i));
-        if (isOraclePlSql || isSapHanaScriptBlock) {
+        const isFirebirdRoutineBlock = isFirebirdRoutineBlockDatabase(databaseType) && statementStart !== -1 && startsWithFirebirdRoutineBlock(sql.slice(statementStart, i));
+        if (isOraclePlSql || isSapHanaScriptBlock || isFirebirdRoutineBlock) {
           markContent(i);
           if (isOraclePlSql && i + 1 < resolvedOraclePlSqlStatementEnd) {
             i += 1;
             continue;
           }
           if (isSapHanaScriptBlock && !sapHanaScriptBlockIsComplete(sql.slice(statementStart, i + 1))) {
+            i += 1;
+            continue;
+          }
+          if (isFirebirdRoutineBlock && !firebirdRoutineBlockIsComplete(sql.slice(statementStart, i + 1))) {
             i += 1;
             continue;
           }
@@ -807,6 +813,7 @@ function rangeForCursorInSoftRanges(sql: string, ranges: RawStatement[], pos: nu
 function splitStatementRangeAtSoftStarts(sql: string, statement: RawStatement, databaseType?: DatabaseType, parameterOptions?: SqlParameterOptions): RawStatement[] {
   if (keepsOracleStyleBlockTogether(statement.sql, databaseType, parameterOptions)) return [statement];
   if (isSapHanaScriptBlockStatement(statement.sql, databaseType)) return [statement];
+  if (isFirebirdRoutineBlockStatement(statement.sql, databaseType)) return [statement];
   // Routine bodies contain top-level-looking SET/INSERT/SELECT lines that are not independent statements.
   if (isMysqlRoutineBlockDatabase(databaseType) && startsWithMysqlRoutineBlock(statement.sql, parameterOptions)) return [statement];
   // SQL Server control-flow batches use line-oriented BEGIN/EXEC tokens inside one IF/ELSE statement.
@@ -1921,6 +1928,14 @@ function isSapHanaScriptBlockStatement(sql: string, databaseType?: DatabaseType)
   return isSapHanaScriptBlockDatabase(databaseType) && startsWithSapHanaScriptBlock(sql);
 }
 
+function isFirebirdRoutineBlockDatabase(databaseType?: DatabaseType): boolean {
+  return databaseType === "firebird";
+}
+
+function isFirebirdRoutineBlockStatement(sql: string, databaseType?: DatabaseType): boolean {
+  return isFirebirdRoutineBlockDatabase(databaseType) && startsWithFirebirdRoutineBlock(sql);
+}
+
 function isMysqlRoutineBlockDatabase(databaseType?: DatabaseType): boolean {
   return !!databaseType && MYSQL_ROUTINE_BLOCK_DATABASES.has(databaseType);
 }
@@ -2316,6 +2331,66 @@ function sapHanaScriptBlockIsComplete(sql: string): boolean {
     if (token.value === "END") {
       const next = nextAdjacentWord(sql, tokens, index);
       if (SAP_HANA_SCRIPT_BLOCK_TERMINATORS.has(next ?? "")) continue;
+      if (caseDepth > 0) {
+        caseDepth -= 1;
+      } else if (blockDepth > 0) {
+        blockDepth -= 1;
+      }
+    }
+  }
+
+  return sawBegin && blockDepth === 0 && caseDepth === 0 && tokens[tokens.length - 1]?.kind === "semicolon";
+}
+
+const FIREBIRD_ROUTINE_OBJECT_TYPES = new Set(["PROCEDURE", "FUNCTION", "TRIGGER"]);
+
+function startsWithFirebirdRoutineBlock(sql: string): boolean {
+  const words = oraclePlSqlWords(sql);
+  if (words.length === 0) return false;
+  const first = words[0];
+  if (first === "EXECUTE" && words[1] === "BLOCK") return true;
+  if (first !== "CREATE" && first !== "RECREATE" && first !== "ALTER") return false;
+  let index = 1;
+  if (words[index] === "OR" && (words[index + 1] === "ALTER" || words[index + 1] === "REPLACE")) {
+    index += 2;
+  }
+  const objectType = words[index];
+  if (objectType === "PACKAGE") {
+    if (words[index + 1] !== "BODY") return false;
+  } else if (!objectType || !FIREBIRD_ROUTINE_OBJECT_TYPES.has(objectType)) {
+    return false;
+  }
+  if (first === "ALTER") {
+    // Firebird accepts `ALTER TRIGGER name ACTIVE/INACTIVE;`. Only treat ALTER
+    // as a routine block when it defines a body via AS or BEGIN.
+    return words.includes("AS") || words.includes("BEGIN");
+  }
+  return true;
+}
+
+function firebirdRoutineBlockIsComplete(sql: string): boolean {
+  if (!startsWithFirebirdRoutineBlock(sql)) return false;
+
+  const tokens = oraclePlSqlTokens(sql);
+  let blockDepth = 0;
+  let caseDepth = 0;
+  let sawBegin = false;
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (token.kind !== "word") continue;
+
+    if (token.value === "BEGIN") {
+      if (previousAdjacentWord(sql, tokens, index) === "END") continue;
+      blockDepth += 1;
+      sawBegin = true;
+      continue;
+    }
+    if (token.value === "CASE") {
+      if (previousAdjacentWord(sql, tokens, index) !== "END") caseDepth += 1;
+      continue;
+    }
+    if (token.value === "END") {
       if (caseDepth > 0) {
         caseDepth -= 1;
       } else if (blockDepth > 0) {

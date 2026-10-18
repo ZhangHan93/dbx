@@ -216,6 +216,21 @@ describe("shortcutRegistry editor actions", () => {
     expect(findShortcutConflict("find", DEFAULT_SHORTCUT_SETTINGS.find, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
   });
 
+  it("registers conflict-free global shortcuts for the toolbar connection, database, and schema pickers", () => {
+    const pickerDefaults: Array<[ShortcutActionId, string]> = [
+      ["openConnectionPicker", "Mod+Alt+C"],
+      ["openDatabasePicker", "Mod+Alt+D"],
+      ["openSchemaPicker", "Mod+Alt+S"],
+    ];
+
+    for (const [id, defaultShortcut] of pickerDefaults) {
+      const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === id);
+      expect(definition).toMatchObject({ labelKey: `settings.shortcut${id[0]!.toUpperCase()}${id.slice(1)}`, scope: "global", defaultShortcut });
+      expect(DEFAULT_SHORTCUT_SETTINGS[id]).toBe(defaultShortcut);
+      expect(findShortcutConflict(id, defaultShortcut, DEFAULT_SHORTCUT_SETTINGS)).toBeNull();
+    }
+  });
+
   it("registers a conflict-free global shortcut for Zen mode", () => {
     const definition = SHORTCUT_DEFINITIONS.find((item) => item.id === "toggleZenMode");
 

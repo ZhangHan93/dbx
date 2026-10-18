@@ -565,6 +565,11 @@ describe("settingsTransfer", () => {
     expect(collectTransferCategories(["csvNullMode", "csvQuoteMode"])).toEqual(["data"]);
   });
 
+  it("maps queryResultExportFileNameSource into the data category (#12092)", () => {
+    expect(transferCategoryForKey("queryResultExportFileNameSource")).toBe("data");
+    expect(collectTransferCategories(["queryResultExportFileNameSource", "pageSize"])).toEqual(["data"]);
+  });
+
   it("round-trips zebra row background in data category", () => {
     expect(transferCategoryForKey("dataGridZebraRowBg")).toBe("data");
 

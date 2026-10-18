@@ -720,7 +720,11 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
         {
             db::dolt::list_databases(p).await
         }
-        PoolKind::Mysql(p, _) if db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata) => {
+        PoolKind::Mysql(p, _)
+            if db_config
+                .as_ref()
+                .is_some_and(|config| db::mysql_compatible::uses_show_metadata(config) || is_mycat_config(config)) =>
+        {
             db::mysql::list_databases_show_with_timeout(p, mysql_database_list_timeout)
                 .await
                 .map(|databases| filter_mysql_system_databases_for_config(databases, db_config.as_ref()))
@@ -744,10 +748,9 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
 
 async fn list_database_metadata_once(state: &AppState, connection_id: &str) -> Result<Vec<db::DatabaseInfo>, String> {
     let config = connection_config(state, connection_id).await;
-    if config
-        .as_ref()
-        .is_some_and(|config| db::dolt::is_config(config) || db::mysql_compatible::uses_show_metadata(config))
-    {
+    if config.as_ref().is_some_and(|config| {
+        db::dolt::is_config(config) || db::mysql_compatible::uses_show_metadata(config) || is_mycat_config(config)
+    }) {
         return list_databases_once(state, connection_id).await;
     }
     let pool_handle = state.pool_handle(connection_id).await;
@@ -1228,6 +1231,108 @@ fn mysql_auto_increment_from_query_result(result: db::QueryResult) -> Result<Opt
     Ok(Some(text))
 }
 
+async fn get_table_comment_core_with_pool_key(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+    pool_key: &str,
+) -> Result<Option<String>, String> {
+    let db_config = connection_config(state, connection_id).await;
+
+    {
+        let pool_handle = state.pool_handle(pool_key).await;
+        try_sqlserver!(pool_handle, get_table_comment, schema, table);
+        if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
+            if is_oracle_external_driver_config(config.as_ref()) {
+                return external_driver_oracle_table_comment(session.clone(), config.as_ref(), database, schema, table)
+                    .await;
+            }
+        }
+        if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
+            if db_config
+                .as_ref()
+                .is_some_and(|config| matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+            {
+                let sql = oracle_table_comment_sql(schema, table);
+                let timeout = agent_metadata_timeout(db_config.as_ref());
+                let mut client = client.lock().await;
+                let result = client
+                    .execute_query_with_timeout::<db::QueryResult>(
+                        agent_execute_query_params(
+                            &sql,
+                            Some(database),
+                            Some(schema),
+                            QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                        ),
+                        timeout,
+                    )
+                    .await?;
+                return single_table_comment_from_query_result(result);
+            }
+            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::SqlServer) {
+                // JDBC `REMARKS` is always NULL on SQL Server, so the legacy Agent's
+                // table list cannot supply the `MS_Description` written by the editor.
+                let sql = db::sqlserver::sqlserver_table_comment_sql(schema, table);
+                let timeout = agent_metadata_timeout(db_config.as_ref());
+                let mut client = client.lock().await;
+                let result = client
+                    .execute_query_with_timeout::<db::QueryResult>(
+                        agent_execute_query_params(
+                            &sql,
+                            Some(database),
+                            Some(schema),
+                            QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
+                        ),
+                        timeout,
+                    )
+                    .await?;
+                return single_table_comment_from_query_result(result);
+            }
+            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
+                let timeout = agent_metadata_timeout(db_config.as_ref());
+                let mut client = client.lock().await;
+                return client.get_table_comment::<Option<String>>(database, schema, table, timeout).await;
+            }
+            if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Tdengine) {
+                let metadata_database = if schema.trim().is_empty() { database } else { schema };
+                let sql = tdengine_table_comment_sql(metadata_database, table);
+                let timeout = agent_metadata_timeout(db_config.as_ref());
+                let mut client = client.lock().await;
+                let result = client
+                    .execute_query_with_timeout::<db::QueryResult>(
+                        agent_execute_query_params(
+                            &sql,
+                            Some(database),
+                            (!schema.trim().is_empty()).then_some(schema),
+                            QueryExecutionOptions { max_rows: Some(2), ..Default::default() },
+                        ),
+                        timeout,
+                    )
+                    .await?;
+                return single_table_comment_from_query_result(result);
+            }
+        }
+    }
+
+    let pool = clone_metadata_pool(state, pool_key).await.ok_or("Pool not found")?;
+
+    match &pool {
+        PoolKind::Mysql(p, mode)
+            if *mode != MysqlMode::OceanBaseOracle
+                && !db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata)
+                && !db_config.as_ref().is_some_and(db::manticoresearch::is_config) =>
+        {
+            db::mysql::get_table_comment(p, database, table).await
+        }
+        PoolKind::Postgres(p) if !db_config.as_ref().is_some_and(is_questdb_config) => {
+            db::postgres::get_table_comment(p, schema, table).await
+        }
+        _ => Err("Table comment lookup is not supported for this connection".to_string()),
+    }
+}
+
 async fn get_table_comment_core_for_session(
     state: &AppState,
     connection_id: &str,
@@ -1239,103 +1344,7 @@ async fn get_table_comment_core_for_session(
     retry_metadata_connection_for_session(state, connection_id, Some(database), client_session_id, || async {
         let pool_key =
             state.get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id).await?;
-        let db_config = connection_config(state, connection_id).await;
-
-        {
-            let pool_handle = state.pool_handle(&pool_key).await;
-            try_sqlserver!(pool_handle, get_table_comment, schema, table);
-            if let Some(PoolKind::ExternalDriver { config, session, .. }) = pool_handle.as_ref() {
-                if is_oracle_external_driver_config(config.as_ref()) {
-                    return external_driver_oracle_table_comment(
-                        session.clone(),
-                        config.as_ref(),
-                        database,
-                        schema,
-                        table,
-                    )
-                    .await;
-                }
-            }
-            if let Some(client) = extract_pool!(pool_handle.as_ref(), Agent) {
-                if db_config.as_ref().is_some_and(|config| {
-                    matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
-                }) {
-                    let sql = oracle_table_comment_sql(schema, table);
-                    let timeout = agent_metadata_timeout(db_config.as_ref());
-                    let mut client = client.lock().await;
-                    let result = client
-                        .execute_query_with_timeout::<db::QueryResult>(
-                            agent_execute_query_params(
-                                &sql,
-                                Some(database),
-                                Some(schema),
-                                QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
-                            ),
-                            timeout,
-                        )
-                        .await?;
-                    return single_table_comment_from_query_result(result);
-                }
-                if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::SqlServer) {
-                    // JDBC `REMARKS` is always NULL on SQL Server, so the legacy Agent's
-                    // table list cannot supply the `MS_Description` written by the editor.
-                    let sql = db::sqlserver::sqlserver_table_comment_sql(schema, table);
-                    let timeout = agent_metadata_timeout(db_config.as_ref());
-                    let mut client = client.lock().await;
-                    let result = client
-                        .execute_query_with_timeout::<db::QueryResult>(
-                            agent_execute_query_params(
-                                &sql,
-                                Some(database),
-                                Some(schema),
-                                QueryExecutionOptions { max_rows: Some(1), ..Default::default() },
-                            ),
-                            timeout,
-                        )
-                        .await?;
-                    return single_table_comment_from_query_result(result);
-                }
-                if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Kingbase) {
-                    let timeout = agent_metadata_timeout(db_config.as_ref());
-                    let mut client = client.lock().await;
-                    return client.get_table_comment::<Option<String>>(database, schema, table, timeout).await;
-                }
-                if db_config.as_ref().is_some_and(|config| config.db_type == DatabaseType::Tdengine) {
-                    let metadata_database = if schema.trim().is_empty() { database } else { schema };
-                    let sql = tdengine_table_comment_sql(metadata_database, table);
-                    let timeout = agent_metadata_timeout(db_config.as_ref());
-                    let mut client = client.lock().await;
-                    let result = client
-                        .execute_query_with_timeout::<db::QueryResult>(
-                            agent_execute_query_params(
-                                &sql,
-                                Some(database),
-                                (!schema.trim().is_empty()).then_some(schema),
-                                QueryExecutionOptions { max_rows: Some(2), ..Default::default() },
-                            ),
-                            timeout,
-                        )
-                        .await?;
-                    return single_table_comment_from_query_result(result);
-                }
-            }
-        }
-
-        let pool = clone_metadata_pool(state, &pool_key).await.ok_or("Pool not found")?;
-
-        match &pool {
-            PoolKind::Mysql(p, mode)
-                if *mode != MysqlMode::OceanBaseOracle
-                    && !db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata)
-                    && !db_config.as_ref().is_some_and(db::manticoresearch::is_config) =>
-            {
-                db::mysql::get_table_comment(p, database, table).await
-            }
-            PoolKind::Postgres(p) if !db_config.as_ref().is_some_and(is_questdb_config) => {
-                db::postgres::get_table_comment(p, schema, table).await
-            }
-            _ => Err("Table comment lookup is not supported for this connection".to_string()),
-        }
+        get_table_comment_core_with_pool_key(state, connection_id, database, schema, table, &pool_key).await
     })
     .await
 }
@@ -3148,8 +3157,19 @@ fn is_shardingsphere_proxy_version(version: &str) -> bool {
     version.as_bytes().windows(MARKER.len()).any(|window| window.eq_ignore_ascii_case(MARKER))
 }
 
+pub(in crate::schema) fn is_mycat_version(version: &str) -> bool {
+    const MARKER: &[u8] = b"mycat";
+    version.as_bytes().windows(MARKER.len()).any(|window| window.eq_ignore_ascii_case(MARKER))
+}
+
+pub(in crate::schema) fn is_mycat_config(config: &ConnectionConfig) -> bool {
+    config.database_info.as_ref().and_then(|info| info.product_version.as_deref()).is_some_and(is_mycat_version)
+        || config.database_info.as_ref().and_then(|info| info.server_comment.as_deref()).is_some_and(is_mycat_version)
+}
+
 fn mysql_table_list_source_for_config(config: Option<&ConnectionConfig>) -> MysqlTableListSource {
     if config.is_some_and(db::tdsql_mysql::is_config)
+        || config.is_some_and(is_mycat_config)
         || config
             .and_then(|config| config.database_info.as_ref())
             .and_then(|info| info.product_version.as_deref())
@@ -5150,6 +5170,14 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn mycat_marker_is_ascii_case_insensitive_and_exact() {
+        assert!(super::is_mycat_version("5.6.29-mycat-1.6-RELEASE-20161028204710"));
+        assert!(super::is_mycat_version("5.6.29-mycat-1.6.7.6"));
+        assert!(super::is_mycat_version("5.7.22-MYCAT-1.6-RELEASE"));
+        assert!(!super::is_mycat_version("8.0.36-MySQL Community Server"));
+    }
+
+    #[test]
     fn mysql_table_list_source_uses_only_saved_shardingsphere_version() {
         let mut config = test_connection_config(DatabaseType::Mysql);
         assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::InformationSchema);
@@ -5163,6 +5191,27 @@ for line in sys.stdin:
         config.database_info.as_mut().unwrap().product_version = Some("8.0.36-MySQL Community Server".to_string());
         assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::InformationSchema);
         assert_eq!(mysql_table_list_source_for_config(None), MysqlTableListSource::InformationSchema);
+    }
+
+    #[test]
+    fn mysql_table_list_source_uses_mycat_version() {
+        let mut config = test_connection_config(DatabaseType::Mysql);
+        assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::InformationSchema);
+
+        config.database_info = Some(DatabaseConnectionInfo {
+            product_version: Some("5.6.29-mycat-1.6-RELEASE-20161028204710".to_string()),
+            ..DatabaseConnectionInfo::default()
+        });
+        assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::ShowFullTables);
+        assert!(super::is_mycat_config(&config));
+
+        config.database_info = Some(DatabaseConnectionInfo {
+            product_version: None,
+            server_comment: Some("MyCat Server 1.6".to_string()),
+            ..DatabaseConnectionInfo::default()
+        });
+        assert_eq!(mysql_table_list_source_for_config(Some(&config)), MysqlTableListSource::ShowFullTables);
+        assert!(super::is_mycat_config(&config));
     }
 
     #[test]
@@ -9718,7 +9767,21 @@ async fn get_table_ddl_core_with_options(
         // Oracle-family comments live in dictionary tables, not inside CREATE VIEW.
         // Append COMMENT ON so table-properties DDL / hover match the structure editor.
         if append_oracle_comments {
-            return Ok(enrich_ddl_with_oracle_style_comments(state, connection_id, database, schema, table, &ddl).await);
+            let pool_key = state
+                .get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id)
+                .await
+                .ok();
+            return Ok(enrich_ddl_with_oracle_style_comments(
+                state,
+                connection_id,
+                database,
+                schema,
+                table,
+                &ddl,
+                client_session_id,
+                pool_key.as_deref(),
+            )
+            .await);
         }
         return Ok(ddl);
     }
@@ -9753,10 +9816,29 @@ async fn get_table_ddl_core_with_options(
         }
     }
 
-    retry_metadata_connection_for_session(state, connection_id, Some(database), client_session_id, || {
+    let ddl = retry_metadata_connection_for_session(state, connection_id, Some(database), client_session_id, || {
         get_table_ddl_once(state, connection_id, database, schema, table, options, client_session_id)
     })
-    .await
+    .await?;
+
+    let db_config = connection_config(state, connection_id).await;
+    if should_append_oracle_style_comment_ddl(db_config.as_ref()) {
+        let pool_key =
+            state.get_or_create_metadata_pool_for_session(connection_id, Some(database), client_session_id).await.ok();
+        Ok(enrich_ddl_with_oracle_style_comments(
+            state,
+            connection_id,
+            database,
+            schema,
+            table,
+            &ddl,
+            client_session_id,
+            pool_key.as_deref(),
+        )
+        .await)
+    } else {
+        Ok(ddl)
+    }
 }
 
 /// Whether the DDL of this object kind is its own definition, rather than the
@@ -11714,33 +11796,84 @@ async fn enrich_ddl_with_oracle_style_comments(
     schema: &str,
     table: &str,
     ddl: &str,
+    client_session_id: Option<&str>,
+    existing_pool_key: Option<&str>,
 ) -> String {
-    let columns = match get_columns_core(state, connection_id, database, schema, table).await {
-        Ok(columns) => columns,
-        Err(error) => {
-            log::debug!(
-                "[schema][oracle:display-ddl:columns-for-comments-failed] connection_id={} schema={} table={} error={}",
-                connection_id,
-                schema,
-                table,
-                error
-            );
-            Vec::new()
+    if ddl.trim().is_empty() {
+        return String::new();
+    }
+    let existing_ddl_upper = ddl.to_ascii_uppercase();
+    let needs_column_comments = !existing_ddl_upper.contains("COMMENT ON COLUMN");
+    let needs_table_comment = !existing_ddl_upper.contains("COMMENT ON TABLE");
+    if !needs_column_comments && !needs_table_comment {
+        return crate::object_source_sql::ensure_oracle_ddl_terminated(ddl);
+    }
+
+    let columns = if !needs_column_comments {
+        Vec::new()
+    } else if let Some(pool_key) = existing_pool_key {
+        match get_columns_core_for_existing_pool(state, connection_id, database, schema, table, pool_key).await {
+            Ok(columns) => columns,
+            Err(error) => {
+                log::debug!(
+                    "[schema][oracle:display-ddl:columns-for-comments-failed] connection_id={} schema={} table={} error={}",
+                    connection_id,
+                    schema,
+                    table,
+                    error
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        match get_columns_core_for_session(state, connection_id, database, schema, table, client_session_id).await {
+            Ok(columns) => columns,
+            Err(error) => {
+                log::debug!(
+                    "[schema][oracle:display-ddl:columns-for-comments-failed] connection_id={} schema={} table={} error={}",
+                    connection_id,
+                    schema,
+                    table,
+                    error
+                );
+                Vec::new()
+            }
         }
     };
-    let table_comment = match get_table_comment_core(state, connection_id, database, schema, table).await {
-        Ok(comment) => comment,
-        Err(error) => {
-            log::debug!(
-                "[schema][oracle:display-ddl:table-comment-failed] connection_id={} schema={} table={} error={}",
-                connection_id,
-                schema,
-                table,
-                error
-            );
-            None
+
+    let table_comment = if !needs_table_comment {
+        None
+    } else if let Some(pool_key) = existing_pool_key {
+        match get_table_comment_core_with_pool_key(state, connection_id, database, schema, table, pool_key).await {
+            Ok(comment) => comment,
+            Err(error) => {
+                log::debug!(
+                    "[schema][oracle:display-ddl:table-comment-failed] connection_id={} schema={} table={} error={}",
+                    connection_id,
+                    schema,
+                    table,
+                    error
+                );
+                None
+            }
+        }
+    } else {
+        match get_table_comment_core_for_session(state, connection_id, database, schema, table, client_session_id).await
+        {
+            Ok(comment) => comment,
+            Err(error) => {
+                log::debug!(
+                    "[schema][oracle:display-ddl:table-comment-failed] connection_id={} schema={} table={} error={}",
+                    connection_id,
+                    schema,
+                    table,
+                    error
+                );
+                None
+            }
         }
     };
+
     append_oracle_comments_to_ddl(ddl, schema, table, table_comment.as_deref(), &columns)
 }
 
@@ -12775,6 +12908,32 @@ mod object_source_tests {
         assert_eq!(ddl.matches("COMMENT ON COLUMN").count(), 1);
         assert!(!ddl.contains("New table comment"));
         assert!(!ddl.contains("New column comment"));
+    }
+
+    #[test]
+    fn appends_oracle_comments_to_table_ddl_when_missing() {
+        let column = db::ColumnInfo {
+            name: "USER_NAME".to_string(),
+            data_type: "VARCHAR2(50)".to_string(),
+            is_nullable: true,
+            column_default: None,
+            is_primary_key: false,
+            extra: None,
+            comment: Some("User name comment".to_string()),
+            ..Default::default()
+        };
+
+        let ddl = append_oracle_comments_to_ddl(
+            "CREATE TABLE \"SYSDBA\".\"USERS\" (\n  \"USER_NAME\" VARCHAR(50)\n);",
+            "SYSDBA",
+            "USERS",
+            Some("Users table"),
+            &[column],
+        );
+
+        assert!(ddl.contains("CREATE TABLE \"SYSDBA\".\"USERS\""));
+        assert!(ddl.contains("COMMENT ON TABLE \"SYSDBA\".\"USERS\" IS 'Users table';"));
+        assert!(ddl.contains("COMMENT ON COLUMN \"SYSDBA\".\"USERS\".\"USER_NAME\" IS 'User name comment';"));
     }
 }
 

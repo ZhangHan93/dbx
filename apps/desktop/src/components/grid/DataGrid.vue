@@ -119,6 +119,7 @@ import { uuid } from "@/lib/common/utils";
 import { generateCellValues, type CellValueGenerationKind, type CellValueGenerationOptions } from "@/lib/dataGrid/cellValueGeneration";
 import { MONGO_DOCUMENT_GRID_NULL, mongoDocumentGridClipboardText, mongoDocumentGridDisplayText, mongoDocumentGridEditorText, mongoDocumentGridExternalValue, mongoDocumentGridInputValue, mongoDocumentGridNumericValue, mongoDocumentRelaxedExtendedJson } from "@/lib/mongo/mongoDocumentValues";
 import { compactHeaderColumnType, formatMetadataColumnTypeLabel, isNumericColumnType, resolveDataGridTypeVisualKind, resolveHeaderColumnType, resolveResultColumnType, shortHeaderTypeName } from "@/lib/dataGrid/dataGridColumnType";
+import { dedupeResultColumnNames } from "@/lib/sql/resultColumnNames";
 import { dataGridCellTextClass, dataGridTypeVisualClass } from "@/lib/dataGrid/dataGridCellTextVisual";
 import { DATA_GRID_TYPE_COLOR_KEYS, resolveActiveDataGridTypeColors } from "@/lib/dataGrid/dataGridTypeColorScheme";
 import {
@@ -2419,6 +2420,10 @@ const filteredGoToColumns = computed(() => {
   return filterDataGridColumnLookupItems(goToColumnItems.value, goToColumnSearch.value, goToColumnMatchMode.value);
 });
 const visibleColumns = computed(() => visibleColumnIndexes.value.map((index) => props.result.columns[index]));
+// Header labels only: SQL generation, sorting, transfer and export keep the raw
+// result columns so duplicate-label handling (#12214) and INSERT targets stay
+// correct. Duplicate labels are disambiguated for display only (#12452).
+const displayColumnNames = computed(() => dedupeResultColumnNames(props.result.columns));
 const visibleColumnIndexIndicators = computed(() =>
   visibleColumns.value.map((column) => {
     if (!showIndexIndicatorsInHeader.value) return false;
@@ -3616,7 +3621,7 @@ watch(
         finishOrContinueLoadAllRun(requestedOffset, requestedLimit);
         return;
       }
-      if (props.result.rows.length >= infiniteScrollMaxRows.value || appendedRows < (requestedLimit ?? pageSize.value)) {
+      if (props.result.page_has_more === false || props.result.rows.length >= infiniteScrollMaxRows.value || appendedRows < (requestedLimit ?? pageSize.value)) {
         infiniteScrollAllLoaded = true;
       }
       if (shouldSelectLastRow) selectAndRevealLastLoadedRow();
@@ -3710,11 +3715,14 @@ const hasCompleteLocalResult = computed(() =>
     totalRowCount: serverKnownTotalRowCount.value,
     truncated: props.result.truncated,
     hasMore: props.result.has_more,
+    pageHasMore: props.result.page_has_more,
   }),
 );
 const canGoNextPage = computed(() => {
   return canGoNextDataGridPage({
     hasMore: props.result.has_more,
+    pageHasMore: props.result.page_has_more,
+    maxRows: paginationMaxRows.value,
     rowCount: props.result.rows.length,
     pageSize: pageSize.value,
     pageOffset: props.pageOffset,
@@ -3725,13 +3733,16 @@ const canGoNextPage = computed(() => {
 });
 const maximumPage = computed(() => {
   if (allRowsLoaded.value) return 1;
+  if (props.result.page_has_more === false) return currentPage.value;
   const total = hasKnownPaginationTotalRowCount.value ? paginationTotalRowCount.value : undefined;
+  if (props.result.page_has_more === true && canGoNextPage.value && typeof total === "number" && total <= (props.pageOffset ?? 0) + props.result.rows.length) return undefined;
   if (typeof total === "number" && Number.isFinite(total) && total >= 0) return Math.max(1, Math.ceil(total / pageSize.value));
   return canGoNextPage.value ? undefined : currentPage.value;
 });
 const canFetchNextInfiniteScrollSegment = computed(() =>
   canFetchNextDataGridSegment({
     hasMore: props.result.has_more,
+    pageHasMore: props.result.page_has_more,
     loadedRowCount: props.result.rows.length,
     pageSize: pageSize.value,
     totalRowCount: hasKnownPaginationTotalRowCount.value ? paginationTotalRowCount.value : undefined,
@@ -4017,17 +4028,19 @@ function selectAndRevealLastLoadedRow() {
 }
 
 // SQL-page counts can come from another session. Explicit load-all must
-// observe a short tail on the original execution path, even at a cached total.
+// observe exhaustion on the original execution path, even at a cached total.
 const loadsSqlPages = computed(() => isResultsContext.value && !!props.pageSql);
-const sqlPageExhausted = computed(() =>
-  hasShortDataGridSqlPage({
+const sqlPageExhausted = computed(() => {
+  if (typeof props.result.page_has_more === "boolean") return !props.result.page_has_more;
+  if (props.result.truncated === true) return false;
+  return hasShortDataGridSqlPage({
     rowCount: props.result.rows.length,
     pageOffset: props.pageOffset,
     pageLimit: props.pageLimit,
     executedPageOffset: props.executedPageOffset,
     executedPageLimit: props.executedPageLimit,
-  }),
-);
+  });
+});
 function nextLoadAllSegment() {
   if (loadsSqlPages.value) {
     if (sqlPageExhausted.value) return null;
@@ -5409,7 +5422,15 @@ const sortedRows = computed(() => {
     const rows = props.result.rows;
     indices = indices.filter((sourceIndex) => {
       const data = rows[sourceIndex];
-      return data.some((cell, columnIndex) => cell !== null && rowLowerTextCache.get(data, columnIndex).includes(q));
+      return data.some((cell, columnIndex) => {
+        if (cell === null) return false;
+        const text = rowLowerTextCache.get(data, columnIndex);
+        if (text.includes(q)) return true;
+        // The display cache is truncated at the cell display cap, so a match
+        // past the cut would wrongly hide a row that a WHERE clause finds;
+        // re-check the full raw string value (#11956).
+        return text.endsWith("...") && typeof cell === "string" && cell.toLowerCase().includes(q);
+      });
     });
   }
   return indices;
@@ -9056,6 +9077,7 @@ function copyExtractorLabel(extractor: DataGridCopyExtractorId): string {
     "one-row": t("grid.copyExtractorOneRow"),
     "sql-in-list": t("grid.copyExtractorSqlInList"),
     "sql-inserts": t("grid.copyExtractorSqlInserts"),
+    "sql-deletes-inserts": t("grid.copyExtractorSqlDeletesInserts"),
     "sql-updates": t("grid.copyExtractorSqlUpdates"),
     "sql-select": t("grid.copyExtractorSqlSelect"),
     "where-clause": t("grid.copyExtractorWhereClause"),
@@ -9088,7 +9110,7 @@ const copyPreferenceMenuItems = computed(() =>
     return {
       value: preference,
       label: copyPreferenceLabel(preference),
-      disabled: extractor ? extractorUnavailableForDatabase(extractor, props.databaseType) || (extractor === "sql-updates" && !props.tableMeta?.primaryKeys.length) : false,
+      disabled: extractor ? extractorUnavailableForDatabase(extractor, props.databaseType) || ((extractor === "sql-updates" || extractor === "sql-deletes-inserts") && !props.tableMeta?.primaryKeys.length) : false,
       separatorBefore: extractor ? DATA_GRID_COPY_EXTRACTOR_DESCRIPTORS[extractor].separatorBefore : false,
     };
   }),
@@ -11817,7 +11839,7 @@ watch(
       if (infiniteScrollEnabled.value || loadAllRowsLoopActive) {
         currentPage.value = appendCompletion.loadedPage;
         lastInfiniteScrollPage = Math.max(0, appendCompletion.loadedPage - 1);
-        infiniteScrollAllLoaded = appendCompletion.allLoaded;
+        infiniteScrollAllLoaded = appendCompletion.allLoaded || result.page_has_more === false;
         infiniteScrollRequestedOffset = undefined;
         infiniteScrollRequestedLimit = undefined;
         infiniteScrollLoading.value = false;
@@ -11850,7 +11872,7 @@ watch(
     loadAllRowsActive.value = false;
     loadAllRowsLoopActive = false;
     if (reloadedFromFirstRow) {
-      if (props.result.has_more === true && !props.result.truncated) {
+      if (props.result.page_has_more === true || (props.result.has_more === true && !props.result.truncated)) {
         loadAllRowsActive.value = true;
         loadAllRowsLoopActive = true;
         nextTick(() => {
@@ -13067,6 +13089,8 @@ async function navigateToForeignKeyCell(rowIndex: number, actualColIdx: number) 
         currentSchema: props.tableMeta?.schema || props.schema,
         fk: association.foreignKey,
         whereInput: condition,
+        connection: connectionStore.getConfig(props.connectionId),
+        databaseType: resolvedDatabaseType.value,
       }),
     );
   } catch (e: any) {
@@ -14804,7 +14828,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                   <DataGridColumnHeader
                     v-for="col in renderedGridColumns"
                     :key="`${col.name}-${col.actualColIdx}`"
-                    :name="col.name"
+                    :name="displayColumnNames[col.actualColIdx] ?? col.name"
                     :actual-column-index="col.actualColIdx"
                     :visible-column-index="col.visibleColIdx"
                     :class="{ 'crosshair-column': !!crosshairTarget?.columnCrosshair && crosshairTarget.visibleColIdx === col.visibleColIdx }"
@@ -16154,7 +16178,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
         </template>
       </div>
 
-      <div v-if="sqlOneLiner" class="min-w-0 max-w-full justify-self-center">
+      <div v-if="settingsStore.editorSettings.showDataGridStatusSql && sqlOneLiner" class="min-w-0 max-w-full justify-self-center">
         <CustomContextMenu :items="statusSqlContextMenuItems" v-slot="{ onContextMenu }">
           <Tooltip>
             <TooltipTrigger as-child>

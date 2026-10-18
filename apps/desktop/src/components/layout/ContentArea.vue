@@ -16,6 +16,7 @@ import { batchSqlRecoveryState, type BatchSqlRecoveryAction } from "@/lib/query/
 import type { CSSProperties } from "vue";
 import { useI18n } from "vue-i18n";
 import { provideTabUiState } from "@/lib/tabs/tabUiState";
+import { shouldPinResultRunOnClick } from "@/lib/tabs/resultRunPin";
 import {
   Check,
   CheckSquare2,
@@ -79,6 +80,7 @@ import ResultSetNavigator from "@/components/layout/ResultSetNavigator.vue";
 import QueryResultViewSwitcher from "@/components/layout/QueryResultViewSwitcher.vue";
 import ProductionWatermark from "@/components/common/ProductionWatermark.vue";
 import DataGridFreezeFirstColumnControl from "@/components/grid/DataGridFreezeFirstColumnControl.vue";
+import DataGridStatusSqlControl from "@/components/grid/DataGridStatusSqlControl.vue";
 import DataGridCopyFormatControl from "@/components/grid/DataGridCopyFormatControl.vue";
 import DataGridFontFamilyControl from "@/components/grid/DataGridFontFamilyControl.vue";
 import DataGridColumnWidthModeControl from "@/components/grid/DataGridColumnWidthModeControl.vue";
@@ -469,9 +471,8 @@ function increaseTableFontSize() {
   setTableFontSize(tableFontSize.value + 1);
 }
 
-/** Export file base name for the query result grid: the result's label (nearby
- *  comment or `schema.table`) names exports, matching the result tab (#9894). */
-const activeQueryResultExportBaseName = computed(() => queryResultExportBaseName(props.activeTab.result?.sourceLabel, props.activeTab.title));
+/** Export file base name for the query result grid: prefers result label or tab title based on settings (#9894, #12092). */
+const activeQueryResultExportBaseName = computed(() => queryResultExportBaseName(props.activeTab.result?.sourceLabel, props.activeTab.title, settingsStore.editorSettings.queryResultExportFileNameSource));
 
 const activeTabDimension = computed(() => {
   const tab = props.activeTab;
@@ -1673,7 +1674,7 @@ function dispatchBeforeResultTabSwitch() {
 async function selectResultRunFromTab(runId: string) {
   if (!(await selectResultRun(runId))) return;
   const run = resultRuns.value.find((item) => item.id === runId);
-  if (run && !run.pinned) toggleResultRunPinned(runId);
+  if (shouldPinResultRunOnClick(run, settingsStore.editorSettings.pinResultTabOnClick)) toggleResultRunPinned(runId);
 }
 
 async function focusResultRunByIndex(index: number) {
@@ -2507,6 +2508,7 @@ defineExpose({
                     </div>
                     <DataGridEmptyColumnsControl :count="dataGridRef?.allEmptyColumnCount" :column-count="dataGridRef?.displayableColumnCount" />
                     <DataGridFreezeFirstColumnControl />
+                    <DataGridStatusSqlControl />
                     <DataGridCopyFormatControl
                       :current-label="dataGridRef?.defaultCopyPreferenceLabel ?? '-'"
                       :current-value="dataGridRef?.defaultCopyPreference ?? ''"
@@ -3237,6 +3239,7 @@ defineExpose({
               </div>
               <DataGridEmptyColumnsControl :count="dataGridRef?.allEmptyColumnCount" :column-count="dataGridRef?.displayableColumnCount" />
               <DataGridFreezeFirstColumnControl />
+              <DataGridStatusSqlControl />
               <DataGridCopyFormatControl
                 :current-label="dataGridRef?.defaultCopyPreferenceLabel ?? '-'"
                 :current-value="dataGridRef?.defaultCopyPreference ?? ''"

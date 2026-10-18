@@ -205,6 +205,7 @@ struct SqlDialectProfile {
     supports_dollar_quoted_strings: bool,
     supports_postgres_dollar_quoted_routines: bool,
     supports_hana_script_blocks: bool,
+    supports_firebird_routine_blocks: bool,
     supports_go_batch_separator: bool,
     keeps_sqlserver_module_batch_at_cursor: bool,
     preserves_tdsql_leading_directives: bool,
@@ -229,6 +230,7 @@ impl Default for SqlDialectProfile {
             supports_dollar_quoted_strings: true,
             supports_postgres_dollar_quoted_routines: false,
             supports_hana_script_blocks: false,
+            supports_firebird_routine_blocks: false,
             supports_go_batch_separator: false,
             keeps_sqlserver_module_batch_at_cursor: false,
             preserves_tdsql_leading_directives: false,
@@ -291,6 +293,10 @@ impl SqlDialectProfile {
 
         if matches!(db_type, DatabaseType::SapHana) {
             return Self::sap_hana();
+        }
+
+        if matches!(db_type, DatabaseType::Firebird) {
+            return Self::firebird();
         }
 
         if matches!(db_type, DatabaseType::DuckDb) {
@@ -391,6 +397,10 @@ impl SqlDialectProfile {
 
     fn sap_hana() -> Self {
         Self { supports_hana_script_blocks: true, ..Self::default() }
+    }
+
+    fn firebird() -> Self {
+        Self { supports_backslash_escaped_quotes: false, supports_firebird_routine_blocks: true, ..Self::default() }
     }
 
     fn is_mysql_compatible_database(db_type: DatabaseType) -> bool {
@@ -927,6 +937,13 @@ impl SqlStatementSplitter {
                         if hana_script_block_is_complete(&self.buffer) {
                             self.push_current_statement(&mut statements);
                         }
+                    } else if self.options.profile.supports_firebird_routine_blocks
+                        && starts_with_firebird_routine_block(&self.buffer)
+                    {
+                        self.buffer.push(ch);
+                        if firebird_routine_block_is_complete(&self.buffer) {
+                            self.push_current_statement(&mut statements);
+                        }
                     } else {
                         self.push_current_statement(&mut statements);
                     }
@@ -1314,6 +1331,9 @@ fn split_statement_range_at_blank_lines(
     if options.profile.supports_hana_script_blocks && starts_with_hana_script_block(&statement.text) {
         return vec![statement.clone()];
     }
+    if options.profile.supports_firebird_routine_blocks && starts_with_firebird_routine_block(&statement.text) {
+        return vec![statement.clone()];
+    }
 
     let mut ranges = Vec::new();
     let mut scanner = SqlScanner::with_profile(options.profile);
@@ -1363,6 +1383,11 @@ fn split_statement_range_at_blank_lines(
 fn starts_with_soft_statement_keyword(sql: &str, options: SqlParsingOptions) -> bool {
     if options.profile.supports_hana_script_blocks
         && starts_with_executable_sql_keyword_with_options(sql, &["DO"], options)
+    {
+        return true;
+    }
+    if options.profile.supports_firebird_routine_blocks
+        && starts_with_executable_sql_keyword_with_options(sql, &["RECREATE"], options)
     {
         return true;
     }
@@ -1567,6 +1592,14 @@ fn split_sql_statement_ranges_with_options(sql: &str, options: SqlParsingOptions
                         && starts_with_hana_script_block(&sql[start..i])
                     {
                         if !hana_script_block_is_complete(&sql[start..i + ch.len_utf8()]) {
+                            i += ch.len_utf8();
+                            continue;
+                        }
+                        push_statement_range(&mut ranges, sql, start, i + ch.len_utf8(), options);
+                    } else if options.profile.supports_firebird_routine_blocks
+                        && starts_with_firebird_routine_block(&sql[start..i])
+                    {
+                        if !firebird_routine_block_is_complete(&sql[start..i + ch.len_utf8()]) {
                             i += ch.len_utf8();
                             continue;
                         }
@@ -3089,6 +3122,97 @@ impl HanaScriptBlock {
                 if matches!(next, Some("IF" | "FOR" | "WHILE")) {
                     continue;
                 }
+                if case_depth > 0 {
+                    case_depth -= 1;
+                } else {
+                    block_depth = block_depth.saturating_sub(1);
+                }
+            }
+        }
+
+        saw_begin
+            && block_depth == 0
+            && case_depth == 0
+            && self.tokens.last().is_some_and(OraclePlSqlToken::is_semicolon)
+    }
+}
+
+fn starts_with_firebird_routine_block(sql: &str) -> bool {
+    FirebirdRoutineBlock::parse(sql).starts_block()
+}
+
+fn firebird_routine_block_is_complete(sql: &str) -> bool {
+    FirebirdRoutineBlock::parse(sql).is_complete()
+}
+
+struct FirebirdRoutineBlock {
+    tokens: Vec<OraclePlSqlToken>,
+}
+
+impl FirebirdRoutineBlock {
+    fn parse(sql: &str) -> Self {
+        Self { tokens: oracle_plsql_tokens(sql) }
+    }
+
+    fn starts_block(&self) -> bool {
+        let Some(first) = self.tokens.first().and_then(OraclePlSqlToken::as_word) else {
+            return false;
+        };
+        if first == "EXECUTE" {
+            return self.tokens.get(1).is_some_and(|token| token.is_word("BLOCK"));
+        }
+        if !matches!(first, "CREATE" | "RECREATE" | "ALTER") {
+            return false;
+        }
+        let mut index = 1;
+        if self.tokens.get(index).is_some_and(|token| token.is_word("OR"))
+            && self.tokens.get(index + 1).is_some_and(|token| token.is_any_word(&["ALTER", "REPLACE"]))
+        {
+            index += 2;
+        }
+        let Some(object_type) = self.tokens.get(index).and_then(OraclePlSqlToken::as_word) else {
+            return false;
+        };
+        if object_type == "PACKAGE" {
+            if !self.tokens.get(index + 1).is_some_and(|token| token.is_word("BODY")) {
+                return false;
+            }
+        } else if !matches!(object_type, "PROCEDURE" | "FUNCTION" | "TRIGGER") {
+            return false;
+        }
+        if first == "ALTER" {
+            // Firebird accepts `ALTER TRIGGER name ACTIVE/INACTIVE;`. Only treat ALTER
+            // as a routine block when it defines a body via AS or BEGIN.
+            return self.tokens.iter().any(|token| token.is_any_word(&["AS", "BEGIN"]));
+        }
+        true
+    }
+
+    fn is_complete(&self) -> bool {
+        if !self.starts_block() {
+            return false;
+        }
+
+        let mut block_depth = 0usize;
+        let mut case_depth = 0usize;
+        let mut saw_begin = false;
+
+        for (index, token) in self.tokens.iter().enumerate() {
+            if token.is_word("BEGIN") {
+                if previous_adjacent_word(&self.tokens, index).is_some_and(|previous| previous == "END") {
+                    continue;
+                }
+                block_depth += 1;
+                saw_begin = true;
+                continue;
+            }
+            if token.is_word("CASE") {
+                if previous_adjacent_word(&self.tokens, index).is_none_or(|previous| previous != "END") {
+                    case_depth += 1;
+                }
+                continue;
+            }
+            if token.is_word("END") {
                 if case_depth > 0 {
                     case_depth -= 1;
                 } else {
@@ -5032,6 +5156,7 @@ SELECT 2;";
         assert!(!default.supports_oracle_plsql_blocks);
         assert!(!default.supports_oracle_style_routine_bodies);
         assert!(!default.supports_hana_script_blocks);
+        assert!(!default.supports_firebird_routine_blocks);
         assert!(!default.supports_slash_line_block_delimiter);
         assert!(!default.supports_go_batch_separator);
         assert!(!default.keeps_sqlserver_module_batch_at_cursor);
@@ -5108,6 +5233,11 @@ SELECT 2;";
         let sap_hana = SqlDialectProfile::for_database_type(DatabaseType::SapHana);
         assert_eq!(sap_hana, SqlDialectProfile::sap_hana());
         assert!(sap_hana.supports_hana_script_blocks);
+
+        let firebird = SqlDialectProfile::for_database_type(DatabaseType::Firebird);
+        assert_eq!(firebird, SqlDialectProfile::firebird());
+        assert!(firebird.supports_firebird_routine_blocks);
+        assert!(!firebird.supports_backslash_escaped_quotes);
     }
 
     #[test]
@@ -5184,6 +5314,134 @@ SELECT 2 FROM DUMMY;";
         assert_eq!(
             find_statement_at_cursor_for_database(sql, cursor, DatabaseType::SapHana),
             "DO\nBEGIN\n  IF 1 = 1 THEN\n    SELECT CASE WHEN 1 = 1 THEN 1 ELSE 0 END AS \"Result\" FROM DUMMY;\n  END IF;\nEND;"
+        );
+    }
+
+    #[test]
+    fn firebird_split_keeps_trigger_block_together() {
+        let sql = "\
+CREATE OR ALTER TRIGGER \"WL_FYD_TP_AU\" FOR \"WL_FYD\" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;
+SELECT 2 FROM RDB$DATABASE;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Firebird),
+            vec![
+                "CREATE OR ALTER TRIGGER \"WL_FYD_TP_AU\" FOR \"WL_FYD\" ACTIVE\nAFTER UPDATE\nas\nbegin\n  /* Trigger text */\n  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN\n  BEGIN\n    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;\n  END\nend;",
+                "SELECT 2 FROM RDB$DATABASE"
+            ]
+        );
+    }
+
+    #[test]
+    fn firebird_split_keeps_procedure_with_declarations_together() {
+        let sql = "\
+CREATE OR ALTER PROCEDURE SP_GET_USER (USER_ID INT)
+RETURNS (USERNAME VARCHAR(50), TOTAL_AMOUNT NUMERIC(18, 2))
+AS
+DECLARE VARIABLE V_TEMP NUMERIC(18, 2);
+DECLARE VARIABLE V_STATUS INT;
+BEGIN
+  SELECT FIRST 1 NAME FROM USERS WHERE ID = :USER_ID INTO :USERNAME;
+  V_TEMP = 100.50;
+  TOTAL_AMOUNT = :V_TEMP;
+  SUSPEND;
+END;
+SELECT 1 FROM RDB$DATABASE;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Firebird),
+            vec![
+                "CREATE OR ALTER PROCEDURE SP_GET_USER (USER_ID INT)\nRETURNS (USERNAME VARCHAR(50), TOTAL_AMOUNT NUMERIC(18, 2))\nAS\nDECLARE VARIABLE V_TEMP NUMERIC(18, 2);\nDECLARE VARIABLE V_STATUS INT;\nBEGIN\n  SELECT FIRST 1 NAME FROM USERS WHERE ID = :USER_ID INTO :USERNAME;\n  V_TEMP = 100.50;\n  TOTAL_AMOUNT = :V_TEMP;\n  SUSPEND;\nEND;",
+                "SELECT 1 FROM RDB$DATABASE"
+            ]
+        );
+    }
+
+    #[test]
+    fn firebird_split_keeps_execute_block_together() {
+        let sql = "\
+EXECUTE BLOCK
+RETURNS (OUT_ID INT)
+AS
+DECLARE VARIABLE I INT;
+BEGIN
+  I = 0;
+  WHILE (I < 10) DO
+  BEGIN
+    I = I + 1;
+  END
+  OUT_ID = I;
+  SUSPEND;
+END;
+SELECT 1 FROM RDB$DATABASE;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Firebird),
+            vec![
+                "EXECUTE BLOCK\nRETURNS (OUT_ID INT)\nAS\nDECLARE VARIABLE I INT;\nBEGIN\n  I = 0;\n  WHILE (I < 10) DO\n  BEGIN\n    I = I + 1;\n  END\n  OUT_ID = I;\n  SUSPEND;\nEND;",
+                "SELECT 1 FROM RDB$DATABASE"
+            ]
+        );
+    }
+
+    #[test]
+    fn firebird_split_keeps_routine_with_case_expression_together() {
+        let sql = "\
+CREATE PROCEDURE P_CASE
+AS
+BEGIN
+  UPDATE T SET FLAG = CASE WHEN X > 0 THEN 1 ELSE 0 END;
+END;
+SELECT 1 FROM RDB$DATABASE;";
+
+        assert_eq!(
+            split_sql_statements_for_database(sql, DatabaseType::Firebird),
+            vec![
+                "CREATE PROCEDURE P_CASE\nAS\nBEGIN\n  UPDATE T SET FLAG = CASE WHEN X > 0 THEN 1 ELSE 0 END;\nEND;",
+                "SELECT 1 FROM RDB$DATABASE"
+            ]
+        );
+    }
+
+    #[test]
+    fn firebird_plain_alter_trigger_still_flushes_at_semicolon() {
+        assert_eq!(
+            split_sql_statements_for_database(
+                "ALTER TRIGGER TR_USERS INACTIVE; SELECT 1 FROM RDB$DATABASE;",
+                DatabaseType::Firebird
+            ),
+            vec!["ALTER TRIGGER TR_USERS INACTIVE", "SELECT 1 FROM RDB$DATABASE"]
+        );
+    }
+
+    #[test]
+    fn firebird_cursor_statement_returns_whole_trigger() {
+        let sql = "\
+CREATE OR ALTER TRIGGER \"WL_FYD_TP_AU\" FOR \"WL_FYD\" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;
+SELECT 2 FROM RDB$DATABASE;";
+        let cursor = sql.find("UPDATE WL_FYD").unwrap();
+
+        assert_eq!(
+            find_statement_at_cursor_for_database(sql, cursor, DatabaseType::Firebird),
+            "CREATE OR ALTER TRIGGER \"WL_FYD_TP_AU\" FOR \"WL_FYD\" ACTIVE\nAFTER UPDATE\nas\nbegin\n  /* Trigger text */\n  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN\n  BEGIN\n    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;\n  END\nend;"
         );
     }
 

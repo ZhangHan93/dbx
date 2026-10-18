@@ -61,6 +61,9 @@ export type ShortcutActionId =
   | "focusSearch"
   | "quickOpen"
   | "globalSearch"
+  | "openConnectionPicker"
+  | "openDatabasePicker"
+  | "openSchemaPicker"
   | "toggleAiPanel"
   | "navigateTabHistoryBack"
   | "navigateTabHistoryForward"
@@ -540,6 +543,24 @@ export const SHORTCUT_DEFINITIONS: ShortcutDefinition[] = [
     labelKey: "settings.shortcutGlobalSearch",
     scope: "global",
     defaultShortcut: "Mod+Alt+F",
+  },
+  {
+    id: "openConnectionPicker",
+    labelKey: "settings.shortcutOpenConnectionPicker",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+C",
+  },
+  {
+    id: "openDatabasePicker",
+    labelKey: "settings.shortcutOpenDatabasePicker",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+D",
+  },
+  {
+    id: "openSchemaPicker",
+    labelKey: "settings.shortcutOpenSchemaPicker",
+    scope: "global",
+    defaultShortcut: "Mod+Alt+S",
   },
   {
     id: "toggleAiPanel",

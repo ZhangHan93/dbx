@@ -43,6 +43,7 @@ import { normalizeExcludedCompletionItems } from "@/lib/editor/excludedCompletio
 import { DEFAULT_SQL_TABLE_COMPLETION_SCHEMA_QUALIFICATION, normalizeSqlTableCompletionSchemaQualification, type SqlTableCompletionSchemaQualification } from "@/lib/sql/sqlCompletionSchemaQualification";
 import { DEFAULT_CSV_QUOTE_MODE, normalizeCsvQuoteMode, type CsvQuoteMode } from "@/lib/export/csvQuoteMode";
 import { DEFAULT_CSV_NULL_MODE, normalizeCsvNullMode, type CsvNullMode } from "@/lib/export/csvNullMode";
+import { DEFAULT_QUERY_RESULT_EXPORT_FILE_NAME_SOURCE, normalizeQueryResultExportFileNameSource, type QueryResultExportFileNameSource } from "@/lib/export/saveTextFile";
 import { configureMetadataRuntimeCache, METADATA_CACHE_DEFAULT_MEMORY_MB, normalizeMetadataCacheMemoryMb } from "@/lib/metadata/metadataRuntimeCache";
 import type { AiApiStyle, AiAssistantMode, AiAuthMethod, AiChatSelectionState, AiConfig, AiConfigItem, AiConfiguredModel, AiEffortLevel, AiEffortSelection, AiModelEffortPreference, AiProvider, AiReasoningLevel, AiTestConnectionResult } from "@/types/ai";
 import type { SqlShortcutAction, SqlSnippet, TableInfoTab } from "@/types/database";
@@ -62,6 +63,7 @@ export type {
   CsvQuoteMode,
   CsvNullMode,
   DataTabReuseMode,
+  QueryResultExportFileNameSource,
   SavedSqlOpenTargetMode,
   SqlCompletionTriggerMode,
   SqlTableCompletionSchemaQualification,
@@ -728,6 +730,7 @@ export function normalizeAiConfig(config: Partial<AiConfig> | null | undefined):
     piAgentCliEnv: normalizeAiEnv(config?.piAgentCliEnv),
     opencodeCliPath: config?.opencodeCliPath?.trim() || undefined,
     opencodeCliEnv: normalizeAiEnv(config?.opencodeCliEnv),
+    opencodeCliVersion: config?.opencodeCliVersion?.trim() || undefined,
     cursorCliPath: config?.cursorCliPath?.trim() || undefined,
     cursorCliEnv: normalizeAiEnv(config?.cursorCliEnv),
     grokCliPath: config?.grokCliPath?.trim() || undefined,
@@ -1036,6 +1039,8 @@ export interface EditorSettings {
   showColumnHeaderTooltips: boolean;
   /** 结果集页签/结果列表的名称是否带上库名（关闭后只显示表名，完整名称仍在悬浮提示中）。 */
   showResultSourceDatabase: boolean;
+  /** Show SQL in the footer of query results and table data grids. */
+  showDataGridStatusSql: boolean;
   /**
    * Global Oracle Instant Client location (the directory that contains
    * oci.dll / libclnts). Shared by every Oracle connection whose driver mode
@@ -1090,6 +1095,7 @@ export interface EditorSettings {
   dataGridExtractorOptionsMigrationVersion: number;
   resultRunDisplayMode: ResultRunDisplayMode;
   defaultAutoKeepResults: boolean;
+  pinResultTabOnClick: boolean;
   multiStatementDefaultView: MultiStatementDefaultView;
   defaultExplainView: DefaultExplainView;
   dataGridAutoTransposeSingleRow: boolean;
@@ -1185,6 +1191,7 @@ export interface EditorSettings {
   applyColumnFormattersOnExport: boolean;
   csvQuoteMode: CsvQuoteMode;
   csvNullMode: CsvNullMode;
+  queryResultExportFileNameSource: QueryResultExportFileNameSource;
   /** Global Redis key-search templates; overridden by non-empty connection templates. */
   redisKeyTemplates: string[];
   /** Sidebar database-list cap for Redis connections; the rest are revealed via "load more". */
@@ -1202,6 +1209,7 @@ export interface EditorSettings {
   toolbarItems: ToolbarItems;
   objectBrowserShowCheckbox: boolean;
   objectBrowserViewMode: "list" | "grid" | "compact";
+  objectBrowserAutoOpenDetailPanel: boolean;
   sqlVariableSubstitutionEnabled: boolean;
   sqlVariableSyntaxOverrides: SqlVariableSyntaxOverrides;
   continueOnErrorOnBatch: boolean;
@@ -1404,6 +1412,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   showColumnTypesInHeader: true,
   showColumnHeaderTooltips: true,
   showResultSourceDatabase: true,
+  showDataGridStatusSql: true,
   oracleOciClientPath: "",
   damengClientBinDir: "",
   oracleOciNlsLang: "",
@@ -1432,6 +1441,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   dataGridExtractorOptionsMigrationVersion: DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION,
   resultRunDisplayMode: "tabs",
   defaultAutoKeepResults: false,
+  pinResultTabOnClick: true,
   multiStatementDefaultView: "result",
   defaultExplainView: "canvas",
   dataGridAutoTransposeSingleRow: false,
@@ -1523,6 +1533,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   applyColumnFormattersOnExport: true,
   csvQuoteMode: DEFAULT_CSV_QUOTE_MODE,
   csvNullMode: DEFAULT_CSV_NULL_MODE,
+  queryResultExportFileNameSource: DEFAULT_QUERY_RESULT_EXPORT_FILE_NAME_SOURCE,
   redisKeyTemplates: [],
   redisDatabaseDisplayLimit: REDIS_DATABASE_DISPLAY_LIMIT_DEFAULT,
   redisValuePreviewLimitKiB: REDIS_VALUE_PREVIEW_LIMIT_KIB_DEFAULT,
@@ -1536,6 +1547,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   toolbarItems: { ...DEFAULT_TOOLBAR_ITEMS },
   objectBrowserShowCheckbox: false,
   objectBrowserViewMode: "list",
+  objectBrowserAutoOpenDetailPanel: true,
   sqlVariableSubstitutionEnabled: true,
   sqlVariableSyntaxOverrides: {},
   continueOnErrorOnBatch: false,
@@ -2063,6 +2075,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     showColumnTypesInHeader: settings.showColumnTypesInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader,
     showColumnHeaderTooltips: settings.showColumnHeaderTooltips ?? DEFAULT_EDITOR_SETTINGS.showColumnHeaderTooltips,
     showResultSourceDatabase: settings.showResultSourceDatabase ?? DEFAULT_EDITOR_SETTINGS.showResultSourceDatabase,
+    showDataGridStatusSql: settings.showDataGridStatusSql !== false,
     oracleOciNlsLang: typeof settings.oracleOciNlsLang === "string" ? settings.oracleOciNlsLang.trim() : "",
     oracleOciTnsAdmin: typeof settings.oracleOciTnsAdmin === "string" ? settings.oracleOciTnsAdmin.trim() : "",
     oracleOciClientPath: typeof settings.oracleOciClientPath === "string" ? settings.oracleOciClientPath.trim() : "",
@@ -2091,6 +2104,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     dataGridExtractorOptionsMigrationVersion: DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION,
     resultRunDisplayMode: normalizeResultRunDisplayMode(settings.resultRunDisplayMode),
     defaultAutoKeepResults: settings.defaultAutoKeepResults === true,
+    pinResultTabOnClick: settings.pinResultTabOnClick !== false,
     multiStatementDefaultView: normalizeMultiStatementDefaultView(settings.multiStatementDefaultView),
     defaultExplainView: normalizeDefaultExplainView(settings.defaultExplainView),
     dataGridAutoTransposeSingleRow: settings.dataGridAutoTransposeSingleRow === true,
@@ -2229,6 +2243,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     applyColumnFormattersOnExport: typeof settings.applyColumnFormattersOnExport === "boolean" ? settings.applyColumnFormattersOnExport : DEFAULT_EDITOR_SETTINGS.applyColumnFormattersOnExport,
     csvQuoteMode: normalizeCsvQuoteMode(settings.csvQuoteMode),
     csvNullMode: normalizeCsvNullMode(settings.csvNullMode),
+    queryResultExportFileNameSource: normalizeQueryResultExportFileNameSource(settings.queryResultExportFileNameSource),
     redisKeyTemplates: normalizeRedisKeyTemplates(settings.redisKeyTemplates),
     redisValuePreviewLimitKiB: normalizeRedisValuePreviewLimitKiB(settings.redisValuePreviewLimitKiB),
     redisDatabaseDisplayLimit:
@@ -2245,6 +2260,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     toolbarItems: normalizeToolbarItems(settings.toolbarItems),
     objectBrowserShowCheckbox: typeof settings.objectBrowserShowCheckbox === "boolean" ? settings.objectBrowserShowCheckbox : DEFAULT_EDITOR_SETTINGS.objectBrowserShowCheckbox,
     objectBrowserViewMode: settings.objectBrowserViewMode === "grid" || settings.objectBrowserViewMode === "compact" ? settings.objectBrowserViewMode : DEFAULT_EDITOR_SETTINGS.objectBrowserViewMode,
+    objectBrowserAutoOpenDetailPanel: typeof settings.objectBrowserAutoOpenDetailPanel === "boolean" ? settings.objectBrowserAutoOpenDetailPanel : DEFAULT_EDITOR_SETTINGS.objectBrowserAutoOpenDetailPanel,
     sqlVariableSubstitutionEnabled: typeof settings.sqlVariableSubstitutionEnabled === "boolean" ? settings.sqlVariableSubstitutionEnabled : DEFAULT_EDITOR_SETTINGS.sqlVariableSubstitutionEnabled,
     sqlVariableSyntaxOverrides: normalizeSqlVariableSyntaxOverrides(settings.sqlVariableSyntaxOverrides),
     continueOnErrorOnBatch: settings.continueOnErrorOnBatch === true,
@@ -2956,6 +2972,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.showColumnTypesInHeader !== undefined) editorSettings.value.showColumnTypesInHeader = partial.showColumnTypesInHeader;
     if (partial.showColumnHeaderTooltips !== undefined) editorSettings.value.showColumnHeaderTooltips = partial.showColumnHeaderTooltips;
     if (partial.showResultSourceDatabase !== undefined) editorSettings.value.showResultSourceDatabase = partial.showResultSourceDatabase;
+    if (partial.showDataGridStatusSql !== undefined) editorSettings.value.showDataGridStatusSql = partial.showDataGridStatusSql !== false;
     if (partial.oracleOciNlsLang !== undefined) editorSettings.value.oracleOciNlsLang = partial.oracleOciNlsLang.trim();
     if (partial.oracleOciTnsAdmin !== undefined) editorSettings.value.oracleOciTnsAdmin = partial.oracleOciTnsAdmin.trim();
     if (partial.oracleOciClientPath !== undefined) editorSettings.value.oracleOciClientPath = partial.oracleOciClientPath.trim();
@@ -2990,6 +3007,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.dataGridExtractorOptionsMigrationVersion !== undefined) editorSettings.value.dataGridExtractorOptionsMigrationVersion = DATA_GRID_EXTRACTOR_OPTIONS_MIGRATION_VERSION;
     if (partial.resultRunDisplayMode !== undefined) editorSettings.value.resultRunDisplayMode = normalizeResultRunDisplayMode(partial.resultRunDisplayMode);
     if (partial.defaultAutoKeepResults !== undefined) editorSettings.value.defaultAutoKeepResults = partial.defaultAutoKeepResults === true;
+    if (partial.pinResultTabOnClick !== undefined) editorSettings.value.pinResultTabOnClick = partial.pinResultTabOnClick !== false;
     if (partial.multiStatementDefaultView !== undefined) editorSettings.value.multiStatementDefaultView = normalizeMultiStatementDefaultView(partial.multiStatementDefaultView);
     if (partial.defaultExplainView !== undefined) editorSettings.value.defaultExplainView = normalizeDefaultExplainView(partial.defaultExplainView);
     if (partial.dataGridAutoTransposeSingleRow !== undefined) editorSettings.value.dataGridAutoTransposeSingleRow = partial.dataGridAutoTransposeSingleRow === true;
@@ -3092,6 +3110,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.applyColumnFormattersOnExport !== undefined) editorSettings.value.applyColumnFormattersOnExport = partial.applyColumnFormattersOnExport === true;
     if (partial.csvQuoteMode !== undefined) editorSettings.value.csvQuoteMode = normalizeCsvQuoteMode(partial.csvQuoteMode);
     if (partial.csvNullMode !== undefined) editorSettings.value.csvNullMode = normalizeCsvNullMode(partial.csvNullMode);
+    if (partial.queryResultExportFileNameSource !== undefined) editorSettings.value.queryResultExportFileNameSource = normalizeQueryResultExportFileNameSource(partial.queryResultExportFileNameSource);
     if (partial.redisValuePreviewLimitKiB !== undefined) editorSettings.value.redisValuePreviewLimitKiB = normalizeRedisValuePreviewLimitKiB(partial.redisValuePreviewLimitKiB);
     if (partial.redisKeyTemplates !== undefined) editorSettings.value.redisKeyTemplates = normalizeRedisKeyTemplates(partial.redisKeyTemplates);
     if (partial.redisDatabaseDisplayLimit !== undefined) editorSettings.value.redisDatabaseDisplayLimit = Math.min(REDIS_DATABASE_DISPLAY_LIMIT_MAX, Math.max(REDIS_DATABASE_DISPLAY_LIMIT_MIN, Math.round(partial.redisDatabaseDisplayLimit)));
@@ -3105,6 +3124,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.toolbarItems !== undefined) editorSettings.value.toolbarItems = normalizeToolbarItems(partial.toolbarItems);
     if (partial.objectBrowserShowCheckbox !== undefined) editorSettings.value.objectBrowserShowCheckbox = partial.objectBrowserShowCheckbox === true;
     if (partial.objectBrowserViewMode !== undefined) editorSettings.value.objectBrowserViewMode = partial.objectBrowserViewMode === "grid" || partial.objectBrowserViewMode === "compact" ? partial.objectBrowserViewMode : "list";
+    if (partial.objectBrowserAutoOpenDetailPanel !== undefined) editorSettings.value.objectBrowserAutoOpenDetailPanel = partial.objectBrowserAutoOpenDetailPanel === true;
     if (partial.sqlVariableSubstitutionEnabled !== undefined) editorSettings.value.sqlVariableSubstitutionEnabled = partial.sqlVariableSubstitutionEnabled === true;
     if (partial.sqlVariableSyntaxOverrides !== undefined) editorSettings.value.sqlVariableSyntaxOverrides = normalizeSqlVariableSyntaxOverrides(partial.sqlVariableSyntaxOverrides);
     if (partial.continueOnErrorOnBatch !== undefined) editorSettings.value.continueOnErrorOnBatch = partial.continueOnErrorOnBatch === true;

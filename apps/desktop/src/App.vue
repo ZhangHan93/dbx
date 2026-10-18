@@ -140,6 +140,9 @@ import {
   handleTabHistoryNavigationShortcut,
   isNewQueryShortcut,
   isObjectSourceSaveShortcutTarget,
+  isOpenConnectionPickerShortcut,
+  isOpenDatabasePickerShortcut,
+  isOpenSchemaPickerShortcut,
   isOpenSettingsShortcut,
   isQuickOpenShortcut,
   isGlobalSearchShortcut,
@@ -4565,6 +4568,17 @@ async function handleKeydown(e: KeyboardEvent) {
   if (isGoToColumnShortcut(e, shortcuts) && contentAreaRef.value?.openGoToColumn()) {
     e.preventDefault();
     e.stopPropagation();
+    return;
+  }
+  if (isOpenConnectionPickerShortcut(e, shortcuts) || isOpenDatabasePickerShortcut(e, shortcuts) || isOpenSchemaPickerShortcut(e, shortcuts)) {
+    const target = e.target instanceof Element ? e.target : null;
+    const opened =
+      !target?.closest('[role="dialog"], [role="alertdialog"]') &&
+      ((isOpenConnectionPickerShortcut(e, shortcuts) && contentAreaRef.value?.openConnectionPicker?.()) || (isOpenDatabasePickerShortcut(e, shortcuts) && contentAreaRef.value?.openDatabasePicker?.()) || (isOpenSchemaPickerShortcut(e, shortcuts) && contentAreaRef.value?.openSchemaPicker?.()));
+    if (opened) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
     return;
   }
 

@@ -75,6 +75,7 @@ export interface AiConfig {
   piAgentCliEnv?: Record<string, string>;
   opencodeCliPath?: string | null;
   opencodeCliEnv?: Record<string, string>;
+  opencodeCliVersion?: string | null;
   cursorCliPath?: string | null;
   cursorCliEnv?: Record<string, string>;
   grokCliPath?: string | null;

@@ -21,6 +21,9 @@ import {
   isGoToNextPageShortcut,
   isGoToPreviousPageShortcut,
   isToggleZenModeShortcut,
+  isOpenConnectionPickerShortcut,
+  isOpenDatabasePickerShortcut,
+  isOpenSchemaPickerShortcut,
   isSidebarFocusedTarget,
   isToggleAiPanelShortcut,
   matchesModifierOnlyShortcut,
@@ -224,6 +227,20 @@ describe("keyboard shortcut matching", () => {
     ).toBe(true);
     expect(isToggleZenModeShortcut({ ...platformModEvent, shiftKey: false }, { toggleZenMode: "Shift+Mod+F12" })).toBe(false);
     expect(isToggleZenModeShortcut(platformModEvent, { toggleZenMode: "" })).toBe(false);
+  });
+
+  it("matches the toolbar picker shortcuts by default and with custom bindings", () => {
+    const modEvent = (key: string) => (isMacShortcutPlatform() ? { key, metaKey: true, altKey: true } : { key, ctrlKey: true, altKey: true });
+
+    expect(isOpenConnectionPickerShortcut(modEvent("c"))).toBe(true);
+    expect(isOpenDatabasePickerShortcut(modEvent("d"))).toBe(true);
+    expect(isOpenSchemaPickerShortcut(modEvent("s"))).toBe(true);
+    expect(isOpenConnectionPickerShortcut(modEvent("d"))).toBe(false);
+    expect(isOpenConnectionPickerShortcut({ ...modEvent("c"), altKey: false })).toBe(false);
+    expect(isOpenDatabasePickerShortcut({ key: "b", ctrlKey: true, altKey: true }, { openDatabasePicker: "Mod+Alt+B" })).toBe(true);
+    expect(isOpenDatabasePickerShortcut(modEvent("d"), { openDatabasePicker: "Mod+Alt+B" })).toBe(false);
+    expect(isOpenSchemaPickerShortcut(modEvent("s"), { openSchemaPicker: "" })).toBe(false);
+    expect(isOpenSchemaPickerShortcut({ ...modEvent("s"), isComposing: true })).toBe(false);
   });
 
   it("matches the platform-specific AI panel shortcut", () => {

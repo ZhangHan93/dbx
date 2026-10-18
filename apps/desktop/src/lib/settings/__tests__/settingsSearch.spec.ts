@@ -159,6 +159,16 @@ describe("settings search", () => {
     });
   });
 
+  it("indexes the query result export file name source setting (#12092)", () => {
+    expect(SETTINGS_SEARCH_DEFINITIONS).toContainEqual({
+      id: "data-export-file-name-source",
+      category: "data",
+      titleKey: "settings.queryResultExportFileNameSource",
+      descriptionKey: "settings.queryResultExportFileNameSourceDescription",
+      targetId: "data",
+    });
+  });
+
   it("places SQL file limits in their owning settings categories", () => {
     expect(SETTINGS_SEARCH_DEFINITIONS).toContainEqual({
       id: "sql-file-editor-max-mb",
@@ -351,6 +361,7 @@ describe("settings search", () => {
       { titleKey: "settings.tableCompletionSchemaQualification", category: "editor", targetId: "editor" },
       { titleKey: "settings.autoAliasTables", category: "editor", targetId: "editor" },
       { titleKey: "settings.clickTableNavigationTarget", category: "navigation", targetId: "navigation" },
+      { titleKey: "settings.objectBrowserAutoOpenDetailPanel", category: "navigation", targetId: "navigation" },
       { titleKey: "settings.prefillNewQueryWithSelect", category: "navigation", targetId: "navigation" },
       { titleKey: "settings.generateSqlIncludeDatabaseName", category: "editor", targetId: "editor" },
       { titleKey: "settings.generateSqlQuoteIdentifiers", category: "editor", targetId: "editor" },

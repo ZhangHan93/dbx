@@ -196,7 +196,7 @@ export interface PluginHostBridgeApi {
    * connection-providers, so plugins can implement their own connection switching inside panels/workbenches and
    * their own business (the host stays unaware of the purpose).
    */
-  listConnections?(pluginId: string): Array<{ id: string; name: string; providerId: string; connectionType?: string; readOnly: boolean }>;
+  listConnections?(pluginId: string): Array<{ id: string; name: string; providerId: string; connectionType?: string; readOnly: boolean; workbenchTitles?: string[] }>;
   /**
    * Estimated plan capability metadata for one connection. Requires the plugin
    * to declare `host.plans:read`. The host only reads the stored connection

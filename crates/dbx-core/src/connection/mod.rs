@@ -2922,12 +2922,37 @@ impl AppState {
                 } else {
                     db_config.url_params.as_deref().and_then(extract_auth_token_from_params).unwrap_or_default()
                 };
-                let client = db::turso_driver::TursoClient::new(&url, &auth_token, db_config.ssl, connect_timeout)?;
+                let http_proxy = clickhouse_http_proxy(runtime_proxy.as_ref())?;
+                let ca_cert =
+                    if db_config.ca_cert_path.trim().is_empty() { None } else { Some(db_config.ca_cert_path.as_str()) };
+                let client_cert = if db_config.client_cert_path.trim().is_empty() {
+                    None
+                } else {
+                    Some(db_config.client_cert_path.as_str())
+                };
+                let client_key = if db_config.client_key_path.trim().is_empty() {
+                    None
+                } else {
+                    Some(db_config.client_key_path.as_str())
+                };
+                let client = db::turso_driver::TursoClient::new_with_options(
+                    &url,
+                    &auth_token,
+                    db_config.ssl,
+                    connect_timeout,
+                    ca_cert,
+                    client_cert,
+                    client_key,
+                    http_proxy,
+                )?;
                 db::turso_driver::test_connection(&client, connect_timeout).await?;
                 PoolKind::Turso(client)
             }
             DatabaseType::CloudflareD1 => {
-                PoolKind::CloudflareD1(db::cloudflare_d1_driver::connect(&db_config, connect_timeout).await?)
+                let http_proxy = clickhouse_http_proxy(runtime_proxy.as_ref())?;
+                PoolKind::CloudflareD1(
+                    db::cloudflare_d1_driver::connect_with_proxy(&db_config, http_proxy, connect_timeout).await?,
+                )
             }
             DatabaseType::Redis => {
                 let con = if db_config.uses_redis_cluster() {
@@ -3691,7 +3716,10 @@ impl AppState {
         if transport_layers.is_empty() || db::sqlite_worker::sqlite_remote_worker_requested(config) {
             return Ok(ConnectionEndpoint::direct(config.host.clone(), config.port));
         }
-        if config.db_type == DatabaseType::ClickHouse {
+        if config.db_type == DatabaseType::ClickHouse
+            || config.db_type == DatabaseType::CloudflareD1
+            || config.db_type == DatabaseType::Turso
+        {
             if let Some(proxy) = self.clickhouse_proxy_for_transport_layers(connection_id, &transport_layers).await? {
                 return Ok(ConnectionEndpoint { host: config.host.clone(), port: config.port, proxy: Some(proxy) });
             }

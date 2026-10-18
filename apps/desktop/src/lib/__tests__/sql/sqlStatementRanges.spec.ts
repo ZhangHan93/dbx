@@ -980,6 +980,62 @@ SELECT 2 FROM DUMMY;`;
   it("still splits SAP HANA ALTER PROCEDURE metadata commands", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges("ALTER PROCEDURE PUBLIC.P RECOMPILE; SELECT 1 FROM DUMMY;", "saphana"))).toEqual(["ALTER PROCEDURE PUBLIC.P RECOMPILE", "SELECT 1 FROM DUMMY"]);
   });
+
+  it("keeps Firebird CREATE OR ALTER TRIGGER blocks together (#12407)", () => {
+    const trigger = `CREATE OR ALTER TRIGGER "WL_FYD_TP_AU" FOR "WL_FYD" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;`;
+    const sql = `${trigger}\nSELECT 2 FROM RDB$DATABASE;`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "firebird"))).toEqual([trigger, "SELECT 2 FROM RDB$DATABASE"]);
+  });
+
+  it("keeps Firebird procedure with local DECLARE statements together (#12407)", () => {
+    const procedure = `CREATE OR ALTER PROCEDURE SP_GET_USER (USER_ID INT)
+RETURNS (USERNAME VARCHAR(50), TOTAL_AMOUNT NUMERIC(18, 2))
+AS
+DECLARE VARIABLE V_TEMP NUMERIC(18, 2);
+DECLARE VARIABLE V_STATUS INT;
+BEGIN
+  SELECT FIRST 1 NAME FROM USERS WHERE ID = :USER_ID INTO :USERNAME;
+  V_TEMP = 100.50;
+  TOTAL_AMOUNT = :V_TEMP;
+  SUSPEND;
+END;`;
+    const sql = `${procedure}\nSELECT 1 FROM RDB$DATABASE;`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "firebird"))).toEqual([procedure, "SELECT 1 FROM RDB$DATABASE"]);
+  });
+
+  it("keeps Firebird EXECUTE BLOCK anonymous blocks together (#12407)", () => {
+    const block = `EXECUTE BLOCK
+RETURNS (OUT_ID INT)
+AS
+DECLARE VARIABLE I INT;
+BEGIN
+  I = 0;
+  WHILE (I < 10) DO
+  BEGIN
+    I = I + 1;
+  END
+  OUT_ID = I;
+  SUSPEND;
+END;`;
+    const sql = `${block}\nSELECT 1 FROM RDB$DATABASE;`;
+
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "firebird"))).toEqual([block, "SELECT 1 FROM RDB$DATABASE"]);
+  });
+
+  it("still splits Firebird ALTER TRIGGER metadata commands (#12407)", () => {
+    expect(rangeSqlTexts(splitSqlStatementRanges("ALTER TRIGGER TR_USERS INACTIVE; SELECT 1 FROM RDB$DATABASE;", "firebird"))).toEqual(["ALTER TRIGGER TR_USERS INACTIVE", "SELECT 1 FROM RDB$DATABASE"]);
+  });
 });
 
 describe("statementRangeAtCursor", () => {
@@ -1791,6 +1847,23 @@ SET t.no = s.no`;
 
     expect(range?.sql.trim()).toBe(sapHanaDoBlockFixture.slice(0, sapHanaDoBlockFixture.indexOf("\nSELECT 2")));
   });
+
+  it("returns the full Firebird trigger definition for cursors inside the body (#12407)", () => {
+    const trigger = `CREATE OR ALTER TRIGGER "WL_FYD_TP_AU" FOR "WL_FYD" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;`;
+    const sql = `${trigger}\nSELECT 2 FROM RDB$DATABASE;`;
+    const range = statementRangeAtCursor(sql, indexOf(sql, "UPDATE WL_FYD"), "firebird");
+
+    expect(range?.sql.trim()).toBe(trigger);
+  });
 });
 
 describe("executableStatementRanges", () => {
@@ -1901,6 +1974,37 @@ DISTRIBUTED BY HASH(product_id) BUCKETS 1`;
 
   it("does not split executable SAP HANA DO ranges at inner statements", () => {
     expect(rangeSqlTexts(executableStatementRanges(sapHanaDoBlockFixture, "saphana"))).toEqual([sapHanaDoBlockFixture.slice(0, sapHanaDoBlockFixture.indexOf("\nSELECT 2")), "SELECT 2 FROM DUMMY"]);
+  });
+
+  it("does not expose run targets for statements inside a Firebird trigger block (#12407)", () => {
+    const trigger = `CREATE OR ALTER TRIGGER "WL_FYD_TP_AU" FOR "WL_FYD" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end;`;
+    const sql = `${trigger}\nSELECT 2 FROM RDB$DATABASE;`;
+
+    expect(rangeSqlTexts(executableStatementRanges(sql, "firebird"))).toEqual([trigger, "SELECT 2 FROM RDB$DATABASE"]);
+  });
+
+  it("keeps Firebird trigger without trailing semicolon as one executable range (#12407)", () => {
+    const trigger = `CREATE OR ALTER TRIGGER "WL_FYD_TP_AU" FOR "WL_FYD" ACTIVE
+AFTER UPDATE
+as
+begin
+  /* Trigger text */
+  IF ( COALESCE(NEW.QSTPS,0) <> COALESCE(OLD.QSTPS,0) ) THEN
+  BEGIN
+    UPDATE WL_FYD SET ZT='完成' WHERE ID= NEW.ID;
+  END
+end`;
+
+    expect(rangeSqlTexts(executableStatementRanges(trigger, "firebird"))).toEqual([trigger]);
   });
 
   it("returns executable SQL Server batches without GO delimiter lines", () => {

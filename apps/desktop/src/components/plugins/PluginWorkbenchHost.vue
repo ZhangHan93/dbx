@@ -540,6 +540,7 @@ function createBridge() {
       listConnections: (ownerPluginId) => {
         const providerIds = new Set((props.plugin.manifest.contributions || []).filter((candidate) => candidate.type === "connection-provider").map((candidate) => candidate.id));
         if (ownerPluginId !== props.plugin.manifest.id) return [];
+        const queryStore = useQueryStore();
         return useConnectionStore()
           .connections.filter((connection) => providerIds.has(connection.plugin_connection_provider ?? ""))
           .map((connection) => ({
@@ -548,6 +549,8 @@ function createBridge() {
             providerId: connection.plugin_connection_provider ?? "",
             connectionType: connection.plugin_connection_type,
             readOnly: connection.read_only === true,
+            // #193b — dock/tab titles bound to the connection (dock first), so plugins can label session rows after renamed terminals.
+            workbenchTitles: queryStore.pluginWorkbenchTitles(connection.id),
           }));
       },
       // Both plan calls carry the plugin's declared `host.plans:read` gate in the

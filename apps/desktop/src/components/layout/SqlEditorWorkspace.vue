@@ -75,6 +75,9 @@ defineExpose({
   },
   focusWhere: () => activeEditorGroup()?.focusWhere() ?? false,
   openGoToColumn: () => activeEditorGroup()?.openGoToColumn() ?? false,
+  openConnectionPicker: () => activeEditorGroup()?.openConnectionPicker() ?? false,
+  openDatabasePicker: () => activeEditorGroup()?.openDatabasePicker() ?? false,
+  openSchemaPicker: () => activeEditorGroup()?.openSchemaPicker() ?? false,
   openTableStructureEditor: (initialTab?: TableInfoTab) => activeEditorGroup()?.openTableStructureEditor?.(initialTab) ?? false,
   refreshData: (target: Element | null = null) => {
     const element = commandTargetElement(target);

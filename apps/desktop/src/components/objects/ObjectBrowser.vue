@@ -46,6 +46,7 @@ import {
   PencilRuler,
   Play,
   Package,
+  PanelRight,
   RefreshCw,
   RotateCcw,
   Scissors,
@@ -424,6 +425,7 @@ const showProcedureExecutionConfirm = ref(false);
 const procedureExecutionTarget = ref<ObjectBrowserRow | null>(null);
 const selectedTableIds = ref<Set<string>>(new Set());
 const tableSelectionAnchorId = ref<string | null>(null);
+const selectedRowId = ref<string | null>(null);
 const expandedPartitionParentIds = ref<Set<string>>(new Set());
 const showBatchDropConfirm = ref(false);
 const batchDropExecuting = ref(false);
@@ -543,6 +545,7 @@ const { tier: toolbarTier } = useToolbarOverflow(toolbarRef, [() => props.databa
 const showToolbarOverflow = computed(() => toolbarTier.value >= 1);
 const showInlineSortAndView = computed(() => toolbarTier.value < 1);
 const showInlineCheckboxToggle = computed(() => toolbarTier.value < 1);
+const showInlineSidePanelToggle = computed(() => toolbarTier.value < 1);
 const showInlineObjectFilter = computed(() => toolbarTier.value < 2);
 const showDatabaseChip = computed(() => toolbarTier.value < 2);
 const hasCreatedAt = computed(() => rows.value.some((row) => row.created_at?.trim()));
@@ -1162,6 +1165,7 @@ function selectTableRangeFromAnchor(row: ObjectBrowserRow) {
 }
 
 function onRowClick(row: ObjectBrowserRow, event: MouseEvent) {
+  selectedRowId.value = row.id;
   if (row.type === "TABLE" && event.shiftKey) {
     selectTableRangeFromAnchor(row);
     return;
@@ -1182,9 +1186,13 @@ function onRowClick(row: ObjectBrowserRow, event: MouseEvent) {
       clearTimeout(singleClickTimer);
       singleClickTimer = null;
     }
-    if (action !== singleClickRowAction(row, effectiveDatabaseType.value)) {
+    const firstClickRan = settingsStore.editorSettings.objectBrowserAutoOpenDetailPanel !== false;
+    if (!firstClickRan || action !== singleClickRowAction(row, effectiveDatabaseType.value)) {
       executeRowAction(row, action);
     }
+    return;
+  }
+  if (settingsStore.editorSettings.objectBrowserAutoOpenDetailPanel === false) {
     return;
   }
   // Single click: defer when the row has a distinct double-click action so a
@@ -1300,6 +1308,7 @@ const filteredTableDdlContent = computed(() => {
 });
 
 async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
+  selectedRowId.value = row.id;
   // Toggle off if clicking the same table
   if (sidePanelRow.value?.id === row.id && sidePanelMode.value === "table-info" && !initialTab) {
     closeSidePanel();
@@ -1698,7 +1707,35 @@ function closeSidePanel() {
   sidePanelGuard.bump();
 }
 
+const isSidePanelOpen = computed(() => !!sidePanelRow.value || isEventEditor.value);
+
+function toggleSidePanel() {
+  if (isSidePanelOpen.value) {
+    if (selectedRowId.value && sidePanelRow.value && sidePanelRow.value.id !== selectedRowId.value) {
+      const targetRow = filteredRows.value.find((r) => r.id === selectedRowId.value);
+      if (targetRow) {
+        executeRowAction(targetRow, singleClickRowAction(targetRow, effectiveDatabaseType.value));
+        return;
+      }
+    }
+    closeSidePanel();
+  } else {
+    const targetRow = (selectedRowId.value ? filteredRows.value.find((r) => r.id === selectedRowId.value) : null) ?? filteredRows.value[0];
+    if (targetRow) {
+      selectedRowId.value = targetRow.id;
+      executeRowAction(targetRow, singleClickRowAction(targetRow, effectiveDatabaseType.value));
+    }
+  }
+}
+
+function toggleAutoOpenDetailPanel() {
+  settingsStore.updateEditorSettings({
+    objectBrowserAutoOpenDetailPanel: settingsStore.editorSettings.objectBrowserAutoOpenDetailPanel === false,
+  });
+}
+
 async function openTypeInfo(row: ObjectBrowserRow) {
+  selectedRowId.value = row.id;
   if (sidePanelRow.value?.id === row.id && sidePanelMode.value === "type-info") {
     closeSidePanel();
     return;
@@ -1709,6 +1746,7 @@ async function openTypeInfo(row: ObjectBrowserRow) {
 }
 
 function openTypeDdl(row: ObjectBrowserRow) {
+  selectedRowId.value = row.id;
   sidePanelRow.value = row;
   sidePanelMode.value = "type-info";
   sidePanelGuard.bump();
@@ -1758,6 +1796,7 @@ async function openSource(row: ObjectBrowserRow) {
 let sourceIdentity: SourceIdentitySnapshot | undefined;
 
 async function loadSourcePanel(row: ObjectBrowserRow, options?: { preserveEditing?: boolean }) {
+  selectedRowId.value = row.id;
   // Starting a different object must invalidate slower source requests before
   // any state is reset, otherwise an old response can populate the new row.
   const epoch = sidePanelGuard.start();
@@ -1829,6 +1868,7 @@ async function refreshActiveSource() {
 }
 
 function openEventEditor(row: ObjectBrowserRow) {
+  selectedRowId.value = row.id;
   sidePanelGuard.start();
   sidePanelRow.value = row;
   sourceRow.value = null;
@@ -4256,6 +4296,7 @@ watch(
     objectBrowserRowsLoadGuard.invalidate();
     schemaListLoadGuard.invalidate();
     closeSidePanel();
+    selectedRowId.value = null;
     loadingSchemas.value = false;
     loadingObjects.value = false;
     loadingMoreObjects.value = false;
@@ -4272,6 +4313,7 @@ watch(
     userHasSelectedFilter.value = false;
     objectFilter.value = usesServerObjectPaging.value ? (props.selectedObjectFilter ?? props.initialObjectFilter ?? "tables") : "all";
     clearTableSelection();
+    selectedRowId.value = null;
     // Close side panel and invalidate any pending source/table-info requests
     // so stale results from the old context don't overwrite new state.
     closeSidePanel();
@@ -4673,6 +4715,9 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         <CheckSquare v-if="settingsStore.editorSettings.objectBrowserShowCheckbox" class="h-3.5 w-3.5" />
         <Square v-else class="h-3.5 w-3.5" />
       </Button>
+      <Button v-if="showInlineSidePanelToggle" variant="ghost" size="icon" class="h-7 w-7" :class="{ 'text-primary': isSidePanelOpen }" :title="isSidePanelOpen ? t('objects.closeDetailPanel') : t('objects.openDetailPanel')" @click="toggleSidePanel">
+        <PanelRight class="h-3.5 w-3.5" />
+      </Button>
       <Button variant="ghost" size="icon" class="h-7 w-7" :title="refreshTooltip" :disabled="loadingObjects" @click="refresh">
         <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': loadingObjects || refreshingObjects }" />
       </Button>
@@ -4712,6 +4757,11 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           {{ t("objects.viewCompact") }}
         </DropdownMenuItem>
         <DropdownMenuCheckboxItem v-if="supportsBatchTableActions" :model-value="settingsStore.editorSettings.objectBrowserShowCheckbox" @select.prevent @update:model-value="toggleCheckboxColumn()">{{ t("objects.toggleCheckbox") }}</DropdownMenuCheckboxItem>
+        <DropdownMenuItem @select="toggleSidePanel">
+          <PanelRight class="h-3.5 w-3.5" />
+          {{ isSidePanelOpen ? t("objects.closeDetailPanel") : t("objects.openDetailPanel") }}
+        </DropdownMenuItem>
+        <DropdownMenuCheckboxItem :model-value="settingsStore.editorSettings.objectBrowserAutoOpenDetailPanel !== false" @select.prevent @update:model-value="toggleAutoOpenDetailPanel()">{{ t("objects.autoOpenDetailPanel") }}</DropdownMenuCheckboxItem>
         <template v-if="showObjectFilter && toolbarTier >= 2">
           <DropdownMenuSeparator />
           <DropdownMenuCheckboxItem v-for="filter in objectFilters" :key="filter" :model-value="objectFilter === filter" @select.prevent @update:model-value="selectObjectFilter(filter)">{{ filterLabel(filter) }} </DropdownMenuCheckboxItem>
@@ -4907,10 +4957,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                 <div
                   class="grid h-[34px] cursor-default items-center gap-3 border-b px-3"
                   :class="{
-                    'bg-accent text-accent-foreground': isOpen || sourceRow?.id === item.id || sidePanelRow?.id === item.id || selectedTableIds.has(item.id),
-                    'hover:bg-accent/40': !isOpen && sourceRow?.id !== item.id && sidePanelRow?.id !== item.id && !selectedTableIds.has(item.id),
+                    'bg-accent text-accent-foreground': isOpen || sourceRow?.id === item.id || sidePanelRow?.id === item.id || selectedRowId === item.id || selectedTableIds.has(item.id),
+                    'hover:bg-accent/40': !isOpen && sourceRow?.id !== item.id && sidePanelRow?.id !== item.id && selectedRowId !== item.id && !selectedTableIds.has(item.id),
                   }"
-                  :style="{ gridTemplateColumns, boxShadow: sidePanelRow?.id === item.id && !selectedTableIds.has(item.id) ? 'inset 3px 0 0 var(--primary)' : undefined }"
+                  :style="{ gridTemplateColumns, boxShadow: (sidePanelRow?.id === item.id || selectedRowId === item.id) && !selectedTableIds.has(item.id) ? 'inset 3px 0 0 var(--primary)' : undefined }"
                   @click="onRowClick(item, $event)"
                   @contextmenu="onContextMenu"
                 >
@@ -4975,8 +5025,8 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                     v-if="isGridView"
                     class="relative flex h-full min-h-0 cursor-default flex-col items-center gap-1 rounded-lg border p-3 text-center transition-all"
                     :class="{
-                      'border-primary bg-accent shadow-sm': isOpen || sourceRow?.id === item.id || sidePanelRow?.id === item.id || selectedTableIds.has(item.id),
-                      'bg-card hover:border-primary/40 hover:bg-accent/40 hover:shadow-sm': !isOpen && sourceRow?.id !== item.id && sidePanelRow?.id !== item.id && !selectedTableIds.has(item.id),
+                      'border-primary bg-accent shadow-sm': isOpen || sourceRow?.id === item.id || sidePanelRow?.id === item.id || selectedRowId === item.id || selectedTableIds.has(item.id),
+                      'bg-card hover:border-primary/40 hover:bg-accent/40 hover:shadow-sm': !isOpen && sourceRow?.id !== item.id && sidePanelRow?.id !== item.id && selectedRowId !== item.id && !selectedTableIds.has(item.id),
                     }"
                     :title="item.displayName"
                     @click="onRowClick(item, $event)"
@@ -5018,8 +5068,8 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
                     data-object-compact-card
                     class="flex h-full min-w-0 cursor-default items-center gap-1 rounded border px-1.5 text-[11px] text-foreground transition-colors"
                     :class="{
-                      'border-primary bg-accent shadow-sm': isOpen || sourceRow?.id === item.id || sidePanelRow?.id === item.id || selectedTableIds.has(item.id),
-                      'bg-card hover:border-primary/40 hover:bg-accent/40': !isOpen && sourceRow?.id !== item.id && sidePanelRow?.id !== item.id && !selectedTableIds.has(item.id),
+                      'border-primary bg-accent shadow-sm': isOpen || sourceRow?.id === item.id || sidePanelRow?.id === item.id || selectedRowId === item.id || selectedTableIds.has(item.id),
+                      'bg-card hover:border-primary/40 hover:bg-accent/40': !isOpen && sourceRow?.id !== item.id && sidePanelRow?.id !== item.id && selectedRowId !== item.id && !selectedTableIds.has(item.id),
                     }"
                     :title="item.displayName"
                     @click="onRowClick(item, $event)"
