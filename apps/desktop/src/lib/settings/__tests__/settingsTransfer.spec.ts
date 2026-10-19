@@ -14,6 +14,17 @@ function fileWith(editor: Record<string, unknown>, overrides: Record<string, unk
 }
 
 describe("settingsTransfer", () => {
+  it("round-trips column comment placement as a data preference and rejects non-booleans", () => {
+    const text = serializeSettingsTransfer({ ...DEFAULT_EDITOR_SETTINGS, dataGridColumnCommentsInInfoArea: true, dataGridTransposeMetadataInInfoColumn: true });
+    const result = parseSettingsTransferFile(text);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.editorSettings.dataGridColumnCommentsInInfoArea).toBe(true);
+    if (result.ok) expect(result.value.editorSettings.dataGridTransposeMetadataInInfoColumn).toBe(true);
+    expect(transferCategoryForKey("dataGridTransposeMetadataInInfoColumn")).toBe("data");
+    expect(transferCategoryForKey("dataGridColumnCommentsInInfoArea")).toBe("data");
+    expect(parseSettingsTransferFile(fileWith({ dataGridColumnCommentsInInfoArea: "true" })).ok).toBe(false);
+    expect(parseSettingsTransferFile(fileWith({ dataGridTransposeMetadataInInfoColumn: "true" })).ok).toBe(false);
+  });
   it("round-trips an opt-out of comment-first result names and rejects non-booleans", () => {
     const text = serializeSettingsTransfer({ ...DEFAULT_EDITOR_SETTINGS, resultTabPreferComments: false });
     const result = parseSettingsTransferFile(text);
@@ -605,5 +616,14 @@ describe("settingsTransfer", () => {
     const result = parseSettingsTransferFile(text);
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value.editorSettings.caretBrowsingEnabled).toBe(true);
+  });
+
+  it("round-trips aiSqlApplyTargetMode and rejects invalid values (#12438)", () => {
+    expect(transferCategoryForKey("aiSqlApplyTargetMode")).toBe("editor");
+    const text = serializeSettingsTransfer({ ...DEFAULT_EDITOR_SETTINGS, aiSqlApplyTargetMode: "new" });
+    const result = parseSettingsTransferFile(text);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value.editorSettings.aiSqlApplyTargetMode).toBe("new");
+    expect(parseSettingsTransferFile(fileWith({ aiSqlApplyTargetMode: "invalid" })).ok).toBe(false);
   });
 });

@@ -107,6 +107,13 @@ export function addConfiguredAiModel(models: AiConfiguredModel[] | undefined, mo
   return [...existing, { name: id }];
 }
 
+/** Remove a manually entered model from configured models. */
+export function removeConfiguredAiModel(models: AiConfiguredModel[] | undefined, modelId: string): AiConfiguredModel[] {
+  const id = modelId.trim();
+  if (!id || !models?.length) return models ?? [];
+  return models.filter((model) => model.name.trim() !== id);
+}
+
 export type ConfigNameValidationResult = "empty" | "duplicate" | "valid";
 
 export function validateConfigName(name: string, configs: AiConfigItem[], excludeId?: string): ConfigNameValidationResult {

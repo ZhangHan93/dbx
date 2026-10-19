@@ -176,21 +176,45 @@ pub(crate) fn linux_compositing_available() -> bool {
     gtk::gdk::Screen::default().is_some_and(|screen| screen.is_composited())
 }
 
+/// Desktops where the transparent floating frame is known to render correctly. Others (notably
+/// KDE, which shows flickering or missing content with some driver/WebKitGTK combinations) keep
+/// the opaque window unless the user forces the frame on.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn should_enable_linux_floating_frame(compositing: bool, opt_in: Option<&std::ffi::OsStr>) -> bool {
-    compositing && opt_in == Some(std::ffi::OsStr::new("1"))
+fn linux_desktop_supports_floating_frame(current_desktop: Option<&std::ffi::OsStr>) -> bool {
+    current_desktop
+        .map(|value| value.to_string_lossy().split(':').any(|name| name.eq_ignore_ascii_case("GNOME")))
+        .unwrap_or(false)
+}
+
+/// `DBX_LINUX_FLOATING_FRAME=1|0` is an optional override; without it the desktop decides.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn should_enable_linux_floating_frame(
+    compositing: bool,
+    override_value: Option<&std::ffi::OsStr>,
+    current_desktop: Option<&std::ffi::OsStr>,
+) -> bool {
+    if !compositing {
+        return false;
+    }
+    match override_value.and_then(|value| value.to_str()) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => linux_desktop_supports_floating_frame(current_desktop),
+    }
 }
 
 /// The Linux config declares the main window with `create: false` so its transparency can
-/// be explicitly opted into at runtime when a compositor is available.
+/// depend at runtime on the desktop and on whether a compositor is available.
 #[cfg(target_os = "linux")]
 fn create_linux_main_window(app: &tauri::App) -> tauri::Result<()> {
     let Some(config) = app.config().app.windows.iter().find(|window| window.label == "main").cloned() else {
         return Ok(());
     };
     let compositing = linux_compositing_available();
-    let opt_in = std::env::var_os("DBX_LINUX_FLOATING_FRAME");
-    let floating_frame = should_enable_linux_floating_frame(compositing, opt_in.as_deref());
+    let override_value = std::env::var_os("DBX_LINUX_FLOATING_FRAME");
+    let current_desktop = std::env::var_os("XDG_CURRENT_DESKTOP");
+    let floating_frame =
+        should_enable_linux_floating_frame(compositing, override_value.as_deref(), current_desktop.as_deref());
     log::info!("[WINDOW] Linux main window compositing={compositing}; floating_frame={floating_frame}");
     let mut builder = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?.transparent(floating_frame);
     if floating_frame {
@@ -772,6 +796,7 @@ enum LocaleFamily {
     Indonesian,
     Italian,
     Portuguese,
+    Polish,
     Russian,
     Turkish,
 }
@@ -809,6 +834,8 @@ fn locale_family(locale: &str) -> LocaleFamily {
         LocaleFamily::Italian
     } else if is_language("pt") {
         LocaleFamily::Portuguese
+    } else if is_language("pl") {
+        LocaleFamily::Polish
     } else if is_language("ru") {
         LocaleFamily::Russian
     } else {
@@ -830,6 +857,7 @@ fn tray_menu_labels_for_locale(locale: &str) -> (&'static str, &'static str) {
         LocaleFamily::Turkish => ("DBX'i Göster", "DBX'ten Çık"),
         LocaleFamily::Portuguese => ("Mostrar DBX", "Sair do DBX"),
         LocaleFamily::Russian => ("Показать DBX", "Выйти из DBX"),
+        LocaleFamily::Polish => ("Pokaż DBX", "Zakończ DBX"),
         LocaleFamily::English => ("Show DBX", "Quit DBX"),
     }
 }
@@ -850,6 +878,7 @@ fn app_menu_copy_support_info_label(locale: &str) -> &'static str {
         LocaleFamily::Turkish => "Destek bilgilerini kopyala",
         LocaleFamily::Portuguese => "Copiar informações",
         LocaleFamily::Russian => "Копировать сведения о поддержке",
+        LocaleFamily::Polish => "Kopiuj informacje o pomocy technicznej",
         LocaleFamily::English => "Copy Support Info",
     }
 }
@@ -869,6 +898,7 @@ fn app_menu_close_tab_label(locale: &str) -> &'static str {
         LocaleFamily::Turkish => "Sekmeyi kapat",
         LocaleFamily::Portuguese => "Fechar aba",
         LocaleFamily::Russian => "Закрыть вкладку",
+        LocaleFamily::Polish => "Zamknij kartę",
         LocaleFamily::English => "Close Tab",
     }
 }
@@ -887,6 +917,7 @@ fn app_menu_quit_label(locale: &str, app_name: &str) -> String {
         LocaleFamily::Turkish => format!("{app_name} Uygulamasından Çık"),
         LocaleFamily::Portuguese => format!("Sair do {app_name}"),
         LocaleFamily::Russian => format!("Выйти из {app_name}"),
+        LocaleFamily::Polish => format!("Zakończ {app_name}"),
         LocaleFamily::English => format!("Quit {app_name}"),
     }
 }
@@ -1205,22 +1236,30 @@ mod tests {
     }
 
     #[test]
-    fn linux_floating_frame_is_disabled_by_default() {
-        assert!(!should_enable_linux_floating_frame(true, None));
-        assert!(!should_enable_linux_floating_frame(false, None));
+    fn linux_floating_frame_is_enabled_by_default_on_gnome_only() {
+        for desktop in ["GNOME", "ubuntu:GNOME", "gnome", "GNOME-Classic:GNOME"] {
+            assert!(should_enable_linux_floating_frame(true, None, Some(OsStr::new(desktop))), "{desktop}");
+        }
+        for desktop in ["KDE", "XFCE", "X-Cinnamon", "sway", "", "GNOMEISH"] {
+            assert!(!should_enable_linux_floating_frame(true, None, Some(OsStr::new(desktop))), "{desktop}");
+        }
+        assert!(!should_enable_linux_floating_frame(true, None, None));
     }
 
     #[test]
-    fn linux_floating_frame_requires_explicit_opt_in() {
-        assert!(should_enable_linux_floating_frame(true, Some(OsStr::new("1"))));
-        for value in ["", "0", "false", "true", "auto", "yes", "01"] {
-            assert!(!should_enable_linux_floating_frame(true, Some(OsStr::new(value))));
+    fn linux_floating_frame_override_wins_over_desktop() {
+        assert!(should_enable_linux_floating_frame(true, Some(OsStr::new("1")), Some(OsStr::new("KDE"))));
+        assert!(!should_enable_linux_floating_frame(true, Some(OsStr::new("0")), Some(OsStr::new("GNOME"))));
+        for value in ["", "true", "auto", "01"] {
+            assert!(should_enable_linux_floating_frame(true, Some(OsStr::new(value)), Some(OsStr::new("GNOME"))));
+            assert!(!should_enable_linux_floating_frame(true, Some(OsStr::new(value)), Some(OsStr::new("KDE"))));
         }
     }
 
     #[test]
-    fn linux_floating_frame_requires_compositing_even_when_opted_in() {
-        assert!(!should_enable_linux_floating_frame(false, Some(OsStr::new("1"))));
+    fn linux_floating_frame_requires_compositing() {
+        assert!(!should_enable_linux_floating_frame(false, Some(OsStr::new("1")), Some(OsStr::new("GNOME"))));
+        assert!(!should_enable_linux_floating_frame(false, None, Some(OsStr::new("GNOME"))));
     }
 
     #[test]
@@ -1243,6 +1282,8 @@ mod tests {
         assert_eq!(tray_menu_labels_for_locale("pt-BR"), ("Mostrar DBX", "Sair do DBX"));
         assert_eq!(tray_menu_labels_for_locale("tr-TR"), ("DBX'i Göster", "DBX'ten Çık"));
         assert_eq!(tray_menu_labels_for_locale("ru-RU"), ("Показать DBX", "Выйти из DBX"));
+        assert_eq!(tray_menu_labels_for_locale("pl-PL"), ("Pokaż DBX", "Zakończ DBX"));
+        assert_eq!(tray_menu_labels_for_locale("pl_PL"), ("Pokaż DBX", "Zakończ DBX"));
         assert_eq!(tray_menu_labels_for_locale("en-US"), ("Show DBX", "Quit DBX"));
         // Unknown and empty locales fall back to English; "ita" must not match "it".
         assert_eq!(tray_menu_labels_for_locale("ita"), ("Show DBX", "Quit DBX"));

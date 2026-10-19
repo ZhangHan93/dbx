@@ -399,6 +399,8 @@ describe("settings search", () => {
       { titleKey: "ai.maxAgentTurns", category: "ai", targetId: "ai" },
       { titleKey: "ai.maxRetriesGlobal", category: "ai", targetId: "ai" },
       { titleKey: "ai.globalInstructions", category: "ai", targetId: "ai" },
+      { titleKey: "settings.aiSqlApplyTarget", category: "editor", targetId: "editor" },
+      { titleKey: "settings.aiSqlApplyTarget", category: "ai", targetId: "ai" },
     ];
 
     for (const expectedControl of expectedControls) {

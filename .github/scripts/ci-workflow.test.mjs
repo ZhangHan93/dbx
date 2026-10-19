@@ -361,11 +361,27 @@ test("Windows compatibility jobs cache Rust compilation without wrapping C or C+
   assert.doesNotMatch(win7, /^\s+(?:CC|CXX):/m);
 });
 
-test("Win7 TLS cache keys ignore the workspace lockfile", () => {
+test("Win7 TLS artifact names ignore the workspace lockfile", () => {
   const win7 = job("windows-win7-bundle");
   assert.ok(win7.includes("hashFiles('.github/fixtures/win7-aws-lc-cache/Cargo.toml', '.github/fixtures/win7-aws-lc-cache/Cargo.lock')"));
   assert.ok(win7.includes("hashFiles('.github/fixtures/win7-openssl-cache/Cargo.toml', '.github/fixtures/win7-openssl-cache/Cargo.lock')"));
-  assert.doesNotMatch(win7, /key: win7-(?:aws-lc|openssl).*hashFiles\('Cargo\.lock'/);
+  assert.doesNotMatch(win7, /WIN7_PREBUILT_ARTIFACT_NAME: win7-(?:aws-lc|openssl).*hashFiles\('Cargo\.lock'/);
+});
+
+test("Win7 TLS artifacts come from main and retain a build fallback", () => {
+  const win7 = job("windows-win7-bundle");
+  assert.ok(win7.includes("actions: read"));
+  assert.doesNotMatch(win7, /uses: actions\/cache(?:\/restore|\/save)?@v4/);
+  for (const [name, id] of [["AWS-LC", "aws-lc-artifact"], ["OpenSSL", "openssl-artifact"]]) {
+    assert.ok(win7.includes(`if: steps.${id}.outputs.run_id != ''`));
+    assert.ok(win7.includes(`if: steps.${id}.outputs.run_id == ''`));
+    assert.ok(win7.includes(`if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.${id}.outputs.run_id == ''`));
+    assert.ok(win7.includes(`name: \${{ steps.${id}.outputs.name }}`));
+    assert.ok(win7.indexOf(`name: Find prebuilt Win7 ${name} artifact`) < win7.indexOf(`name: Download prebuilt Win7 ${name} artifact`));
+    assert.ok(win7.indexOf(`name: Download prebuilt Win7 ${name} artifact`) < win7.indexOf(`name: Build prebuilt Win7 ${name}`));
+    assert.ok(win7.indexOf(`name: Build prebuilt Win7 ${name}`) < win7.indexOf(`name: Upload prebuilt Win7 ${name} on main`));
+    assert.ok(win7.indexOf(`name: Configure prebuilt Win7 ${name}`) < win7.indexOf(`name: Upload prebuilt Win7 ${name} on main`));
+  }
 });
 
 test("path filtering and the planner use the exact test merge first parent", () => {

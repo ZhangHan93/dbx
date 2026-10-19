@@ -125,6 +125,7 @@ import { PARTITION_TREE_INDENT_PX, flattenPgPartitionNodes, pgPartitionBoundText
 import { formatBytes } from "@/lib/database/serverMetrics";
 import { hasTableStructureRefreshWork, unloadedTableStructureRefreshScope, visibleTableStructureRefreshScope, type TableStructureRefreshScope } from "@/lib/table/tableStructureMetadataLoading";
 import { canAddTableStructureColumn, getTableStructureCapabilities, hasLocalTableColumnOrderChange, isPhysicalTableColumnOrderChange, sanitizeStructureIndexesForCapabilities, supportsLocalTableColumnReorder } from "@/lib/table/tableStructureCapabilities";
+import { sortStructureIndexesByColumns, type StructureIndexColumnSort } from "@/lib/table/structureIndexSort";
 import { getConcurrentIndexAvailability, concurrentIndexNamesInStatements, normalizeUnsupportedConcurrentIndexes, type ConcurrentIndexAvailability } from "@/lib/table/concurrentIndexAvailability";
 import { orderedColumnIndexes, uniqueDataGridColumnOrderKeys } from "@/lib/dataGrid/dataGridColumnOrder";
 import { loadTableDataGridColumnOrder, notifyTableDataGridColumnOrderChanged, removeTableDataGridColumnOrder, saveTableDataGridColumnOrder, tableDataGridColumnOrderScopeKey } from "@/lib/dataGrid/dataGridColumnLayoutStorage";
@@ -590,6 +591,12 @@ let copySourceTablesRequestId = 0;
 let copySourceColumnsRequestId = 0;
 let copySourceTableSearchTimer: ReturnType<typeof setTimeout> | undefined;
 const indexes = ref<EditableStructureIndex[]>([]);
+const indexColumnSort = ref<StructureIndexColumnSort | null>(null);
+const displayedIndexes = computed(() => (indexColumnSort.value ? sortStructureIndexesByColumns(indexes.value, indexColumnSort.value) : indexes.value));
+
+function toggleIndexColumnSort() {
+  indexColumnSort.value = indexColumnSort.value === "asc" ? "desc" : indexColumnSort.value === "desc" ? null : "asc";
+}
 /** PostgreSQL partitioned parent (`relkind = 'p'`): `CREATE INDEX CONCURRENTLY`
  * is rejected by the server on such tables, so the option is disabled here and
  * the SQL builder refuses any concurrent request on it (fail closed). */
@@ -5075,7 +5082,9 @@ function scrollToIndexSearchMatch(direction: 1 | -1 = 1) {
     return;
   }
   const rows = Array.from(rootRef.value?.querySelectorAll<HTMLElement>("[data-index-row-index]") ?? []);
-  const matches = indexes.value.map((index, rowIndex) => ({ index, rowIndex })).filter(({ index }) => indexMatchesSearch(index));
+  // DOM rows render in displayedIndexes order, which differs from indexes.value
+  // once the column-list sort is active.
+  const matches = displayedIndexes.value.map((index, rowIndex) => ({ index, rowIndex })).filter(({ index }) => indexMatchesSearch(index));
   if (!matches.length) return;
   const currentIndex = highlightedIndexId.value ? matches.findIndex(({ index }) => index.id === highlightedIndexId.value) : -1;
   const nextMatch = matches[(currentIndex + direction + matches.length) % matches.length] ?? matches[0];
@@ -5414,10 +5423,12 @@ function newIndexDraft(): EditableStructureIndex {
 function addIndex() {
   if (!structureCapabilities.value.createIndex || indexesLoading.value) return;
   activeTab.value = "indexes";
-  indexes.value.push(newIndexDraft());
+  const draft = newIndexDraft();
+  indexes.value.push(draft);
   void nextTick(() => {
-    const indexRows = rootRef.value?.querySelectorAll<HTMLElement>('[data-new-index-row="true"]');
-    const row = indexRows?.[indexRows.length - 1];
+    // The sorted DOM order is not the insertion order; focus the row belonging
+    // to this draft instead of the last rendered new-index row.
+    const row = Array.from(rootRef.value?.querySelectorAll<HTMLElement>("[data-index-row-id]") ?? []).find((candidate) => candidate.dataset.indexRowId === draft.id);
     const input = row?.querySelector<HTMLInputElement>("[data-index-name-input]");
     row?.scrollIntoView({ block: "nearest" });
     input?.focus();
@@ -8159,19 +8170,24 @@ watch(
                   <th
                     v-for="(label, i) in indexColLabels"
                     :key="i"
-                    :class="[structureHeaderCellClass, { 'text-center': i === 2 || i === 7 }]"
+                    :class="[structureHeaderCellClass, { 'text-center': i === 2 || i === 7, 'cursor-pointer select-none': i === 1 }]"
+                    :aria-sort="i === 1 ? (indexColumnSort === 'asc' ? 'ascending' : indexColumnSort === 'desc' ? 'descending' : 'none') : undefined"
                     :style="{
                       width: indexColWidths[i] + 'px',
                       minWidth: indexColWidths[i] + 'px',
                     }"
+                    @click="i === 1 && toggleIndexColumnSort()"
                   >
-                    {{ label }}
-                    <div v-if="i < indexColLabels.length - 1" class="absolute right-0 top-0 z-20 h-full w-1 cursor-col-resize hover:bg-primary/30" :class="resizing?.col === i ? 'bg-primary/30' : ''" @mousedown="onIndexColResize($event, i)" />
+                    <span class="inline-flex items-center gap-1">
+                      {{ label }}
+                      <span v-if="i === 1" class="text-[10px] text-muted-foreground">{{ indexColumnSort === "asc" ? "▲" : indexColumnSort === "desc" ? "▼" : "↕" }}</span>
+                    </span>
+                    <div v-if="i < indexColLabels.length - 1" class="absolute right-0 top-0 z-20 h-full w-1 cursor-col-resize hover:bg-primary/30" :class="resizing?.col === i ? 'bg-primary/30' : ''" @mousedown="onIndexColResize($event, i)" @click.stop />
                   </th>
                 </tr>
               </thead>
               <tbody>
-                <tr v-for="(index, rowIndex) in indexes" :key="index.id" :class="indexRowClass(index)" :data-new-index-row="!index.original ? 'true' : undefined" :data-index-row-index="rowIndex">
+                <tr v-for="(index, rowIndex) in displayedIndexes" :key="index.id" :class="indexRowClass(index)" :data-index-row-id="index.id" :data-new-index-row="!index.original ? 'true' : undefined" :data-index-row-index="rowIndex">
                   <td :class="[structureCellClass, 'structure-index-name']">
                     <div class="flex min-w-0 items-center gap-1">
                       <KeyRound :class="[structureIconClass, 'structure-column-key-icon shrink-0']" :title="index.isPrimary ? 'PRIMARY' : index.isUnique ? 'UNIQUE' : index.indexType || 'INDEX'" />

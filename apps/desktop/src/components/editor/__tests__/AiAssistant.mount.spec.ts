@@ -182,6 +182,7 @@ vi.mock("@/lib/backend/api", async (importOriginal) => {
       return result ? Promise.resolve(result) : Promise.reject(new Error("readUserSkills not configured"));
     },
     loadAiConfigs: empty,
+    saveAiConfigItem: () => Promise.resolve(),
     listPlugins: empty,
     loadPromptTemplates: empty,
     getAiGlobalCustomInstructions: () => Promise.resolve(""),
@@ -615,6 +616,51 @@ describe("AiAssistant mount", () => {
     expect(trigger!.disabled).toBe(false);
     expect(trigger!.getAttribute("aria-label")).toBe(i18n.global.t("ai.skillsEntry"));
     expect(trigger!.getAttribute("title")).toBe(i18n.global.t("ai.skillsEntry"));
+    expect(errors.map(String)).toEqual([]);
+  });
+
+  it("allows deleting manually entered AI models from the model selector popover", async () => {
+    let currentSettings: any;
+    const { errors, container } = await mountPanel(true, undefined, (settings) => {
+      aiAssistantMountApi.tauriRuntime = true;
+      currentSettings = settings;
+      settings.aiConfigs = [
+        {
+          id: "cli-default",
+          name: "Claude Code",
+          provider: "claude-code-cli",
+          apiKey: "",
+          authMethod: "api-key",
+          endpoint: "",
+          model: "default",
+          models: [{ name: "my-custom-model" }],
+          apiStyle: "completions",
+          isDefault: true,
+        },
+      ];
+      settings.activeModel = { configId: "cli-default", modelId: "my-custom-model" };
+    });
+
+    const trigger = container.querySelector<HTMLButtonElement>(".ai-model-selector-trigger");
+    expect(trigger).not.toBeNull();
+    trigger!.click();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const popover = container.querySelector('[data-slot="popover-content"]');
+    expect(popover).not.toBeNull();
+
+    // Default model should not have delete button
+    expect(popover!.querySelector('[data-remove-model="default"]')).toBeNull();
+
+    // Manually added model should have delete button
+    const deleteButton = popover!.querySelector<HTMLButtonElement>('[data-remove-model="my-custom-model"]');
+    expect(deleteButton).not.toBeNull();
+
+    deleteButton!.click();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Config should have model removed
+    expect(currentSettings.aiConfigs[0].models).toEqual([]);
     expect(errors.map(String)).toEqual([]);
   });
 

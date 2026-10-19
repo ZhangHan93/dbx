@@ -346,12 +346,17 @@ fn update_existing_primary_key_columns(
     conflict_policy: TableImportConflictPolicy,
     mappings: &[TableImportColumnMapping],
     target_columns: &[crate::db::ColumnInfo],
+    db_type: &DatabaseType,
 ) -> Result<Vec<String>, String> {
     if conflict_policy != TableImportConflictPolicy::UpdateExisting {
         return Ok(Vec::new());
     }
 
-    let primary_key_columns = target_columns.iter().filter(|column| column.is_primary_key).collect::<Vec<_>>();
+    let uses_unique_key_model = matches!(db_type, DatabaseType::Doris | DatabaseType::StarRocks);
+    let primary_key_columns = target_columns
+        .iter()
+        .filter(|column| column.is_primary_key || (uses_unique_key_model && column.is_unique))
+        .collect::<Vec<_>>();
     if primary_key_columns.is_empty() {
         return Err("Update-existing import requires target primary-key metadata".to_string());
     }
@@ -7345,7 +7350,7 @@ where
         Err(_) => Vec::new(),
     };
     let primary_key_columns =
-        match update_existing_primary_key_columns(conflict_policy, &request.mappings, &target_columns) {
+        match update_existing_primary_key_columns(conflict_policy, &request.mappings, &target_columns, db_type) {
             Ok(columns) => columns,
             Err(error) => {
                 return Err(emit_import_error(&mut progress_callback, request, 0, 0, started_at, error));
@@ -8601,18 +8606,58 @@ mod tests {
             crate::db::ColumnInfo { name: "name".to_string(), ..Default::default() },
         ];
 
-        let missing_key =
-            update_existing_primary_key_columns(TableImportConflictPolicy::UpdateExisting, &mappings, &target_columns)
-                .unwrap_err();
+        let missing_key = update_existing_primary_key_columns(
+            TableImportConflictPolicy::UpdateExisting,
+            &mappings,
+            &target_columns,
+            &DatabaseType::Postgres,
+        )
+        .unwrap_err();
         assert!(missing_key.contains("id"));
 
         let missing_metadata = update_existing_primary_key_columns(
             TableImportConflictPolicy::UpdateExisting,
             &mappings,
             &[crate::db::ColumnInfo { name: "name".to_string(), ..Default::default() }],
+            &DatabaseType::Postgres,
         )
         .unwrap_err();
         assert!(missing_metadata.contains("primary-key metadata"));
+
+        let doris_unique_columns = vec![
+            crate::db::ColumnInfo {
+                name: "id".to_string(),
+                is_unique: true,
+                is_primary_key: false,
+                ..Default::default()
+            },
+            crate::db::ColumnInfo { name: "name".to_string(), ..Default::default() },
+        ];
+        // The Doris unique-key column still has to be mapped, like any key column —
+        // only the key discovery itself differs (is_unique instead of is_primary_key).
+        let mut doris_mappings = mappings.clone();
+        doris_mappings.push(TableImportColumnMapping {
+            source_column: "uid".to_string(),
+            target_column: "id".to_string(),
+            target_data_type: None,
+        });
+        let doris_keys = update_existing_primary_key_columns(
+            TableImportConflictPolicy::UpdateExisting,
+            &doris_mappings,
+            &doris_unique_columns,
+            &DatabaseType::Doris,
+        )
+        .expect("Doris unique key column should qualify as an update-existing key");
+        assert_eq!(doris_keys, vec!["id"]);
+
+        let mysql_without_pk = update_existing_primary_key_columns(
+            TableImportConflictPolicy::UpdateExisting,
+            &mappings,
+            &doris_unique_columns,
+            &DatabaseType::Mysql,
+        )
+        .unwrap_err();
+        assert!(mysql_without_pk.contains("primary-key metadata"));
 
         let unsupported =
             validate_update_existing_target(TableImportConflictPolicy::UpdateExisting, &DatabaseType::Oracle, false)

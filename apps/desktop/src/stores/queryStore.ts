@@ -4118,10 +4118,11 @@ export const useQueryStore = defineStore("query", () => {
         return suffix ? Math.max(highest, Number(suffix[1])) : highest;
       }, 0) + 1;
     const baseTitle = options.title || contributionId;
+    const title = siblingTabs.length >= 1 ? `${baseTitle} (${nextSessionNumber})` : baseTitle;
     const id = uuid();
     const tab: QueryTab = {
       id,
-      title: siblingTabs.length >= 1 ? `${baseTitle} (${nextSessionNumber})` : baseTitle,
+      title,
       connectionId,
       database: options.database || "",
       sql: "",
@@ -4133,6 +4134,7 @@ export const useQueryStore = defineStore("query", () => {
         commandId: options.commandId,
         pluginId,
         contributionId,
+        defaultTitle: title,
         context: options.context ? snapshotPluginWorkbenchContext(options.context) : undefined,
       },
     };
@@ -4161,7 +4163,30 @@ export const useQueryStore = defineStore("query", () => {
       if (!localizedTitle) continue;
       const suffix = / \((\d+)\)$/.exec(tab.title)?.[0] || "";
       tab.title = `${localizedTitle}${suffix}`;
+      if (tab.pluginWorkbench) {
+        tab.pluginWorkbench.defaultTitle = tab.title;
+      }
     }
+  }
+
+  function setPluginWorkbenchTabTitle(id: string, title: string | null): boolean {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab || tab.mode !== "plugin-workbench" || !tab.pluginWorkbench) return false;
+    const trimmed = typeof title === "string" ? title.trim().slice(0, 256) : "";
+    if (trimmed) {
+      tab.title = trimmed;
+      tab.customTitle = true;
+    } else {
+      tab.title = tab.pluginWorkbench.defaultTitle || tab.pluginWorkbench.contributionId;
+      tab.customTitle = false;
+    }
+    return true;
+  }
+
+  function getPluginWorkbenchTabTitle(id: string): string | undefined {
+    const tab = tabs.value.find((t) => t.id === id);
+    if (!tab || tab.mode !== "plugin-workbench") return undefined;
+    return tab.title;
   }
 
   function openPluginFilesystem(pluginId: string, providerId: string, options: { title?: string; connectionId?: string; rootUri?: string; currentUri?: string; forceNew?: boolean } = {}) {
@@ -10722,6 +10747,8 @@ export const useQueryStore = defineStore("query", () => {
     openMqttAdmin,
     openNacosAdmin,
     openPluginWorkbench,
+    setPluginWorkbenchTabTitle,
+    getPluginWorkbenchTabTitle,
     pluginWorkbenchTitles,
     localizePluginTabTitles,
     openPluginFilesystem,

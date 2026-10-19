@@ -9,6 +9,7 @@ import { normalizeSqlTableCompletionSchemaQualification } from "@/lib/sql/sqlCom
 import { normalizeTableHoverLookupMode } from "@/lib/editor/hoverTableLookup";
 import { normalizeRedisKeyTemplates } from "@/lib/redis/redisKeyTemplates";
 import { normalizeCsvNullMode } from "@/lib/export/csvNullMode";
+import { normalizeAiSqlApplyTargetMode } from "@/lib/ai/aiSqlTargetTab";
 
 export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "fontFamily",
@@ -49,6 +50,7 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "confirmUnsavedSqlClose",
   "appCloseUnsavedTabsMode",
   "savedSqlOpenTargetMode",
+  "aiSqlApplyTargetMode",
   "welcomePageMode",
   "appLayout",
   "webLogoPosition",
@@ -59,12 +61,14 @@ export const EDITOR_SETTINGS_DRAFT_KEYS = [
   "tabSortMode",
   "tabMaxWidth",
   "showColumnCommentsInHeader",
+  "dataGridColumnCommentsInInfoArea",
   "showColumnTypesInHeader",
   "showColumnHeaderTooltips",
   "showResultSourceDatabase",
   "resultTabNamingMode",
   "resultTabPreferComments",
   "dataGridShowTransposeFieldMetadata",
+  "dataGridTransposeMetadataInInfoColumn",
   "colorizeDataGridCellTypes",
   "dataGridTypeColorSchemes",
   "activeDataGridTypeColorSchemeId",
@@ -203,6 +207,7 @@ function normalizedDraftValue(key: EditorSettingsDraftKey, value: unknown): unkn
   if (key === "backgroundImage") return normalizeBackgroundImageSettings(value);
   if (key === "snippetTriggerKey") return value === "space" || value === "both" ? value : "tab";
   if (key === "webLogoPosition") return value === "right" || value === "hidden" ? value : "left";
+  if (key === "aiSqlApplyTargetMode") return normalizeAiSqlApplyTargetMode(value);
   return value;
 }
 

@@ -75,6 +75,15 @@ describe("normalizeEditorSettings", () => {
     expect(normalizeEditorSettings({ queryResultExportFileNameSource: undefined }).queryResultExportFileNameSource).toBe("result-label");
   });
 
+  it("defaults aiSqlApplyTargetMode to current and validates options (#12438)", () => {
+    expect(DEFAULT_EDITOR_SETTINGS.aiSqlApplyTargetMode).toBe("current");
+    expect(normalizeEditorSettings({}).aiSqlApplyTargetMode).toBe("current");
+    expect(normalizeEditorSettings({ aiSqlApplyTargetMode: "current" }).aiSqlApplyTargetMode).toBe("current");
+    expect(normalizeEditorSettings({ aiSqlApplyTargetMode: "first" }).aiSqlApplyTargetMode).toBe("first");
+    expect(normalizeEditorSettings({ aiSqlApplyTargetMode: "new" }).aiSqlApplyTargetMode).toBe("new");
+    expect(normalizeEditorSettings({ aiSqlApplyTargetMode: "invalid" as any }).aiSqlApplyTargetMode).toBe("current");
+  });
+
   it("defaults caretBrowsingEnabled to false and normalizes boolean values (#11827)", () => {
     expect(DEFAULT_EDITOR_SETTINGS.caretBrowsingEnabled).toBe(false);
     expect(normalizeEditorSettings({}).caretBrowsingEnabled).toBe(false);
@@ -2444,6 +2453,20 @@ describe("settingsStore activeModel lifecycle", () => {
     // 核心保障：不改变任何配置的 isDefault
     expect(store.aiConfigs[0].isDefault).toBe(true);
     expect(store.aiConfigs[1].isDefault).toBe(false);
+  });
+
+  it("updateActiveModel(null) clears the active model when the last model is deleted", async () => {
+    const { useSettingsStore } = await import("@/stores/settingsStore");
+    const store = useSettingsStore();
+
+    store.aiConfigs = [makeTestConfig({ id: "c1", model: "model-a", isDefault: true })];
+    store.isAiConfigLoaded = true;
+
+    store.updateActiveModel({ configId: "c1", modelId: "model-a" });
+    expect(store.activeModel).toEqual({ configId: "c1", modelId: "model-a" });
+
+    store.updateActiveModel(null);
+    expect(store.activeModel).toBeNull();
   });
 
   it("setDefaultAiConfig(id) changes the fallback config without replacing the active model", async () => {

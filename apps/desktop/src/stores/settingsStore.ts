@@ -22,6 +22,7 @@ import { normalizeExternalSqlEditorMaxMb } from "@/lib/sql/sqlFileOpen";
 import { DEFAULT_QUERY_TIMEOUT_SECS, normalizeConnectTimeoutSecs, normalizeQueryTimeoutSecs } from "@/lib/connection/timeoutLimits";
 import { needsTabNavigationHistoryShortcutMigration, normalizeShortcutSettings, isReservedShortcut, type ShortcutSettings } from "@/lib/editor/shortcutRegistry";
 import type { SavedSqlOpenTargetMode } from "@/lib/savedSql/savedSqlExecutionTarget";
+import { type AiSqlApplyTargetMode, normalizeAiSqlApplyTargetMode } from "@/lib/ai/aiSqlTargetTab";
 import type { ConnectionListSortMode } from "@/lib/sidebar/connectionListSort";
 import { type ColumnNameCopySeparator } from "@/lib/dataGrid/dataGridColumnNameCopy";
 import { normalizeRedisValuePreviewLimitKiB, REDIS_VALUE_PREVIEW_LIMIT_KIB_DEFAULT } from "@/lib/redis/redisValuePreviewLimit";
@@ -65,6 +66,7 @@ export type {
   DataTabReuseMode,
   QueryResultExportFileNameSource,
   SavedSqlOpenTargetMode,
+  AiSqlApplyTargetMode,
   SqlCompletionTriggerMode,
   SqlTableCompletionSchemaQualification,
   TableHoverLookupMode,
@@ -1004,6 +1006,7 @@ export interface EditorSettings {
   confirmUnsavedSqlClose: boolean;
   appCloseUnsavedTabsMode: AppCloseUnsavedTabsMode;
   savedSqlOpenTargetMode: SavedSqlOpenTargetMode;
+  aiSqlApplyTargetMode: AiSqlApplyTargetMode;
   welcomePageMode: WelcomePageMode;
   welcomePageModeDefaultVersion: number;
   compactTabTitle: boolean;
@@ -1035,6 +1038,7 @@ export interface EditorSettings {
   autoCalculateTotalRows: boolean;
   mongoViewMode: "document" | "table";
   showColumnCommentsInHeader: boolean;
+  dataGridColumnCommentsInInfoArea: boolean;
   showColumnTypesInHeader: boolean;
   showColumnHeaderTooltips: boolean;
   /** 结果集页签/结果列表的名称是否带上库名（关闭后只显示表名，完整名称仍在悬浮提示中）。 */
@@ -1073,6 +1077,7 @@ export interface EditorSettings {
   /** Prefer SQL preamble comments in source naming mode, preserving the original naming behavior. */
   resultTabPreferComments: boolean;
   dataGridShowTransposeFieldMetadata: boolean;
+  dataGridTransposeMetadataInInfoColumn: boolean;
   colorizeDataGridCellTypes: boolean;
   dataGridTypeColorSchemes: DataGridTypeColorScheme[];
   activeDataGridTypeColorSchemeId: string;
@@ -1380,6 +1385,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   confirmUnsavedSqlClose: true,
   appCloseUnsavedTabsMode: "keep-drafts",
   savedSqlOpenTargetMode: "saved",
+  aiSqlApplyTargetMode: "current",
   welcomePageMode: "workspace",
   welcomePageModeDefaultVersion: WELCOME_PAGE_DEFAULT_VERSION,
   compactTabTitle: true,
@@ -1409,6 +1415,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   autoCalculateTotalRows: false,
   mongoViewMode: "document",
   showColumnCommentsInHeader: true,
+  dataGridColumnCommentsInInfoArea: false,
   showColumnTypesInHeader: true,
   showColumnHeaderTooltips: true,
   showResultSourceDatabase: true,
@@ -1420,6 +1427,7 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   resultTabNamingMode: "source",
   resultTabPreferComments: true,
   dataGridShowTransposeFieldMetadata: false,
+  dataGridTransposeMetadataInInfoColumn: false,
   colorizeDataGridCellTypes: false,
   dataGridTypeColorSchemes: [],
   activeDataGridTypeColorSchemeId: DATA_GRID_TYPE_COLOR_SCHEME_AUTO_ID,
@@ -2043,6 +2051,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     confirmUnsavedSqlClose: settings.confirmUnsavedSqlClose ?? DEFAULT_EDITOR_SETTINGS.confirmUnsavedSqlClose,
     appCloseUnsavedTabsMode: normalizeAppCloseUnsavedTabsMode(settings.appCloseUnsavedTabsMode),
     savedSqlOpenTargetMode: settings.savedSqlOpenTargetMode === "current" ? "current" : DEFAULT_EDITOR_SETTINGS.savedSqlOpenTargetMode,
+    aiSqlApplyTargetMode: normalizeAiSqlApplyTargetMode(settings.aiSqlApplyTargetMode, DEFAULT_EDITOR_SETTINGS.aiSqlApplyTargetMode),
     welcomePageMode: hasCurrentWelcomePageDefault && (settings.welcomePageMode === "intro" || settings.welcomePageMode === "workspace") ? settings.welcomePageMode : DEFAULT_EDITOR_SETTINGS.welcomePageMode,
     welcomePageModeDefaultVersion,
     compactTabTitle: hasCurrentCompactTabTitleDefault ? settings.compactTabTitle === true : DEFAULT_EDITOR_SETTINGS.compactTabTitle,
@@ -2072,6 +2081,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     autoCalculateTotalRows: settings.autoCalculateTotalRows ?? DEFAULT_EDITOR_SETTINGS.autoCalculateTotalRows,
     mongoViewMode: settings.mongoViewMode === "table" ? "table" : DEFAULT_EDITOR_SETTINGS.mongoViewMode,
     showColumnCommentsInHeader: settings.showColumnCommentsInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnCommentsInHeader,
+    dataGridColumnCommentsInInfoArea: settings.dataGridColumnCommentsInInfoArea ?? DEFAULT_EDITOR_SETTINGS.dataGridColumnCommentsInInfoArea,
     showColumnTypesInHeader: settings.showColumnTypesInHeader ?? DEFAULT_EDITOR_SETTINGS.showColumnTypesInHeader,
     showColumnHeaderTooltips: settings.showColumnHeaderTooltips ?? DEFAULT_EDITOR_SETTINGS.showColumnHeaderTooltips,
     showResultSourceDatabase: settings.showResultSourceDatabase ?? DEFAULT_EDITOR_SETTINGS.showResultSourceDatabase,
@@ -2083,6 +2093,7 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     resultTabNamingMode: normalizeResultTabNamingMode(settings.resultTabNamingMode),
     resultTabPreferComments: settings.resultTabPreferComments !== false,
     dataGridShowTransposeFieldMetadata: settings.dataGridShowTransposeFieldMetadata === true,
+    dataGridTransposeMetadataInInfoColumn: settings.dataGridTransposeMetadataInInfoColumn === true,
     colorizeDataGridCellTypes: settings.colorizeDataGridCellTypes ?? DEFAULT_EDITOR_SETTINGS.colorizeDataGridCellTypes,
     dataGridTypeColorSchemes,
     activeDataGridTypeColorSchemeId: normalizeActiveDataGridTypeColorSchemeId(dataGridTypeColorSchemes, settings.activeDataGridTypeColorSchemeId),
@@ -2710,11 +2721,8 @@ export const useSettingsStore = defineStore("settings", () => {
     });
   }
 
-  function updateActiveModel(model: { configId: string; modelId: string }) {
-    activeModel.value = {
-      configId: model.configId,
-      modelId: model.modelId.trim(),
-    };
+  function updateActiveModel(model: { configId: string; modelId: string } | null) {
+    activeModel.value = model ? { configId: model.configId, modelId: model.modelId.trim() } : null;
     persistAiChatSelection();
   }
 
@@ -2936,6 +2944,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.confirmUnsavedSqlClose !== undefined) editorSettings.value.confirmUnsavedSqlClose = partial.confirmUnsavedSqlClose;
     if (partial.appCloseUnsavedTabsMode !== undefined) editorSettings.value.appCloseUnsavedTabsMode = normalizeAppCloseUnsavedTabsMode(partial.appCloseUnsavedTabsMode);
     if (partial.savedSqlOpenTargetMode !== undefined) editorSettings.value.savedSqlOpenTargetMode = partial.savedSqlOpenTargetMode === "current" ? "current" : "saved";
+    if (partial.aiSqlApplyTargetMode !== undefined) editorSettings.value.aiSqlApplyTargetMode = normalizeAiSqlApplyTargetMode(partial.aiSqlApplyTargetMode, DEFAULT_EDITOR_SETTINGS.aiSqlApplyTargetMode);
     if (partial.welcomePageMode !== undefined) editorSettings.value.welcomePageMode = partial.welcomePageMode === "intro" || partial.welcomePageMode === "workspace" ? partial.welcomePageMode : DEFAULT_EDITOR_SETTINGS.welcomePageMode;
     if (partial.compactTabTitle !== undefined) {
       editorSettings.value.compactTabTitle = partial.compactTabTitle;
@@ -2969,6 +2978,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.autoCalculateTotalRows !== undefined) editorSettings.value.autoCalculateTotalRows = partial.autoCalculateTotalRows === true;
     if (partial.mongoViewMode !== undefined) editorSettings.value.mongoViewMode = partial.mongoViewMode;
     if (partial.showColumnCommentsInHeader !== undefined) editorSettings.value.showColumnCommentsInHeader = partial.showColumnCommentsInHeader;
+    if (partial.dataGridColumnCommentsInInfoArea !== undefined) editorSettings.value.dataGridColumnCommentsInInfoArea = partial.dataGridColumnCommentsInInfoArea;
     if (partial.showColumnTypesInHeader !== undefined) editorSettings.value.showColumnTypesInHeader = partial.showColumnTypesInHeader;
     if (partial.showColumnHeaderTooltips !== undefined) editorSettings.value.showColumnHeaderTooltips = partial.showColumnHeaderTooltips;
     if (partial.showResultSourceDatabase !== undefined) editorSettings.value.showResultSourceDatabase = partial.showResultSourceDatabase;
@@ -2980,6 +2990,7 @@ export const useSettingsStore = defineStore("settings", () => {
     if (partial.resultTabNamingMode !== undefined) editorSettings.value.resultTabNamingMode = normalizeResultTabNamingMode(partial.resultTabNamingMode);
     if (partial.resultTabPreferComments !== undefined) editorSettings.value.resultTabPreferComments = partial.resultTabPreferComments !== false;
     if (partial.dataGridShowTransposeFieldMetadata !== undefined) editorSettings.value.dataGridShowTransposeFieldMetadata = partial.dataGridShowTransposeFieldMetadata === true;
+    if (partial.dataGridTransposeMetadataInInfoColumn !== undefined) editorSettings.value.dataGridTransposeMetadataInInfoColumn = partial.dataGridTransposeMetadataInInfoColumn === true;
     if (partial.colorizeDataGridCellTypes !== undefined) editorSettings.value.colorizeDataGridCellTypes = partial.colorizeDataGridCellTypes === true;
     if (partial.dataGridTypeColorSchemes !== undefined) {
       editorSettings.value.dataGridTypeColorSchemes = normalizeDataGridTypeColorSchemes(partial.dataGridTypeColorSchemes);

@@ -38,6 +38,7 @@ vi.mock("@/stores/connectionStore", () => ({
       if (id === "connection-1") return { id, name: "SQLite", db_type: "sqlite" };
       if (id === "postgres-1") return { id, name: "PostgreSQL", db_type: "postgres" };
       if (id === "sqlserver-1") return { id, name: "SQL Server", db_type: "sqlserver" };
+      if (id === "doris-1") return { id, name: "Doris", db_type: "doris" };
       return undefined;
     },
     ensureConnected: mocks.ensureConnected,
@@ -467,6 +468,110 @@ describe("TableImportDialog existing targets", () => {
     const updateOption = document.body.querySelector<HTMLOptionElement>('option[value="updateExisting"]');
     expect(updateOption?.disabled).toBe(true);
     expect(document.body.textContent).toContain("requires primary-key metadata");
+  });
+
+  it("recognizes Doris unique-key columns as primary keys for update-existing", async () => {
+    mocks.getColumns.mockResolvedValueOnce([
+      { name: "id", data_type: "BIGINT", nullable: false, is_primary_key: false, is_unique: true },
+      { name: "name", data_type: "VARCHAR", nullable: true, is_primary_key: false, is_unique: false },
+    ]);
+    i18n.global.locale.value = "en";
+    await mountDialog({ connectionId: "doris-1", database: "analytics" });
+    await selectWorkbook();
+    buttonContaining("Existing table")?.click();
+    await flushAsyncUpdates();
+    await selectExistingTarget("existing_target");
+    await vi.waitFor(() => expect(buttonContaining("Next")?.disabled).toBe(false));
+
+    const policySelect = document.body.querySelector<HTMLSelectElement>('[data-testid="table-import-conflict-policy"]');
+    expect(policySelect).toBeTruthy();
+    const updateOption = policySelect?.querySelector<HTMLOptionElement>('option[value="updateExisting"]');
+    await vi.waitFor(() => expect(updateOption?.disabled, document.body.textContent || "").toBe(false));
+    if (policySelect) {
+      policySelect.value = "updateExisting";
+      policySelect.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    await flushAsyncUpdates();
+
+    buttonContaining("Next")?.click();
+    await flushAsyncUpdates();
+    buttonContaining("Next")?.click();
+    await flushAsyncUpdates();
+    buttonContaining("Start Import")?.click();
+    await flushAsyncUpdates();
+
+    expect(mocks.importTableFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "doris-1",
+        conflictPolicy: "updateExisting",
+        skipDuplicateRows: false,
+      }),
+      expect.any(Function),
+    );
+  });
+
+  it("allows selecting update-existing on options step when target has keys even if preview columns are initially unmapped, and guards mapping step", async () => {
+    mocks.previewTableImportFile.mockResolvedValueOnce({
+      fileName: "unmapped.xlsx",
+      filePath: "/tmp/unmapped.xlsx",
+      fileType: "excel",
+      sizeBytes: 24,
+      columns: ["other_code", "name"],
+      rows: [[1, "Alice"]],
+      totalRows: 1,
+      sourceFingerprint: "unmapped-xlsx",
+      sheets: ["Data"],
+    });
+    i18n.global.locale.value = "en";
+    await mountDialog({ connectionId: "doris-1", database: "analytics" });
+    await selectWorkbook();
+    buttonContaining("Existing table")?.click();
+    await flushAsyncUpdates();
+    await selectExistingTarget("existing_target");
+    await vi.waitFor(() => expect(buttonContaining("Next")?.disabled).toBe(false));
+
+    const policySelect = document.body.querySelector<HTMLSelectElement>('[data-testid="table-import-conflict-policy"]');
+    expect(policySelect).toBeTruthy();
+    const updateOption = policySelect?.querySelector<HTMLOptionElement>('option[value="updateExisting"]');
+    // On options step, the option is enabled because target table has unique/primary key
+    expect(updateOption?.disabled).toBe(false);
+    if (policySelect) {
+      policySelect.value = "updateExisting";
+      policySelect.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    await flushAsyncUpdates();
+
+    buttonContaining("Next")?.click();
+    await flushAsyncUpdates();
+
+    // Now in mapping step: column mapping hasn't mapped the primary key yet,
+    // so error is displayed and proceeding is guarded
+    expect(document.body.textContent).toContain("Map every primary-key column to update conflicts. Missing: id");
+    expect(buttonContaining("Next")?.disabled).toBe(true);
+
+    // Map other_code -> id
+    const mappings = Array.from(document.body.querySelectorAll<HTMLSelectElement>("select"));
+    if (mappings[0]) {
+      mappings[0].value = "id";
+      mappings[0].dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    await flushAsyncUpdates();
+
+    // Now mapping is valid, so Next becomes enabled
+    expect(buttonContaining("Next")?.disabled).toBe(false);
+    buttonContaining("Next")?.click();
+    await flushAsyncUpdates();
+    buttonContaining("Start Import")?.click();
+    await flushAsyncUpdates();
+
+    expect(mocks.importTableFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connectionId: "doris-1",
+        conflictPolicy: "updateExisting",
+        skipDuplicateRows: false,
+      }),
+      expect.any(Function),
+    );
   });
 
   it("allows selecting target schema on schema-aware databases and reloads tables", async () => {

@@ -43,6 +43,12 @@ function makeSettings(overrides: Partial<EditorSettings> = {}): EditorSettings {
 }
 
 describe("EDITOR_SETTINGS_DRAFT_KEYS", () => {
+  it("captures and saves the column comment placement preference", () => {
+    const base = editorSettingsDraftFromSettings(makeSettings({ dataGridColumnCommentsInInfoArea: false, dataGridTransposeMetadataInInfoColumn: false }));
+    const draft = editorSettingsDraftFromSettings(makeSettings({ dataGridColumnCommentsInInfoArea: true, dataGridTransposeMetadataInInfoColumn: true }));
+    expect(draft.dataGridColumnCommentsInInfoArea).toBe(true);
+    expect(editorSettingsPatchFromDraft(draft, base)).toEqual({ dataGridColumnCommentsInInfoArea: true, dataGridTransposeMetadataInInfoColumn: true });
+  });
   it("keeps connection and query timeout ownership outside editor settings", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).not.toContain("globalConnectTimeoutSecs");
     expect(EDITOR_SETTINGS_DRAFT_KEYS).not.toContain("globalQueryTimeoutSecs");
@@ -81,6 +87,12 @@ describe("EDITOR_SETTINGS_DRAFT_KEYS", () => {
 
   it("includes the saved SQL open target mode", () => {
     expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("savedSqlOpenTargetMode");
+  });
+
+  it("includes aiSqlApplyTargetMode (#12438)", () => {
+    expect(EDITOR_SETTINGS_DRAFT_KEYS).toContain("aiSqlApplyTargetMode");
+    const draft = editorSettingsDraftFromSettings(makeSettings({ aiSqlApplyTargetMode: "new" } as Partial<EditorSettings>));
+    expect(draft.aiSqlApplyTargetMode).toBe("new");
   });
 
   it("includes the privacy-safe welcome page mode", () => {

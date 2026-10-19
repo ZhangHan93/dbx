@@ -192,7 +192,7 @@ import {
 } from "@/lib/ai/desktopAiRunRegistry";
 import { createDesktopAiRunSnapshotScheduler } from "@/lib/ai/desktopAiRunSnapshotScheduler";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
-import { addConfiguredAiModel, aiModelOptions } from "@/lib/ai/aiConfigList";
+import { addConfiguredAiModel, aiModelOptions, removeConfiguredAiModel } from "@/lib/ai/aiConfigList";
 import { orderAiConfigsForDisplay } from "@/lib/ai/aiConfigOrdering";
 import { effortSelectionEquals, runtimeEffortFromPreference } from "@/lib/ai/aiEffortPreference";
 import { useAiModelCatalog } from "@/composables/useAiModelCatalog";
@@ -1733,12 +1733,47 @@ async function applyManualModel(configId: string) {
   const config = settings.aiConfigs.find((item) => item.id === configId);
   if (!config) return;
   try {
-    if (config.model.trim() !== modelId) {
-      await settings.updateAiConfigItem(configId, { models: addConfiguredAiModel(config.models, modelId) });
-    }
+    await settings.updateAiConfigItem(configId, { models: addConfiguredAiModel(config.models, modelId) });
     handleModelSelect(configId, modelId);
     manualModelConfigId.value = "";
     manualModelId.value = "";
+  } catch (error) {
+    toast(translateBackendError(t, error));
+  }
+}
+
+function canRemoveModel(config: AiConfigItem, modelId: string): boolean {
+  if (isCliProvider(config.provider) && modelId === "default") return false;
+  const isDiscovered = (modelCatalogs.get(config.id)?.models ?? []).some((m) => m.id === modelId);
+  if (isDiscovered) return false;
+  const preset = getAiProviderPreset(config.provider, config.endpoint);
+  if (preset.group === "partner" && (preset.models ?? []).some((m) => m.name.trim() === modelId)) {
+    return false;
+  }
+  return (config.models ?? []).some((m) => m.name.trim() === modelId);
+}
+
+async function handleRemoveModel(configId: string, modelId: string) {
+  const config = settings.aiConfigs.find((item) => item.id === configId);
+  if (!config) return;
+  const nextModels = removeConfiguredAiModel(config.models, modelId);
+  const updates: Partial<AiConfigItem> = { models: nextModels };
+  if (config.model.trim() === modelId) {
+    updates.model = isCliProvider(config.provider) ? "default" : (nextModels[0]?.name ?? "");
+  }
+  try {
+    await settings.updateAiConfigItem(configId, updates);
+    if (settings.activeModel?.configId === configId && settings.activeModel?.modelId === modelId) {
+      const remaining = aiModelOptions({ ...config, ...updates }, modelCatalogs.get(configId)?.models ?? []);
+      const nextActiveModelId = remaining[0]?.id;
+      if (nextActiveModelId) {
+        handleModelSelect(configId, nextActiveModelId);
+      } else {
+        settings.updateActiveModel(null);
+      }
+    }
+    effortCatalogs.delete(effortKey(configId, modelId));
+    closeEffortMenu();
   } catch (error) {
     toast(translateBackendError(t, error));
   }
@@ -7717,20 +7752,31 @@ async function openExternalUrl(url: string) {
                           {{ modelSearchQuery.trim() ? t("ai.noModelMatch") : t("ai.noModels") }}
                         </div>
                         <template v-if="getConfigModelOptions(config).length">
-                          <button
+                          <div
                             v-for="model in getConfigModelOptions(config)"
                             :key="model.id"
-                            type="button"
-                            class="flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-xs hover:bg-accent hover:text-accent-foreground"
+                            class="group/model flex w-full items-center gap-1.5 rounded-sm px-2 py-1 text-left text-xs hover:bg-accent hover:text-accent-foreground"
                             :class="model.id === settings.activeModel?.modelId && config.id === settings.activeModel?.configId ? 'bg-accent text-accent-foreground' : ''"
-                            @click="handleModelSelect(config.id, model.id)"
                           >
-                            <span class="min-w-0 flex-1 truncate">
-                              {{ model.displayName || model.id }}
-                              <span v-if="model.displayName && model.displayName !== model.id" class="ml-1 text-[10px] text-muted-foreground">{{ model.id }}</span>
-                            </span>
-                            <Check v-if="model.id === settings.activeModel?.modelId && config.id === settings.activeModel?.configId" class="h-3.5 w-3.5 shrink-0 text-primary" />
-                          </button>
+                            <button type="button" class="flex min-w-0 flex-1 items-center gap-2 py-0.5 text-left" :data-model-id="model.id" @click="handleModelSelect(config.id, model.id)">
+                              <span class="min-w-0 flex-1 truncate">
+                                {{ model.displayName || model.id }}
+                                <span v-if="model.displayName && model.displayName !== model.id" class="ml-1 text-[10px] text-muted-foreground">{{ model.id }}</span>
+                              </span>
+                              <Check v-if="model.id === settings.activeModel?.modelId && config.id === settings.activeModel?.configId" class="h-3.5 w-3.5 shrink-0 text-primary" />
+                            </button>
+                            <button
+                              v-if="canRemoveModel(config, model.id)"
+                              type="button"
+                              class="rounded p-0.5 text-muted-foreground opacity-0 transition-opacity hover:text-destructive focus-visible:opacity-100 group-hover/model:opacity-100"
+                              :title="t('common.delete')"
+                              :aria-label="t('common.delete')"
+                              :data-remove-model="model.id"
+                              @click.stop="handleRemoveModel(config.id, model.id)"
+                            >
+                              <X class="h-3 w-3 shrink-0" />
+                            </button>
+                          </div>
                         </template>
                         <div v-if="getModelCatalog(config.id).status === 'error' && getModelsForConfig(config.id).length" class="flex items-center justify-between gap-2 px-2 py-1 text-[10px] text-muted-foreground">
                           <span class="truncate" :title="getModelCatalog(config.id).error">{{ t("ai.modelLoadFailed") }}</span>

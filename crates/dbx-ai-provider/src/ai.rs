@@ -1944,6 +1944,7 @@ fn ai_endpoint_is_loopback(config: &AiConfig) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
+    let host = host.strip_prefix('[').and_then(|host| host.strip_suffix(']')).unwrap_or(host);
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().map(|addr| addr.is_loopback()).unwrap_or(false)
 }
 
@@ -1952,7 +1953,10 @@ pub fn build_ai_http_client(config: &AiConfig, timeout_secs: u64) -> Result<reqw
     if config.skip_tls_verify {
         builder = builder.danger_accept_invalid_certs(true);
     }
-    if config.proxy_enabled && !config.proxy_url.trim().is_empty() && !ai_endpoint_is_loopback(config) {
+    if ai_endpoint_is_loopback(config) {
+        // Skipping an explicit proxy alone still allows environment and system proxies.
+        builder = builder.no_proxy();
+    } else if config.proxy_enabled && !config.proxy_url.trim().is_empty() {
         let proxy_url = normalize_ai_proxy_url(&config.proxy_url);
         let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| format!("Invalid AI proxy URL: {e}"))?;
         builder = builder.proxy(proxy);
@@ -6384,6 +6388,29 @@ mod tests {
         config.skip_tls_verify = true;
 
         build_ai_http_client(&config, 1).unwrap();
+    }
+
+    #[test]
+    fn ai_http_client_identifies_loopback_endpoints() {
+        for (endpoint, expected) in [
+            ("http://localhost:3456/v1", true),
+            ("http://LOCALHOST:3456/v1", true),
+            ("http://127.0.0.1:3456/v1", true),
+            ("http://127.12.34.56:3456/v1", true),
+            ("http://[::1]:3456/v1", true),
+            ("http://192.168.1.2:3456/v1", false),
+            ("http://10.0.0.1:3456/v1", false),
+            ("http://[fd00::1]:3456/v1", false),
+            ("https://api.example.com/v1", false),
+            ("http://localhost.example.com/v1", false),
+            ("invalid endpoint", false),
+        ] {
+            let config: AiConfig = serde_json::from_value(serde_json::json!({
+                "provider": "openai-compatible", "endpoint": endpoint
+            }))
+            .unwrap();
+            assert_eq!(super::ai_endpoint_is_loopback(&config), expected, "{endpoint}");
+        }
     }
 
     #[test]

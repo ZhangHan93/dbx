@@ -1,4 +1,3 @@
-use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -18,14 +17,6 @@ use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
 use crate::models::connection::DatabaseConnectionInfo;
 
 type PendingAgentResponse = tokio::sync::oneshot::Sender<Result<Value, String>>;
-type AgentDecodedResult = Box<dyn Any + Send>;
-type AgentResultDecoder = fn(Value) -> Result<AgentDecodedResult, String>;
-
-fn deserialize_agent_result<T: DeserializeOwned + Send + 'static>(value: Value) -> Result<AgentDecodedResult, String> {
-    serde_json::from_value::<T>(value)
-        .map(|result| Box::new(result) as AgentDecodedResult)
-        .map_err(|error| format!("Failed to deserialize agent result: {error}"))
-}
 
 #[derive(Clone)]
 struct CachedAgentQuery {
@@ -1818,26 +1809,6 @@ impl AgentDriverClient {
         timeout_duration: Option<Duration>,
         cancel_token: Option<CancellationToken>,
     ) -> Result<T, AgentCallError> {
-        let result = self
-            .call_decoded_with_timeout_and_cancel(
-                method,
-                params,
-                timeout_duration,
-                cancel_token,
-                deserialize_agent_result::<T>,
-            )
-            .await?;
-        Ok(*result.downcast::<T>().expect("Agent result decoder returned a different type"))
-    }
-
-    async fn call_decoded_with_timeout_and_cancel(
-        &mut self,
-        method: &str,
-        params: Value,
-        timeout_duration: Option<Duration>,
-        cancel_token: Option<CancellationToken>,
-        decode: AgentResultDecoder,
-    ) -> Result<AgentDecodedResult, AgentCallError> {
         if let Some(runtime) = &self.shared_runtime {
             let agent_session_id = self.agent_session_id.clone();
             let mut params = params;
@@ -1851,15 +1822,10 @@ impl AgentDriverClient {
                     .ok_or_else(|| "Agent RPC parameters must be an object".to_string())?
                     .insert("agentSessionId".to_string(), Value::String(session_id.clone()));
             }
-            let result: Value = runtime
+            return runtime
                 .call_typed(method, params, timeout_duration, cancel_token)
                 .await
-                .map_err(|error| error.with_legacy_session_id(agent_session_id.as_deref()))?;
-            return decode(result).map_err(|message| AgentCallError::ContractViolation {
-                rpc_code: None,
-                message,
-                reason: ContractViolationReason::InvalidResult,
-            });
+                .map_err(|error| error.with_legacy_session_id(agent_session_id.as_deref()));
         }
         self.next_id += 1;
         let id = self.next_id;
@@ -1958,7 +1924,8 @@ impl AgentDriverClient {
             let result = if let Some(err) = resp.get("error") {
                 Err(format_agent_rpc_error(err))
             } else if let Some(result_val) = resp.get("result") {
-                decode(result_val.clone())
+                serde_json::from_value::<T>(result_val.clone())
+                    .map_err(|e| format!("Failed to deserialize agent result: {e}"))
             } else {
                 Err(format!("Agent response missing both 'result' and 'error': {line}"))
             };
