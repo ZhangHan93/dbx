@@ -220,12 +220,16 @@ function openTableStructureForSelection(): boolean {
   return connectionTreeRef.value?.openTableStructureForSelection?.() ?? false;
 }
 
-defineExpose({ focusSearch, locateTabInSidebar, disconnectAllActiveConnections, openTableStructureForSelection });
+async function focusSelectedNode() {
+  await connectionTreeRef.value?.focusSelectedNode?.();
+}
+
+defineExpose({ focusSearch, locateTabInSidebar, disconnectAllActiveConnections, focusSelectedNode, openTableStructureForSelection });
 </script>
 
 <template>
-  <div data-app-sidebar class="app-sidebar-panel h-full shrink-0 relative select-none" :class="classicLayout ? '' : 'rounded-md border border-border/80 bg-background'" :style="{ width: sidebarWidth + 'px' }" @keydown="onSidebarKeydown">
-    <div class="h-full flex flex-col overflow-hidden">
+  <div data-app-sidebar class="app-sidebar-panel h-full shrink-0 relative select-none" :class="classicLayout ? '' : 'dbx-panel bg-background'" :style="{ width: sidebarWidth + 'px' }" @keydown="onSidebarKeydown">
+    <div class="h-full flex flex-col overflow-hidden rounded-[inherit]">
       <div class="app-sidebar-toolbar flex items-center gap-px px-3 text-xs font-medium text-muted-foreground border-b bg-muted/20" :class="classicLayout ? 'h-9' : 'h-10'">
         <span v-if="showConnectionMultiSelectToolbar" class="flex min-w-0 self-stretch items-center" data-tauri-drag-region>
           <span class="truncate" data-tauri-drag-region>{{ t("sidebar.connections") }}</span>
@@ -319,7 +323,7 @@ defineExpose({ focusSearch, locateTabInSidebar, disconnectAllActiveConnections, 
           </span>
         </template>
       </div>
-      <div class="flex-1 min-h-0">
+      <div data-sidebar-connection-tree class="flex-1 min-h-0">
         <ConnectionTree ref="connectionTreeRef" @open-settings="(initialTab) => emit('open-settings', initialTab)" @add-to-ai="(nodes) => emit('add-to-ai', nodes)" />
       </div>
       <div v-if="activeConnectionEndpoint" data-sidebar-connection-endpoint class="flex shrink-0 items-center gap-1.5 border-t border-border/60 px-2.5 py-1.5 text-[11px] leading-none text-muted-foreground" :title="activeWindowConnection?.name">

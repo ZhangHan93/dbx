@@ -206,7 +206,18 @@ import {
 import { adjacentDataGridDetailIndex, type DataGridDetailNavigationDelta } from "@/lib/dataGrid/dataGridDetailNavigation";
 import { applyColumnFormatter, DataGridDateTimePatterns, displayTimeZoneOption, formatIoTDBTimestampEditorValue, iotdbTimestampFractionDigits, iotdbTimestampPrecision, parseIoTDBTimestampEditorValue, type ColumnFormatterConfig } from "@/lib/dataGrid/columnFormatter";
 import { temporalCellEditorConfig, type TemporalCellEditorConfig } from "@/lib/dataGrid/dataGridTemporalEditor";
-import { BOOLEAN_CELL_EDITOR_VALUES, booleanCellDisplayText, booleanCellEditorValue, isBooleanCellValue, isBooleanColumnType, isPointInBooleanCheckbox, nextBooleanCellValue, normalizeBooleanCellValue, parseBooleanCellEditorValue } from "@/lib/dataGrid/dataGridBooleanColumn";
+import {
+  BOOLEAN_CELL_EDITOR_VALUES,
+  booleanCellDisplayText,
+  booleanCellEditorDisplayValues,
+  booleanCellEditorValue,
+  isBooleanCellValue,
+  isBooleanColumnType,
+  isPointInBooleanCheckbox,
+  nextBooleanCellValue,
+  normalizeBooleanCellValue,
+  parseBooleanCellEditorValue,
+} from "@/lib/dataGrid/dataGridBooleanColumn";
 import { resolveDataGridColumnNullability, resolveDataGridColumnsByResultIndex } from "@/lib/dataGrid/dataGridColumnMetadata";
 import { resolveDataGridNewRowCellPlaceholder } from "@/lib/dataGrid/dataGridDefaultPlaceholder";
 import {
@@ -241,6 +252,7 @@ import {
   elasticsearchCursorPageJumpRequestCount,
   hasCompleteLocalDataGridResult,
   hasShortDataGridSqlPage,
+  isDataGridSurfaceBusy,
   reconcileDataGridExactTotalWithObservedPage,
   resolveDataGridPaginationTotal,
   showDataGridRerunTotalCountAction,
@@ -473,6 +485,7 @@ const hideNullColumns = computed(() => settingsStore.editorSettings.dataGridHide
 const hideEmptyColumns = computed(() => settingsStore.editorSettings.dataGridHideEmptyColumns);
 const booleanCellsUseCheckbox = computed(() => settingsStore.editorSettings.dataGridBooleanDisplayMode === "checkbox");
 const booleanCellValueStyle = computed(() => settingsStore.editorSettings.dataGridBooleanValueStyle);
+const booleanEditorDisplayValues = computed(() => booleanCellEditorDisplayValues(booleanCellValueStyle.value));
 const booleanDisplayMode = computed(() => settingsStore.editorSettings.dataGridBooleanDisplayMode);
 const colorizeDataGridCellTypes = computed(() => settingsStore.editorSettings.colorizeDataGridCellTypes);
 const { isDark, themePalette } = useTheme();
@@ -2420,12 +2433,14 @@ const {
   onHideNullColumnsChange: (value) => settingsStore.updateEditorSettings({ dataGridHideNullColumns: value }),
   onRefreshMetrics: scheduleColumnLayoutRefresh,
 });
+// The go-to-column list mirrors the column filter panel, so both follow the
+// user's local column order instead of the database order.
 const goToColumnItems = computed(() =>
   buildDataGridColumnLookupItems({
     columns: props.result.columns,
     sourceColumns: props.sourceColumns,
     columnComments: props.resultColumnComments,
-    displayableIndexes: displayableColumnIndexes.value,
+    displayableIndexes: orderedDisplayableColumnIndexes.value,
     commentByColumn: columnCommentMap.value,
   }),
 );
@@ -2731,12 +2746,11 @@ const columnWidthMode = computed(() => settingsStore.editorSettings.dataGridColu
 const tableFontFamily = computed(() => settingsStore.editorSettings.tableFontFamily);
 const columnWidthCacheKey = computed(() => props.columnWidthCacheKey?.trim() || props.cacheKey?.trim() || undefined);
 const columnStructureSignature = computed(() => createDataGridColumnStructureSignature(props.result.columns, props.result.column_types));
-// Bumped once the configured header font is ready, so widths measured against a temporary fallback
-// font get re-measured without reacting to unrelated fonts loaded elsewhere in the application.
-const dataGridFontReadyTick = ref(0);
-const columnFormatterReadyTick = ref(0);
-const columnHeaderMeasurementKey = computed(() => [tableFontSize.value, tableFontFamily.value, dataGridFontReadyTick.value, columnFormatterReadyTick.value]);
+// The configured header font is re-measured once ready (grown-only, never clearing user
+// adjustments), without reacting to unrelated fonts loaded elsewhere in the application.
+const columnHeaderMeasurementKey = computed(() => [tableFontSize.value, tableFontFamily.value]);
 let columnHeaderMeasureContext: CanvasRenderingContext2D | null | undefined;
+let triggerGrowColumnWidths: (() => void) | undefined;
 
 if (typeof document !== "undefined" && document.fonts) {
   let fontLoadRequestId = 0;
@@ -2749,7 +2763,9 @@ if (typeof document !== "undefined" && document.fonts) {
       } catch {
         return;
       }
-      if (requestId === fontLoadRequestId) dataGridFontReadyTick.value++;
+      if (requestId === fontLoadRequestId) {
+        triggerGrowColumnWidths?.();
+      }
     },
     { immediate: true },
   );
@@ -2774,7 +2790,7 @@ function columnWidthDisplayValue(value: CellValue, columnIndex: number): CellVal
   return showWhitespaceEnabled.value && typeof display === "string" ? gridCellDisplayValue(display, flatteningMultiLineEnabled.value, true) : display;
 }
 
-const { initColumnWidths, onResizeStart, autoFitColumn, autoFitAllColumns, renderedColumnWidths, totalWidth, columnVars, getIsResizing } = useDataGridColumnResize({
+const { initColumnWidths, growColumnWidthsToFitSamples, onResizeStart, autoFitColumn, autoFitAllColumns, renderedColumnWidths, totalWidth, columnVars, getIsResizing } = useDataGridColumnResize({
   columns: visibleColumns,
   sourceRows: computed(() => props.result.rows),
   columnIndexes: visibleColumnIndexes,
@@ -2790,6 +2806,7 @@ const { initColumnWidths, onResizeStart, autoFitColumn, autoFitAllColumns, rende
   viewportWidth: gridViewportWidth,
   displayValue: columnWidthDisplayValue,
 });
+triggerGrowColumnWidths = growColumnWidthsToFitSamples;
 const gridStyle = computed(() => ({
   ...columnVars.value,
   "--header-total-w": dataGridHeaderContentWidth("var(--total-w)", gridScrollbarGutter.value),
@@ -3644,6 +3661,8 @@ watch(
 );
 const manualTotalRowCount = ref<number | undefined>(undefined);
 const manualTotalRowCountLoading = ref(false);
+/** True only for count-then-navigate flows (e.g. jump to last page), where the grid must stay covered. */
+const manualTotalRowCountCoversSurface = ref(false);
 let manualTotalRowCountGeneration = 0;
 function invalidateManualTotalRowCount() {
   manualTotalRowCountGeneration++;
@@ -3772,8 +3791,20 @@ const rowPreparationProgress = shallowRef<DataGridRowPreparationProgress | null>
 let rowPreparationController: AbortController | null = null;
 let gridClipboardLifecycle = 0;
 let gridClipboardActive = true;
-/** Automatic background counts keep rows interactive; explicit count navigation still blocks the surface. */
-const gridSurfaceBusy = computed(() => isRefreshingData.value || props.loading === true || manualTotalRowCountLoading.value || pageJumpBusy.value || rowPreparationProgress.value !== null);
+/**
+ * Automatic background counts keep rows interactive. A manual footer count only covers the grid when it is
+ * part of a navigation flow; counting total rows on demand must not look like a table refresh.
+ */
+const gridSurfaceBusy = computed(() =>
+  isDataGridSurfaceBusy({
+    isRefreshingData: isRefreshingData.value,
+    loading: props.loading === true,
+    pageJumpBusy: pageJumpBusy.value,
+    rowPreparationBusy: rowPreparationProgress.value !== null,
+    manualTotalRowCountLoading: manualTotalRowCountLoading.value,
+    manualTotalRowCountCoversSurface: manualTotalRowCountCoversSurface.value,
+  }),
+);
 const gridPaginationBusy = computed(() => gridSurfaceBusy.value || totalRowCountBusy.value);
 const dataGridNativeSelectionBlockOwner = {};
 watch(
@@ -4251,20 +4282,26 @@ function jumpToCountedLastPage(total: number) {
   requestServerPageJump(lastPageNum);
 }
 
-async function beginManualTotalRowCount(): Promise<number | undefined> {
+async function beginManualTotalRowCount(coversSurface = false): Promise<number | undefined> {
   if (manualTotalRowCountLoading.value) return undefined;
   const generation = manualTotalRowCountGeneration;
+  manualTotalRowCountCoversSurface.value = coversSurface;
   manualTotalRowCountLoading.value = true;
-  // Flush busy UI (overlay / spinner) before the slow COUNT starts.
+  // Flush the button spinner (and the overlay for count-then-navigate flows) before the slow COUNT starts.
   await nextTick();
   return generation;
+}
+
+function finishManualTotalRowCount() {
+  manualTotalRowCountLoading.value = false;
+  manualTotalRowCountCoversSurface.value = false;
 }
 
 async function lastPage() {
   if (infiniteScrollEnabled.value || allRowsLoaded.value) return;
   // Navicat-style: always re-COUNT when jumping to the last page.
   if (props.countTotalRows) {
-    const generation = await beginManualTotalRowCount();
+    const generation = await beginManualTotalRowCount(true);
     if (generation === undefined) return;
     try {
       if (generation !== manualTotalRowCountGeneration) return;
@@ -4283,12 +4320,12 @@ async function lastPage() {
         5000,
       );
     } finally {
-      manualTotalRowCountLoading.value = false;
+      finishManualTotalRowCount();
     }
     return;
   }
   if (props.connectionId && (props.countSql || canCountTableRows.value)) {
-    const generation = await beginManualTotalRowCount();
+    const generation = await beginManualTotalRowCount(true);
     if (generation === undefined) return;
     try {
       if (generation !== manualTotalRowCountGeneration) return;
@@ -4306,7 +4343,7 @@ async function lastPage() {
     } catch {
       // COUNT query failed — ignore silently
     } finally {
-      manualTotalRowCountLoading.value = false;
+      finishManualTotalRowCount();
     }
     return;
   }
@@ -4378,7 +4415,7 @@ async function calculateTotalRowCount() {
   } catch (e: any) {
     toast(t("grid.calculateTotalRowsFailed", { message: e?.message || String(e) }), 5000);
   } finally {
-    manualTotalRowCountLoading.value = false;
+    finishManualTotalRowCount();
   }
 }
 
@@ -5647,7 +5684,6 @@ const {
   toast,
 });
 columnFormatterForWidth = columnFormatter;
-columnFormatterReadyTick.value++;
 
 initColumnWidths();
 watch([visibleColumnIndexes, () => renderedColumnWidths.value.length], () => scheduleColumnLayoutRefresh());
@@ -8989,6 +9025,9 @@ function changeExportQueryTimeout() {
 
 const userFacingSql = ref("");
 let userFacingSqlGeneration = 0;
+// Legacy snapshots may retain a display page without the actual execution text.
+// Do not present the original, unpaginated statement as the executed SQL there.
+const actualExecutionSql = computed(() => props.result.sqlPage?.executedSql || props.result.executedStatement || (!props.pageSql ? props.result.sourceStatement || props.sql || "" : ""));
 
 function sqlWithDisplayDatabaseName(sql: string): string {
   const database = props.tableMeta?.database ?? props.database;
@@ -9002,7 +9041,7 @@ function sqlWithDisplayDatabaseName(sql: string): string {
 
 async function syncUserFacingSql() {
   const generation = ++userFacingSqlGeneration;
-  const executionSql = (props.pageSql || props.sql)?.trim() ?? "";
+  const executionSql = (props.result.sqlPage?.sql || props.pageSql || props.sql)?.trim() ?? "";
   const includeDatabaseName = settingsStore.editorSettings.generateSqlIncludeDatabaseName;
   const shouldRebuildSql = executionSql.includes("__DBX_LARGE_VALUE_BYTES_") || includeDatabaseName;
   if (props.context !== "table-data" || !shouldRebuildSql || !props.tableMeta?.tableName) {
@@ -9044,7 +9083,7 @@ async function syncUserFacingSql() {
 }
 
 watch(
-  () => [props.sql, props.pageSql, props.context, props.tableMeta, props.pageLimit, props.pageOffset, props.executedPageLimit, props.executedPageOffset, currentWhereInput(), effectiveOrderBy(), settingsStore.editorSettings.generateSqlIncludeDatabaseName],
+  () => [props.sql, props.pageSql, props.result.sqlPage, props.context, props.tableMeta, props.pageLimit, props.pageOffset, props.executedPageLimit, props.executedPageOffset, currentWhereInput(), effectiveOrderBy(), settingsStore.editorSettings.generateSqlIncludeDatabaseName],
   () => void syncUserFacingSql(),
   { immediate: true },
 );
@@ -12405,8 +12444,9 @@ async function copyUserFacingSqlWithoutComments() {
 }
 
 const statusSqlContextMenuItems = computed<ContextMenuItem[]>(() => [
-  { label: t("grid.copyQuerySql"), icon: Copy, action: () => void copyUserFacingSql() },
+  { label: t(props.result.sqlPage ? "grid.copyCurrentPageSql" : "grid.copyQuerySql"), icon: Copy, action: () => void copyUserFacingSql() },
   { label: t("grid.copyExecutableSql"), icon: Copy, action: () => void copyUserFacingSqlWithoutComments() },
+  ...(actualExecutionSql.value ? [{ label: t("grid.copyActualExecutionSql"), icon: Copy, action: () => void copyText(actualExecutionSql.value) }] : []),
 ]);
 
 type TableInfoTabItem = {
@@ -14889,6 +14929,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                             v-else-if="isBooleanGridCell(displayItems[cell.recordIndex], cell.valueIndex)"
                             v-model="booleanEditorModelValue"
                             :values="BOOLEAN_CELL_EDITOR_VALUES"
+                            :display-values="booleanEditorDisplayValues"
                             :nullable="isBooleanGridColumnNullable(cell.valueIndex)"
                             :initial-null="isGridCellInitialNull(displayItems[cell.recordIndex]?.id, cell.valueIndex)"
                             cell-layout="transpose"
@@ -15595,6 +15636,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                           v-else-if="isBooleanGridCell(getRowItem(canvasEditingCell.rowId), canvasEditingCell.actualColIdx)"
                           v-model="booleanEditorModelValue"
                           :values="BOOLEAN_CELL_EDITOR_VALUES"
+                          :display-values="booleanEditorDisplayValues"
                           :nullable="isBooleanGridColumnNullable(canvasEditingCell.actualColIdx)"
                           :initial-null="isGridCellInitialNull(canvasEditingCell.rowId, canvasEditingCell.actualColIdx)"
                           @cancel="cancelEdit"
@@ -15823,6 +15865,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                               v-else-if="isBooleanGridCell(item, col.actualColIdx)"
                               v-model="booleanEditorModelValue"
                               :values="BOOLEAN_CELL_EDITOR_VALUES"
+                              :display-values="booleanEditorDisplayValues"
                               :nullable="isBooleanGridColumnNullable(col.actualColIdx)"
                               :initial-null="isGridCellInitialNull(item.id, col.actualColIdx)"
                               @cancel="cancelEdit"
@@ -16381,11 +16424,18 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
           <Tooltip>
             <TooltipTrigger as-child>
               <span class="block min-w-0 max-w-full truncate opacity-60 cursor-pointer hover:opacity-100" data-result-sql @click="copyUserFacingSql" @contextmenu="onContextMenu">
+                <span v-if="result.sqlPage">{{ t("grid.currentPageSql") }}: </span>
                 {{ sqlOneLiner }}
               </span>
             </TooltipTrigger>
             <TooltipContent side="top" class="max-w-md">
+              <div v-if="result.sqlPage" class="mb-1 font-medium">{{ t("grid.currentPageSql") }}</div>
               <pre class="text-xs font-mono whitespace-pre-wrap">{{ userFacingSql }}</pre>
+              <p v-if="result.sqlPage?.probe" class="mt-2 text-xs">{{ t("grid.pageProbeDescription", { count: result.sqlPage.executedLimit }) }}</p>
+              <template v-if="actualExecutionSql && actualExecutionSql.trim() !== userFacingSql.trim()">
+                <div class="mt-3 mb-1 font-medium">{{ t("grid.actualExecutionSql") }}</div>
+                <pre class="max-h-48 overflow-auto text-xs font-mono whitespace-pre-wrap">{{ actualExecutionSql }}</pre>
+              </template>
             </TooltipContent>
           </Tooltip>
         </CustomContextMenu>
@@ -16451,6 +16501,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
       v-model:column-open="columnDetailDialogOpen"
       :row-detail="rowDetail"
       :column-detail="columnDetail"
+      :database-type="resolvedDatabaseType"
       :type-color-class="typeColorClass"
       @navigate-row="navigateRowDetail"
       @navigate-column="navigateColumnDetail"

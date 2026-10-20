@@ -2366,6 +2366,8 @@ pub fn run() {
             commands::query::build_dropped_file_preview_sql,
             commands::query::build_table_select_sql,
             commands::query::build_database_search_sql,
+            commands::query::build_database_search_columns_sql,
+            commands::query::build_database_search_probe_sql,
             commands::query::build_database_structure_search_sql,
             commands::query::supports_database_structure_search,
             commands::query::build_search_result_where,

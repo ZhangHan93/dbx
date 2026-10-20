@@ -7013,6 +7013,7 @@ export default withEnglishFallback({
     modeOverwrite: "Nadpisz (TRUNCATE + INSERT)",
     modeUpsert: "Wstaw lub zaktualizuj (INSERT lub UPDATE wg PK)",
     targetTableNameCase: "Wielkość liter nazwy tabeli docelowej",
+    targetColumnNameCase: "Wielkość liter nazwy kolumny docelowej",
     quoteTargetColumnNames: "Ujmuj nazwy kolumn docelowych w cudzysłowy",
     tableNameCasePreserve: "Zachowaj",
     tableNameCaseLower: "Małe litery",

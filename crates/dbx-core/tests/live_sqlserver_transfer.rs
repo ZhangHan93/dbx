@@ -2,8 +2,8 @@ use dbx_core::connection::AppState;
 use dbx_core::models::connection::{ConnectionConfig, DatabaseType};
 use dbx_core::transfer::{
     clear_foreign_key_linked_overwrite_targets, drop_backup_tables, rename_tables_to_backup,
-    sort_tables_by_fk_dependency_with_foreign_keys, transfer_table, transfer_table_with_result, TransferContent,
-    TransferMode, TransferOwnershipPolicy, TransferRequest, TransferTableNameCase,
+    sort_tables_by_fk_dependency_with_foreign_keys, transfer_table, transfer_table_with_result, TransferColumnNameCase,
+    TransferContent, TransferMode, TransferOwnershipPolicy, TransferRequest, TransferTableNameCase,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -191,6 +191,7 @@ async fn live_sqlserver_transfer_rebuild_releases_constraint_and_index_names() {
         objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
+        target_column_name_case: TransferColumnNameCase::Preserve,
         quote_target_column_names: true,
         ownership_policy: TransferOwnershipPolicy::Preserve,
         batch_size: 10,
@@ -353,6 +354,7 @@ async fn live_sqlserver_transfer_overwrite_handles_existing_identity_target() {
         objects: Some(Vec::new()),
         mode: TransferMode::Overwrite,
         target_table_name_case: TransferTableNameCase::Preserve,
+        target_column_name_case: TransferColumnNameCase::Preserve,
         quote_target_column_names: true,
         ownership_policy: TransferOwnershipPolicy::Preserve,
         batch_size: 1,
@@ -471,6 +473,7 @@ async fn live_sqlserver_keyset_pagination_copies_every_row() {
         objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
+        target_column_name_case: TransferColumnNameCase::Preserve,
         quote_target_column_names: true,
         ownership_policy: TransferOwnershipPolicy::Preserve,
         batch_size: 3,
@@ -593,6 +596,7 @@ async fn live_sqlserver_progress_read_survives_total_duration_beyond_timeout() {
         objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
+        target_column_name_case: TransferColumnNameCase::Preserve,
         quote_target_column_names: true,
         ownership_policy: TransferOwnershipPolicy::Preserve,
         batch_size: 10000,
@@ -713,6 +717,7 @@ async fn live_sqlserver_keyset_uniqueidentifier_datetime2_composite_key() {
         objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
+        target_column_name_case: TransferColumnNameCase::Preserve,
         quote_target_column_names: true,
         ownership_policy: TransferOwnershipPolicy::Preserve,
         batch_size: 3,
@@ -826,6 +831,7 @@ async fn live_sqlserver_transfer_new_identity_target_keeps_explicit_identity_val
         objects: Some(Vec::new()),
         mode: TransferMode::Append,
         target_table_name_case: TransferTableNameCase::Preserve,
+        target_column_name_case: TransferColumnNameCase::Preserve,
         quote_target_column_names: true,
         ownership_policy: TransferOwnershipPolicy::Preserve,
         batch_size: 1,
@@ -1071,6 +1077,7 @@ async fn live_sqlserver_transfer_overwrite_replaces_tables_linked_by_foreign_key
         objects: Some(Vec::new()),
         mode: TransferMode::Overwrite,
         target_table_name_case: TransferTableNameCase::Preserve,
+        target_column_name_case: TransferColumnNameCase::Preserve,
         quote_target_column_names: true,
         ownership_policy: TransferOwnershipPolicy::Preserve,
         batch_size: 1000,
