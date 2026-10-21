@@ -171,12 +171,12 @@ test("setErrorResult stops loading and shows the error result", () => {
   assert.deepEqual(tab?.result?.rows, [["metadata failed"]]);
 });
 
-test("renames query tab titles", () => {
+test("renames query tab titles", async () => {
   setActivePinia(createPinia());
   const store = useQueryStore();
   const tabId = store.createTab("conn-1", "db");
 
-  assert.equal(store.renameTab(tabId, " Revenue checks "), true);
+  assert.equal(await store.renameTab(tabId, " Revenue checks "), true);
 
   const tab = store.tabs.find((item) => item.id === tabId);
   assert.equal(tab?.title, "Revenue checks");

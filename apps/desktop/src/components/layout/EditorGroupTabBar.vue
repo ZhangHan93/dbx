@@ -1395,13 +1395,13 @@ function startRenameTab(tab: QueryTab) {
   });
 }
 
-function commitRenameTab(tab: QueryTab) {
+async function commitRenameTab(tab: QueryTab) {
   if (editingTabId.value !== tab.id) {
     return;
   }
   const title = editingTitle.value.trim();
   if (title) {
-    queryStore.renameTab(tab.id, title);
+    await queryStore.renameTab(tab.id, title);
   }
   editingTabId.value = null;
 }

@@ -257,11 +257,11 @@ const batchTargetNamesValid = computed(() => {
 });
 const canImport = computed(() => {
   if (running.value || !props.prefillConnectionId || !existingTargetMetadataReady.value || conflictPolicyError.value) return false;
-  if (!isBatchImport.value) return !!preview.value && !!targetTableName.value && mappingValidation.value.valid;
+  if (!isBatchImport.value) return !!preview.value?.rows.length && !!targetTableName.value && mappingValidation.value.valid;
   if (!batchTargetNamesValid.value) return false;
   return selectedBatchTasks.value.every((task) => {
     const mappings = task.preview.columns.map((sourceColumn) => ({ sourceColumn, targetColumn: task.columnMapping[sourceColumn] ?? "", targetDataType: task.columnDataTypes[sourceColumn] ?? "" })).filter((mapping) => mapping.targetColumn);
-    return !!task.tableName.trim() && validateImportMappings(mappings).valid;
+    return task.preview.rows.length > 0 && !!task.tableName.trim() && validateImportMappings(mappings).valid;
   });
 });
 const canGoBack = computed(() => wizardStep.value !== "source" && wizardStep.value !== "execution" && !running.value);
@@ -271,7 +271,7 @@ const canGoNext = computed(() => {
     if (wizardStep.value === "options") return batchTargetNamesValid.value;
     if (wizardStep.value === "mapping") return canImport.value;
   }
-  if (wizardStep.value === "options") return !!preview.value && !!targetTableName.value && existingTargetMetadataReady.value;
+  if (wizardStep.value === "options") return !!preview.value?.rows.length && !!targetTableName.value && existingTargetMetadataReady.value;
   if (wizardStep.value === "mapping") return existingTargetMetadataReady.value && mappingValidation.value.valid && !conflictPolicyError.value;
   return false;
 });
@@ -883,7 +883,7 @@ async function prepareBatchSources(sources: ImportSource[]) {
         const tableBase = sheetName ? `${suggestedTableName(sourceName(source))}_${sheetName}` : sourceName(source);
         tasks.push({
           id: uuid(),
-          selected: true,
+          selected: taskPreview.rows.length > 0,
           source,
           format,
           sheetName: effectiveSheetName,
@@ -898,7 +898,8 @@ async function prepareBatchSources(sources: ImportSource[]) {
     }
     batchTasks.value = tasks;
     if (tasks.length) {
-      activateBatchTask(0);
+      const firstSelectedIndex = tasks.findIndex((task) => task.selected);
+      activateBatchTask(Math.max(0, firstSelectedIndex));
       wizardStep.value = "options";
     }
   } catch (e: any) {
@@ -1421,7 +1422,7 @@ watch(rawProgressPercent, (percent) => {
           </div>
           <div class="flex max-h-32 flex-wrap gap-1.5 overflow-auto p-2">
             <div v-for="(task, index) in batchTasks" :key="task.id" class="flex max-w-[260px] items-center gap-1.5 rounded-md border pl-2 text-xs transition-colors" :class="index === activeTaskIndex ? 'border-primary bg-primary/10 text-primary' : 'hover:bg-muted/60'">
-              <input v-model="task.selected" type="checkbox" class="h-3.5 w-3.5 shrink-0 accent-primary" :aria-label="t('tableImport.selectTask', { name: task.tableName })" :disabled="running" />
+              <input v-model="task.selected" type="checkbox" class="h-3.5 w-3.5 shrink-0 accent-primary" :aria-label="t('tableImport.selectTask', { name: task.tableName })" :disabled="running || !task.preview.rows.length" />
               <button
                 type="button"
                 class="flex min-w-0 items-center gap-1.5 py-1 pr-2"
@@ -1437,6 +1438,7 @@ watch(rawProgressPercent, (percent) => {
                 <FileSpreadsheet v-else-if="task.format === 'excel'" class="h-3.5 w-3.5 shrink-0" />
                 <FileText v-else class="h-3.5 w-3.5 shrink-0" />
                 <span class="truncate">{{ task.tableName }}</span>
+                <span v-if="!task.preview.rows.length" class="shrink-0 text-muted-foreground">{{ t("tableImport.rows") }}: 0</span>
               </button>
             </div>
           </div>

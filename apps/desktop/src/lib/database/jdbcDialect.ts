@@ -244,7 +244,27 @@ export function sqlSnippetDatabaseTypeForConnection(connection?: JdbcDialectConn
   // ASE uses T-SQL snippets, but mapping it globally to SQL Server would also
   // enable incompatible SQL Server metadata and pagination behavior.
   if (isJdbcAseProfile(connection)) return "sqlserver";
+  const kingbaseType = kingbaseSqlDatabaseType(connection);
+  if (kingbaseType) return kingbaseType;
   return effectiveDatabaseTypeForConnection(connection);
+}
+
+/** SQL syntax only: never use this mapping for transport, catalogs or capabilities. */
+export function kingbaseSqlDatabaseType(connection?: JdbcDialectConnection): "mysql" | "postgres" | "oracle" | "sqlserver" | undefined {
+  if (connection?.db_type !== "kingbase") return undefined;
+  const mode = connection.database_info?.compatibilityMode?.trim().toLowerCase();
+  switch (mode) {
+    case "pg":
+    case "postgres":
+    case "postgresql":
+      return "postgres";
+    case "oracle":
+    case "mysql":
+    case "sqlserver":
+      return mode;
+    default:
+      return undefined;
+  }
 }
 
 export function tableStructureDatabaseTypeForConnection(connection?: JdbcDialectConnection): DatabaseType | undefined {
@@ -275,6 +295,16 @@ export function connectionShouldDiscoverJdbcSchemas(connection?: JdbcDialectConn
 
 export function connectionUsesSchemaExecutionContext(connection?: JdbcDialectConnection): boolean {
   return connection?.db_type === "jdbc" && inferJdbcDialect(connection) === "databend";
+}
+
+/**
+ * SQL Server 没有会话级 Schema 切换：后端会把 SQL 文本里未限定的表名改写成
+ * `[schema].[table]`（#8951）。因此页签 Schema 一旦随执行下发就会改变 SQL 语义，
+ * 只有用户显式选择的 Schema 才可以参与改写；连接默认 / 恢复 / 保存的 Schema
+ * 仅用于浏览与补全。IRIS/Kingbase 复用同一改写机制，但本次只收紧 SQL Server。
+ */
+export function sqlServerQualifiesSqlWithTabSchema(connection?: JdbcDialectConnection): boolean {
+  return effectiveDatabaseTypeForConnection(connection) === "sqlserver";
 }
 
 export function connectionQueryExecutionSchema(connection: JdbcDialectConnection | undefined, database: string | undefined, schema: string | undefined, dataMode: boolean): string | undefined {
@@ -370,14 +400,17 @@ export function connectionTableSqlSchema(connection: JdbcDialectConnection | und
 
 /** Maps a database type to the corresponding CodeMirror SQL dialect name used by QueryEditor and DdlViewDialog. */
 export function codeMirrorSqlDialect(dbType: DatabaseType | undefined): "mysql" | "postgres" | "sqlserver" {
-  if (dbType === "postgres" || dbType === "gaussdb" || dbType === "kwdb" || dbType === "opengauss") return "postgres";
+  if (dbType === "postgres" || dbType === "gaussdb" || dbType === "kwdb" || dbType === "opengauss" || dbType === "kingbase") return "postgres";
   if (dbType === "sqlserver") return "sqlserver";
   return "mysql";
 }
 
 export function codeMirrorSqlDialectForConnection(connection?: JdbcDialectConnection): CodeMirrorSqlDialectName {
   if (isJdbcAseProfile(connection)) return "sqlserver";
+  const kingbaseType = kingbaseSqlDatabaseType(connection);
+  if (kingbaseType) return kingbaseType;
   const databaseType = effectiveDatabaseTypeForConnection(connection);
+  if (databaseType === "kingbase") return "postgres";
   if (databaseType === "clickhouse") return "clickhouse";
   return codeMirrorSqlDialect(databaseType);
 }

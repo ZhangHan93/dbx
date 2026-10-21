@@ -3519,6 +3519,11 @@ fn parse_xlsx_preview_file_with_options(
         let preview_last_row = first_row.saturating_add(preview_limit.saturating_sub(1));
         row_range.last_data_row.map_or(preview_last_row, |last| last.min(preview_last_row))
     };
+    // The preview window is anchored at the first data row that actually carries content.
+    // Until one is found we keep scanning (up to the selected row range) instead of stopping
+    // at the provisional window, so a sheet whose only data sits beyond preview_limit is not
+    // misjudged as empty (see review on PR #12738).
+    let mut first_content_row: Option<usize> = None;
     let mut requested_last_row = preview_end_from(row_range.data_start_row);
 
     let mut dimension = None;
@@ -3553,7 +3558,7 @@ fn parse_xlsx_preview_file_with_options(
                         .unwrap_or_else(|| current_row.saturating_add(1).max(1));
                     current_column = 0;
                     if row_range.last_data_row.is_some_and(|last| current_row > last)
-                        || (observed_min_row != usize::MAX
+                        || (first_content_row.is_some()
                             && current_row > requested_last_row.max(row_range.title_row.unwrap_or_default()))
                     {
                         break;
@@ -3571,7 +3576,6 @@ fn parse_xlsx_preview_file_with_options(
                     current_column = position.1;
                     if current_row >= min_import_row {
                         observed_min_row = observed_min_row.min(position.0);
-                        requested_last_row = preview_end_from(row_range.data_start_row.max(observed_min_row));
                         observed_min_column = observed_min_column.min(position.1);
                         observed_max_row = observed_max_row.max(position.0);
                         observed_max_column = observed_max_column.max(position.1);
@@ -3627,10 +3631,16 @@ fn parse_xlsx_preview_file_with_options(
                     if let Some((row, column)) = current_position.take() {
                         if row >= min_import_row {
                             observed_min_row = observed_min_row.min(row);
-                            requested_last_row = preview_end_from(row_range.data_start_row.max(observed_min_row));
                             observed_min_column = observed_min_column.min(column);
                             observed_max_column = observed_max_column.max(column);
                             observed_max_row = observed_max_row.max(row);
+                            if first_content_row.is_none()
+                                && row >= row_range.data_start_row
+                                && current_cell.has_content()
+                            {
+                                first_content_row = Some(row);
+                                requested_last_row = preview_end_from(row);
+                            }
                             if row == row_range.title_row.unwrap_or_default()
                                 || (row >= row_range.data_start_row && row <= requested_last_row)
                             {
@@ -3656,14 +3666,20 @@ fn parse_xlsx_preview_file_with_options(
         .collect::<HashSet<_>>();
     let shared_strings = read_xlsx_shared_strings(&mut zip, &needed_shared_strings)?;
     if observed_min_row == usize::MAX || observed_min_column == usize::MAX {
-        return Err("Import file has no data rows in the selected row range".to_string());
+        return Ok((
+            ParsedImportFile { columns: Vec::new(), rows: Vec::new(), total_rows: 0, effective_encoding: None },
+            sheets,
+        ));
     }
     let start_row = observed_min_row;
     let start_column = observed_min_column;
     let observed_end_column = observed_max_column.max(start_column);
     let observed_column_count = observed_end_column.saturating_sub(start_column).saturating_add(1);
+    // Count only the anchored preview window: when the first content row sits far below
+    // data_start_row, the row span up to requested_last_row is mostly skipped blank rows
+    // that are never stored in raw_cells, so counting it would falsely trip the cell limit.
     let preview_row_count = requested_last_row
-        .saturating_sub(row_range.data_start_row.max(start_row))
+        .saturating_sub(first_content_row.unwrap_or(row_range.data_start_row).max(start_row))
         .saturating_add(1)
         .saturating_add(usize::from(row_range.title_row.is_some()));
     if observed_column_count.saturating_mul(preview_row_count) > MAX_FAST_PREVIEW_CELLS {
@@ -3707,7 +3723,7 @@ fn parse_xlsx_preview_file_with_options(
     let first_preview_row = row_range.data_start_row.max(start_row);
     let last_preview_row = requested_last_row.min(observed_max_row);
     if last_preview_row < first_preview_row {
-        return Err("Import file has no data rows in the selected row range".to_string());
+        return Ok((ParsedImportFile { columns, rows: Vec::new(), total_rows: 0, effective_encoding: None }, sheets));
     }
     // Rows made of style-only cells (blank rows inserted by a spreadsheet app) carry no
     // data and are skipped here as well so the preview matches what the import writes (#8604).
@@ -3728,9 +3744,6 @@ fn parse_xlsx_preview_file_with_options(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    if rows.is_empty() {
-        return Err("Import file has no data rows in the selected row range".to_string());
-    }
     Ok((ParsedImportFile { columns, total_rows: rows.len(), rows, effective_encoding: None }, sheets))
 }
 
@@ -4672,7 +4685,8 @@ async fn parse_import_preview_file_with_options(
             tokio::task::spawn_blocking(move || parse_xlsx_preview_file_with_options(&path, &options, preview_limit))
                 .await
                 .map_err(|e| e.to_string())??;
-        return Ok((parsed, false, sheets));
+        let total_rows_exact = parsed.total_rows == 0;
+        return Ok((parsed, total_rows_exact, sheets));
     }
 
     let parsed = parse_import_file_with_options(path, Some(format), options, preview_limit).await?;
@@ -9116,7 +9130,10 @@ mod tests {
         assert_eq!(preview.rows, parsed.rows);
         assert_eq!(parsed.total_rows, 2);
         let limited = TableImportParseOptions { last_data_row: Some(99), ..options };
-        assert!(parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &limited, 1).is_err());
+        let (empty_preview, sheets) =
+            parse_xlsx_preview_file_with_options(&path.to_string_lossy(), &limited, 1).unwrap();
+        assert!(empty_preview.rows.is_empty());
+        assert!(!sheets.is_empty());
         assert!(parse_xlsx_file_with_options(&path.to_string_lossy(), &limited, 1).is_err());
         let _ = std::fs::remove_file(path);
     }

@@ -67,6 +67,7 @@ import { clipboardLineEndings, copyToClipboard, readTextFromClipboard } from "@/
 import { resolveExecutableSql, type SqlExecutionOverride } from "@/lib/sql/sqlExecutionTarget";
 import { supportsExecutionTargetPicker, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
 import { executableStatementRangeAtCursor, executableStatementRangeCacheForDoc, executableStatementRangeStartingAt as executableStatementRangeStartingAtLine, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
+import { statementNavigationTarget, type StatementNavigationDirection } from "@/lib/sql/statementNavigation";
 
 import { looksLikeDmlStatement } from "@/lib/sql/dmlChangePreview";
 
@@ -146,14 +147,23 @@ import * as api from "@/lib/backend/api";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { isMacOS } from "@/lib/backend/platform";
 import { resolveSqlDialectId } from "@/lib/sql/semantic/dialect";
+import { kingbaseSqlDatabaseType } from "@/lib/database/jdbcDialect";
 import type { SqlCompletionColumn, SqlCompletionContext, SqlCompletionReferencedTable } from "@/lib/sql/sqlCompletion";
 
 const props = defineProps<QueryEditorProps>();
 
 function sqlBehaviorDialect(): "mysql" | "postgres" | "sqlserver" | undefined {
+  const mode = kingbaseSqlType.value;
+  if (props.databaseType === "kingbase") return mode === "oracle" ? undefined : (mode ?? "postgres");
   // clickhouse and soql ride the SQL editor but have no matching behavior dialect;
   // fall back to the connection's dialect (undefined for Salesforce).
+  if (props.syntaxDialect === "oracle") return undefined;
   return props.syntaxDialect === "clickhouse" || props.syntaxDialect === "soql" ? props.dialect : (props.syntaxDialect ?? props.dialect);
+}
+
+function sqlSyntaxDialect() {
+  if (props.databaseType === "kingbase") return kingbaseSqlType.value ?? "postgres";
+  return props.syntaxDialect ?? props.dialect;
 }
 
 function queryEditorSelectionLanguage(): "sql" | "text" {
@@ -246,12 +256,14 @@ let contextMenuDoc: Text | null = null;
 let contextMenuDocText = "";
 const connectionStore = useConnectionStore();
 const settingsStore = useSettingsStore();
+const kingbaseConfig = computed(() => (props.databaseType === "kingbase" && props.connectionId ? connectionStore.getConfig(props.connectionId) : undefined));
+const kingbaseSqlType = computed(() => kingbaseSqlDatabaseType(kingbaseConfig.value));
 
 function sqlStatementParameterOptions() {
   const toggles = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, props.databaseType, settingsStore.editorSettings.sqlVariableSubstitutionEnabled);
   return {
-    databaseType: props.databaseType,
-    compatibilityMode: props.databaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(props.connectionId, props.database) : undefined,
+    databaseType: kingbaseSqlType.value ?? props.databaseType,
+    compatibilityMode: props.databaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(props.connectionId, props.database) : kingbaseConfig.value?.database_info?.compatibilityMode,
     enabledSyntaxes: enabledSqlParameterSyntaxes(toggles),
   };
 }
@@ -510,6 +522,7 @@ const statementBoundaries = useQueryEditorStatementBoundaries({
   props,
   view,
   sqlStatementParameterOptions,
+  syntaxDialect: sqlSyntaxDialect,
   runtime: codeMirrorRuntime,
   driverProfile: () => sqlDriverProfile.value,
   cache: {
@@ -533,6 +546,7 @@ const completionMetadata = useQueryEditorCompletionMetadata({
   view,
   connectionStore,
   sqlBehaviorDialect,
+  syntaxDialect: sqlSyntaxDialect,
   remoteLatencyBudgetMs: COMPLETION_REMOTE_LATENCY_BUDGET_MS,
   maxCompletionTables: MAX_COMPLETION_TABLES,
   onDemandMinPrefix: PRESTO_ON_DEMAND_TABLE_COMPLETION_MIN_PREFIX,
@@ -1223,6 +1237,24 @@ function selectCurrentStatementFromContextMenu(): void {
   selectCurrentStatementFromView(currentView);
 }
 
+/**
+ * Move the caret between executable statements without changing the document.
+ * Reuses the same statement ranges as 「执行当前语句」/「选中当前语句」 so the
+ * navigation boundaries always match what execution would run.
+ */
+function navigateStatementFromView(currentView: EditorViewType, direction: StatementNavigationDirection): boolean {
+  executableStatementRangeCache = executableStatementRangeCacheForDoc(executableStatementRangeCache, currentView.state.doc, props.databaseType, sqlStatementParameterOptions());
+  const target = statementNavigationTarget(executableStatementRangeCache.ranges, currentView.state.selection.main.head, direction);
+  if (target === null) return false;
+  currentView.dispatch({
+    selection: { anchor: target },
+    scrollIntoView: true,
+    userEvent: "select.keyboard",
+  });
+  currentView.focus();
+  return true;
+}
+
 const contextMenuActions: QueryEditorContextMenuActions = {
   executeFromContextMenu,
   executeInNewResultTabFromContextMenu,
@@ -1435,6 +1467,9 @@ function runKeymapExtension(codeMirrorKeymap: (typeof import("@codemirror/view")
         ...binding(shortcuts.redo, (view) => codeMirrorRuntime.codeMirrorRedo?.(view) ?? false),
         ...binding(shortcuts.selectAll, (view) => codeMirrorRuntime.codeMirrorSelectAll?.(view) ?? false),
         ...binding(shortcuts.selectCurrentStatement, selectCurrentStatementFromView),
+        ...binding(shortcuts.previousStatement, (currentView) => navigateStatementFromView(currentView, "previous")),
+        ...binding(shortcuts.nextStatement, (currentView) => navigateStatementFromView(currentView, "next")),
+        ...binding(shortcuts.statementStart, (currentView) => navigateStatementFromView(currentView, "start")),
         ...binding(shortcuts.extendSelection, extendQueryEditorSelectionForView),
         ...binding(shortcuts.addNextSelectionOccurrence, addNextQueryEditorSelectionOccurrence),
         ...binding(shortcuts.selectAllSelectionOccurrences, selectAllQueryEditorSelectionOccurrences),
@@ -1672,6 +1707,7 @@ const { sqlErrorDecorationRange, sqlSemanticDecorationRanges, reconfigureDiagnos
     sqlDriverProfile,
     sqlStatementParameterOptions,
     sqlBehaviorDialect,
+    sqlSyntaxDialect,
     queryEditorSelectionLanguage,
     semanticCompletionEnabled: SEMANTIC_SQL_COMPLETION_ENABLED,
     maxCompletionTables: MAX_COMPLETION_TABLES,
@@ -2003,6 +2039,8 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
       t,
       sqlBehaviorDialect,
       sqlDriverProfile,
+      sqlFunctionDatabaseType: () => kingbaseSqlType.value ?? props.databaseType,
+      sqlSyntaxDialect,
       sqlStatementParameterOptions,
       queryEditorSelectionLanguage,
       cache: {
@@ -2567,8 +2605,11 @@ watch([() => props.clientSessionId, () => props.completionContextVersion], () =>
 });
 
 watch(
-  [() => props.tabId, () => props.databaseType, () => props.dialect, () => props.syntaxDialect, sqlDriverProfile],
+  [() => props.tabId, () => props.databaseType, () => props.dialect, sqlSyntaxDialect, sqlDriverProfile, () => kingbaseConfig.value?.database_info?.compatibilityMode],
   () => {
+    completion.invalidateRequests();
+    refreshCompletionCache();
+    setSemanticDiagnostics([]);
     executableStatementRangeCache = null;
     statementBoundaries.invalidate();
     if (!view.value || !codeMirrorRuntime.sqlLanguageComp || !codeMirrorRuntime.buildSqlLanguageExtension || !codeMirrorRuntime.sqlSemanticHighlightComp || !codeMirrorRuntime.buildSqlSemanticHighlightExtension || !codeMirrorRuntime.sqlSignatureComp || !codeMirrorRuntime.buildSqlSignatureExtension)
@@ -2582,6 +2623,7 @@ watch(
       ],
     });
     applyEditorCompletionExtension();
+    scheduleSemanticDiagnostics(0);
   },
   { flush: "post" },
 );
