@@ -303,13 +303,15 @@ struct SqlServerEndpoint<'a> {
 }
 
 fn sqlserver_endpoint(host: &str) -> SqlServerEndpoint<'_> {
-    if let Some((server, instance)) = host.split_once('\\') {
+    let trimmed = host.trim();
+    let without_tcp = if trimmed.to_ascii_lowercase().starts_with("tcp:") { trimmed[4..].trim() } else { trimmed };
+    if let Some((server, instance)) = without_tcp.split_once('\\') {
         if !server.trim().is_empty() && !instance.trim().is_empty() {
             return SqlServerEndpoint { host: server.trim(), instance_name: Some(instance.trim()) };
         }
     }
 
-    SqlServerEndpoint { host: host.trim(), instance_name: None }
+    SqlServerEndpoint { host: without_tcp, instance_name: None }
 }
 
 fn sqlserver_uses_named_instance_resolution(endpoint: &SqlServerEndpoint<'_>, port: u16, port_explicit: bool) -> bool {
@@ -498,9 +500,9 @@ async fn try_connect(
     timeout: Duration,
 ) -> Result<SqlServerClient, String> {
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut current_host = host.to_string();
-    let mut current_port = port;
-    let mut current_port_explicit = port_explicit;
+    let (mut current_host, parsed_port) = dbx_types::models::connection::normalize_sqlserver_host_port(host);
+    let mut current_port = parsed_port.unwrap_or(port);
+    let mut current_port_explicit = port_explicit || parsed_port.is_some();
     let mut redirects = 0;
 
     loop {
@@ -4801,6 +4803,18 @@ mod tests {
         assert_eq!(
             super::sqlserver_endpoint(r"db.example.com\"),
             super::SqlServerEndpoint { host: r"db.example.com\", instance_name: None }
+        );
+    }
+
+    #[test]
+    fn sqlserver_endpoint_strips_tcp_prefix() {
+        assert_eq!(
+            super::sqlserver_endpoint(r"tcp:192.168.1.10\SQL2022"),
+            super::SqlServerEndpoint { host: "192.168.1.10", instance_name: Some("SQL2022") }
+        );
+        assert_eq!(
+            super::sqlserver_endpoint("tcp:db.example.com"),
+            super::SqlServerEndpoint { host: "db.example.com", instance_name: None }
         );
     }
 

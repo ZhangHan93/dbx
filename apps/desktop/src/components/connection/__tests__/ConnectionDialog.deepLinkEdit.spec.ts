@@ -428,4 +428,46 @@ describe("ConnectionDialog deep-link edit confirmation", () => {
     expect(store.updateConnection).toHaveBeenCalledWith(expect.objectContaining({ id: "saved-production", port: 1445, external_config: { portExplicit: true } }));
     expect(store.addConnection).not.toHaveBeenCalled();
   });
+
+  it("normalizes SQL Server host with comma port and marks explicit port on save", async () => {
+    await mountDialog(savedConnection({ db_type: "sqlserver", driver_profile: "sqlserver", driver_label: "SQL Server", host: "127.0.0.1", port: 1433 }), "dbx://connection/new?id=saved-production&host=gg.test.com,9005");
+    const save = [...document.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Save");
+    expect(save).toBeTruthy();
+    save!.click();
+    await settle();
+
+    expect(store.updateConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "saved-production",
+        host: "gg.test.com",
+        port: 9005,
+        external_config: { portExplicit: true },
+      }),
+    );
+    expect(store.addConnection).not.toHaveBeenCalled();
+  });
+
+  it("normalizes SQL Server host with tcp prefix and comma port on blur", async () => {
+    await mountDialog(savedConnection({ db_type: "sqlserver", driver_profile: "sqlserver", driver_label: "SQL Server", host: "127.0.0.1", port: 1433 }));
+    const hostInput = [...document.querySelectorAll("input")].find((input) => input.value === "127.0.0.1");
+    expect(hostInput).toBeTruthy();
+    hostInput!.value = "tcp:sql.example.com,1444";
+    hostInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    hostInput!.dispatchEvent(new Event("blur", { bubbles: true }));
+    await settle();
+
+    const save = [...document.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Save");
+    expect(save).toBeTruthy();
+    save!.click();
+    await settle();
+
+    expect(store.updateConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "saved-production",
+        host: "sql.example.com",
+        port: 1444,
+        external_config: { portExplicit: true },
+      }),
+    );
+  });
 });

@@ -6777,7 +6777,9 @@ impl ConnectionEndpoint {
 }
 
 fn connection_remote_endpoint(config: &ConnectionConfig) -> (String, u16) {
-    if config.db_type == DatabaseType::MongoDb {
+    if config.db_type == DatabaseType::SqlServer {
+        sqlserver_tcp_endpoint(&config.host, config.port)
+    } else if config.db_type == DatabaseType::MongoDb {
         config
             .connection_string
             .as_deref()
@@ -7546,7 +7548,11 @@ pub async fn probe_connection_endpoint(config: &ConnectionConfig, host: &str, po
     }
     let timeout = std::time::Duration::from_secs(config.effective_connect_timeout_secs());
 
-    let entries = connection_probe_endpoints(host, port);
+    let entries = if config.db_type == DatabaseType::SqlServer {
+        vec![sqlserver_tcp_endpoint(host, port)]
+    } else {
+        connection_probe_endpoints(host, port)
+    };
 
     if entries.is_empty() {
         return Err("no host entries to probe".to_string());
@@ -7562,6 +7568,14 @@ pub async fn probe_connection_endpoint(config: &ConnectionConfig, host: &str, po
         }
     }
     Err(last_error)
+}
+
+fn sqlserver_tcp_endpoint(host: &str, port: u16) -> (String, u16) {
+    let (host, parsed_port) = dbx_types::models::connection::normalize_sqlserver_host_port(host);
+    // TCP probes and transport layers expect a raw IPv6 address, unlike
+    // Tiberius' combined "[host]:port" string.
+    let probe_host = host.strip_prefix('[').and_then(|value| value.strip_suffix(']')).unwrap_or(&host);
+    (probe_host.to_string(), parsed_port.unwrap_or(port))
 }
 
 fn connection_probe_endpoints(host: &str, default_port: u16) -> Vec<(String, u16)> {
@@ -12295,6 +12309,35 @@ for line in sys.stdin:
         }));
 
         assert_eq!(connection_remote_endpoint(&config), ("broker.internal".to_string(), 8443));
+    }
+
+    #[test]
+    fn sqlserver_connection_remote_endpoint_parses_comma_and_colon_port() {
+        let mut config = mysql_config(None);
+        config.db_type = DatabaseType::SqlServer;
+        config.host = "gg.test.com,9005".to_string();
+        config.port = 1433;
+        assert_eq!(connection_remote_endpoint(&config), ("gg.test.com".to_string(), 9005));
+
+        config.host = "tcp:sql.example.com,1444".to_string();
+        assert_eq!(connection_remote_endpoint(&config), ("sql.example.com".to_string(), 1444));
+
+        config.host = "sql.example.com".to_string();
+        assert_eq!(connection_remote_endpoint(&config), ("sql.example.com".to_string(), 1433));
+
+        config.host = "[::1],9005".to_string();
+        assert_eq!(connection_remote_endpoint(&config), ("::1".to_string(), 9005));
+    }
+
+    #[test]
+    fn sqlserver_probe_resolves_bracketed_ipv6_without_retargeting_invalid_ports() {
+        use std::net::ToSocketAddrs;
+        for host in ["[::1],9005", "[::1]:9005", "tcp:[::1],9005"] {
+            let endpoint = super::sqlserver_tcp_endpoint(host, 1433);
+            let address = (endpoint.0.as_str(), endpoint.1).to_socket_addrs().unwrap().next().unwrap();
+            assert_eq!(address, "[::1]:9005".parse::<std::net::SocketAddr>().unwrap());
+        }
+        assert_eq!(super::sqlserver_tcp_endpoint("[::1],70000", 1433), ("[::1],70000".to_string(), 1433));
     }
 
     #[test]

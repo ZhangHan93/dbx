@@ -978,6 +978,8 @@ async function toggle(requestId = beginNavigationRequest()) {
   // Keep the click path aligned with every object-group definition. In
   // particular, schema-level trigger/type groups have no tableName, so they
   // must use the generic object loader rather than the table-trigger loader.
+  // !node.tableName is generic: table-level structure groups (columns/indexes/fkeys/constraints/partitions/table triggers)
+  // stay off the schema-level object-group loader, not just triggers.
   const databaseObjectGroup = !!objectTypesForGroupNode(node.type) && !node.tableName;
   const needsConfiguredTablePageDrain = node.type === "group-tables" && connectionStore.getConfig(node.connectionId || "")?.sidebar_auto_load_all_tables === true && hasTableTreeLoadMore(node.children ?? []);
   if (databaseObjectGroup && connectionStore.canUseLoadedTreeNodeToggle(node) && !needsConfiguredTablePageDrain) {
@@ -2187,6 +2189,7 @@ async function newQuery(options: { reuseQueryTabByScope?: boolean } = {}) {
           schema: node.schema,
           includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
           quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
+          keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
           tableName: node.label,
           columns: [],
         });
@@ -2288,6 +2291,7 @@ async function newSelectTemplate() {
             schema: context.tableSchema,
             includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
             quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
+            keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
             tableName: context.node.label,
             columns: context.columns,
           }),
@@ -2307,6 +2311,7 @@ async function newSelectTemplate() {
       schema: context.tableSchema,
       includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
       quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
+      keywordCase: settingsStore.editorSettings.sqlFormatter.keywordCase,
       tableName: context.node.label,
       columns: context.columns,
     });
@@ -2489,7 +2494,7 @@ async function openSidebarMultiTableDdlTab(targets: Array<TreeNode & { connectio
       return buildViewDdl({
         databaseType: databaseTypeForNode(target),
         identifierQuote: connectionStore.connectionIdentifierQuote?.(target.connectionId),
-        schema,
+        schema: connectionTableSqlSchema(connectionStore.getConfig(target.connectionId), schema),
         name: target.label,
         source: result.source,
       });
@@ -2878,10 +2883,11 @@ function dropObjectSqlOptions(): DropObjectSqlOptions | null {
 
 function dropObjectSqlOptionsForNode(node: TreeNode): DropObjectSqlOptions | null {
   if (node.type !== "view" && node.type !== "materialized_view" && node.type !== "procedure" && node.type !== "function" && node.type !== "event") return null;
+  const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
   return {
     databaseType: tableStructureDatabaseTypeForNode(node),
     objectType: node.type === "view" ? "VIEW" : node.type === "materialized_view" ? "MATERIALIZED_VIEW" : node.type === "procedure" ? "PROCEDURE" : node.type === "function" ? "FUNCTION" : "EVENT",
-    schema: node.schema,
+    schema: connectionTableSqlSchema(config, node.schema),
     name: node.objectName || node.label,
     signature: node.signature,
     // Cloud Spanner's dialect decides the quote; the static per-type mapping cannot.
@@ -7717,7 +7723,10 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (!isPackageMember && currentDatabaseType() === "xugu" && buildXuguCompileSql({ objectType: node.type, schema: node.schema, name: node.objectName || node.label })) {
       items.push({ label: t("contextMenu.compileObject"), action: compileXuguObject, icon: Wrench });
     }
-    items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    if (!isPackageMember) {
+      items.push({ sidebarActionId: "contextMenu.editObject", label: t("contextMenu.editObject"), action: () => openObjectSourceDialog(true), icon: Pencil });
+    }
+    items.push({ sidebarActionId: "contextMenu.viewSource", label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
     if (!isPackageMember) {
       items.push({ label: t("diff.title"), action: openSchemaDiffForRoutine, icon: ArrowRightLeft });
     }
@@ -7798,7 +7807,10 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (currentDatabaseType() === "xugu" && buildXuguCompileSql({ objectType: node.type, schema: node.schema, name: node.objectName || node.label })) {
       items.push({ label: t("contextMenu.compileObject"), action: compileXuguObject, icon: Wrench });
     }
-    items.push({ label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
+    if (node.type === "package" || node.type === "package-body") {
+      items.push({ sidebarActionId: "contextMenu.editObject", label: t("contextMenu.editObject"), action: () => openObjectSourceDialog(true), icon: Pencil });
+    }
+    items.push({ sidebarActionId: "contextMenu.viewSource", label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
     if (canViewDatabaseObjectDependencies(currentDatabaseType(), node)) {
       items.push({ label: t("contextMenu.viewDependencies"), action: openDatabaseObjectDependencies, icon: Network });
     }

@@ -80,8 +80,8 @@ afterEach(() => {
 describe("source dialog dependency integration", () => {
   it("keeps the real CodeMirror draft, undo history and selection through dependency refresh", async () => {
     const { open, onOpenObject } = mountDialog();
-    await vi.waitFor(() => expect(button("contextMenu.editView")?.disabled).toBe(false));
-    button("contextMenu.editView").click();
+    await vi.waitFor(() => expect(button("contextMenu.editObject")?.disabled).toBe(false));
+    button("contextMenu.editObject").click();
     await vi.waitFor(() => expect(document.querySelector("[data-object-source-editor] .cm-editor")).not.toBeNull());
     const editor = document.querySelector<HTMLElement>("[data-object-source-editor] .cm-editor")!;
     const view = EditorView.findFromDOM(editor)!;

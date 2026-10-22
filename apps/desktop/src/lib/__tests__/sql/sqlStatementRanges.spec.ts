@@ -582,6 +582,12 @@ describe("splitSqlStatementRanges", () => {
     expect(rangeSqlTexts(splitSqlStatementRanges(sql, "mysql"))).toEqual(["SELECT 1", "SELECT 2"]);
   });
 
+  it("treats hash comments as line comments on generic JDBC and Hive connections", () => {
+    const sql = "SELECT 1 # comment;\n;\nSELECT 2";
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "jdbc"))).toEqual(["SELECT 1", "SELECT 2"]);
+    expect(rangeSqlTexts(splitSqlStatementRanges(sql, "hive"))).toEqual(["SELECT 1", "SELECT 2"]);
+  });
+
   it("keeps SQL Server temporary table names instead of treating them as hash comments", () => {
     const sql = "DROP TABLE IF EXISTS #Temp;\nSELECT * FROM ##GlobalTemp;";
     expect(rangeSqlTexts(splitSqlStatementRanges(sql, "sqlserver"))).toEqual(["DROP TABLE IF EXISTS #Temp", "SELECT * FROM ##GlobalTemp"]);
@@ -723,6 +729,61 @@ SELECT f1 + f2 FROM dual;`;
     expect(hasMultipleExecutionTargets(argoProcedureFixture, "argo")).toBe(false);
     expect(rangeSqlTexts(executableStatementRanges(argoProcedureFixture, "argo"))).toEqual([argoProcedureFixture]);
     expect(rangeSqlTexts(splitSqlStatementRanges(argoProcedureFixture, "transwarp"))).toEqual([argoProcedureFixture]);
+    expect(rangeSqlTexts(splitSqlStatementRanges(argoProcedureFixture, "jdbc"))).toEqual([argoProcedureFixture]);
+    expect(rangeSqlTexts(splitSqlStatementRanges(argoProcedureFixture, "hive"))).toEqual([argoProcedureFixture]);
+  });
+
+  it("keeps procedure bodies together on JDBC and Hive connections (#12321)", () => {
+    const procedure = `CREATE OR REPLACE PROCEDURE pro_cbs_check_his(is_date IN VARCHAR(8))
+IS
+BEGIN
+    DELETE FROM transwarp.tmp_cbs_t00_corp_cust_his
+    WHERE data_date = is_date;
+
+    INSERT INTO transwarp.tmp_cbs_t00_corp_cust_his
+    SELECT * FROM transwarp.cbs_t00_corp_cust_his
+    WHERE data_date = is_date;
+
+    COMMIT;
+END;`;
+
+    for (const dbType of ["jdbc", "hive", "argo", "transwarp"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(procedure, dbType))).toEqual([procedure]);
+      expect(hasMultipleExecutionTargets(procedure, dbType)).toBe(false);
+      expect(rangeSqlTexts(executableStatementRanges(procedure, dbType))).toEqual([procedure]);
+    }
+
+    const procedureWithAs = `CREATE OR REPLACE PROCEDURE pro_cbs_check_his(is_date IN VARCHAR(8))
+AS
+BEGIN
+    DELETE FROM transwarp.tmp_cbs_t00_corp_cust_his
+    WHERE data_date = is_date;
+
+    COMMIT;
+END;`;
+
+    for (const dbType of ["jdbc", "hive", "argo", "transwarp"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(procedureWithAs, dbType))).toEqual([procedureWithAs]);
+      expect(hasMultipleExecutionTargets(procedureWithAs, dbType)).toBe(false);
+      expect(rangeSqlTexts(executableStatementRanges(procedureWithAs, dbType))).toEqual([procedureWithAs]);
+    }
+  });
+
+  it("splits vanilla Hive string-bodied functions at semicolons on JDBC and Hive connections", () => {
+    const sqlBasic = `CREATE FUNCTION my_udf AS 'com.example.Mask';
+SELECT mask_fn(x) FROM t;`;
+
+    const sqlIfNotExists = `CREATE FUNCTION IF NOT EXISTS my_udf AS 'com.example.Mask';
+SELECT mask_fn(x) FROM t;`;
+
+    const sqlTemporary = `CREATE TEMPORARY FUNCTION my_udf AS 'com.example.Mask';
+SELECT mask_fn(x) FROM t;`;
+
+    for (const dbType of ["jdbc", "hive"] as const) {
+      expect(rangeSqlTexts(splitSqlStatementRanges(sqlBasic, dbType))).toEqual(["CREATE FUNCTION my_udf AS 'com.example.Mask'", "SELECT mask_fn(x) FROM t"]);
+      expect(rangeSqlTexts(splitSqlStatementRanges(sqlIfNotExists, dbType))).toEqual(["CREATE FUNCTION IF NOT EXISTS my_udf AS 'com.example.Mask'", "SELECT mask_fn(x) FROM t"]);
+      expect(rangeSqlTexts(splitSqlStatementRanges(sqlTemporary, dbType))).toEqual(["CREATE TEMPORARY FUNCTION my_udf AS 'com.example.Mask'", "SELECT mask_fn(x) FROM t"]);
+    }
   });
 
   it("statement at cursor inside an ArgoDB procedure body returns the whole definition", () => {

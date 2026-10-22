@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { dirname, resolve, relative } from "node:path";
+import { dirname, resolve, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "vue/compiler-sfc";
 import { describe, expect, it } from "vitest";
@@ -13,6 +13,11 @@ import { APP_CUSTOM_UI_COLOR_DEFS } from "@/lib/app/appTheme";
 
 const src = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const root = resolve(src, "components/editor/EditorSettingsDialog.vue");
+
+/** Findings key with POSIX separators so the expectations stay stable on Windows. */
+function relativePosix(file: string): string {
+  return relative(src, file).split(sep).join("/");
+}
 
 // These dialogs display transient operations or release notes, not persisted settings.
 // UI primitives and decorative icons are excluded by directory, not by control label.
@@ -55,6 +60,9 @@ const auditedNonLiteralLabels: Record<string, string> = {
   "t(def.labelKey)": "APP_CUSTOM_UI_COLOR_DEFS tested below",
   "getToolbarVisibilityItemLabel(item)": "Toolbar controls and index share TOOLBAR_VISIBILITY_ITEMS",
   "t(tool.labelKey)": "MCP_TOOL_OPTIONS tested below",
+  "t(`settings.${titleKey}`) t(option.labelKey)": "Formatter rule titles and option labels derived from the SFC below",
+  "t(`settings.${titleKey}`)": "Formatter rule titles derived from the SFC below",
+  "t(`settings.${titleKey}`) t(`settings.sqlFormatterRule_${value}`)": "Formatter rule titles and enum labels derived from the SFC below",
   database: "User-owned database names must never enter the static search index",
   Authentication: "Static AI protocol alias tested below",
   Endpoint: "Static AI protocol alias tested below",
@@ -97,7 +105,7 @@ function inspectSettingsTemplates(entry: string): Map<string, Set<string>> {
           const expression = expressions(node).trim().replace(/\s+/g, " ");
           const translated = translationKeys(expression);
           translated.forEach((key) => keys.add(key));
-          if (expression && !translated.length && !auditedNonLiteralLabels[expression]) unauditedLabels.push(`${relative(src, file)}: ${expression}`);
+          if (expression && !translated.length && !auditedNonLiteralLabels[expression]) unauditedLabels.push(`${relativePosix(file)}: ${expression}`);
         }
         // Buttons with configuration roles are settings, not ordinary action buttons.
         const role = node.props?.find((prop) => prop.name === "role")?.value?.content;
@@ -120,7 +128,15 @@ function inspectSettingsTemplates(entry: string): Map<string, Set<string>> {
     if (/ThemeCustomizerDialog|DataGridTypeColorSchemeDialog/.test(file)) {
       for (const match of script.matchAll(/labelKey:\s*["']([^"']+)["']|label:\s*t\(\s*["']([^"']+)["']/g)) keys.add(match[1] ?? match[2]);
     }
-    findings.set(relative(src, file), keys);
+    // Formatter rule rows render their labels from local definitions rather than literal template keys.
+    if (file.endsWith("SqlFormatterSettingsPanel.vue")) {
+      for (const match of script.matchAll(/titleKey:\s*["']([^"']+)["']/g)) keys.add(`settings.${match[1]}`);
+      for (const match of script.matchAll(/labelKey:\s*["']([^"']+)["']/g)) keys.add(match[1]);
+      const ruleEnums = script.match(/const ruleEnums = \{([\s\S]*?)\} as const;/)?.[1];
+      if (!ruleEnums) throw new Error("Formatter rule enum source is missing");
+      for (const match of ruleEnums.matchAll(/["']([^"']+)["']/g)) keys.add(`settings.sqlFormatterRule_${match[1]}`);
+    }
+    findings.set(relativePosix(file), keys);
     for (const component of components) {
       if (excludedComponents[component]) continue;
       const importPath = imports.get(component)!;

@@ -270,7 +270,7 @@ fn maps_table_pagination_strategy_by_database_type() {
     );
     assert_eq!(
         pagination_strategy(Some(DatabaseType::Oracle), PaginationContext::UserQuery),
-        TablePaginationStrategy::Unbounded
+        TablePaginationStrategy::Rownum
     );
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Jdbc)), TablePaginationStrategy::AgentMaxRows);
     // Both Spanner dialects support `LIMIT n OFFSET m`; pin the fallback.
@@ -711,6 +711,32 @@ fn builds_table_data_where_and_schema_queries() {
         }),
         "SELECT FIRST 100 * FROM gbasedbt.connection_smoke"
     );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Gbase8s),
+            schema: Some("gbasedbt".to_string()),
+            table_name: "v_orders".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "SELECT FIRST 100 * FROM v_orders"
+    );
+    assert_eq!(
+        build_table_data_select_sql(TableDataSelectSqlOptions {
+            database_type: Some(DatabaseType::Gbase8s),
+            identifier_quote: Some(String::new()),
+            schema: Some("gbasedbt".to_string()),
+            table_name: "v_orders".to_string(),
+            limit: Some(100),
+            ..Default::default()
+        }),
+        "SELECT FIRST 100 * FROM v_orders"
+    );
+    assert_eq!(
+        build_count_table_sql(Some(DatabaseType::Gbase8s), Some("gbasedbt"), "v_orders"),
+        "SELECT COUNT(*) AS row_count FROM v_orders"
+    );
+    assert_eq!(qualified_table_name(Some(DatabaseType::Gbase8s), Some("gbasedbt"), "v_orders"), "v_orders");
     assert_eq!(
         build_table_data_select_sql(TableDataSelectSqlOptions {
             database_type: Some(DatabaseType::Gaussdb),

@@ -14,7 +14,7 @@ import { supportsConnectionLevelSqlExecution } from "@/lib/connection/connection
 import { classifySqlActivityKind } from "@/lib/history/historyActivityKind";
 import { sqlMetadataRefreshTarget } from "@/lib/sql/sqlMetadataRefresh";
 import { invalidateObjectMetadataCache } from "@/lib/metadata/objectMetadataCache";
-import { defaultViewForResult } from "@/lib/query/queryResultDefaultView";
+import { defaultViewForResult, statementRunsWithoutResultGrid } from "@/lib/query/queryResultDefaultView";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
 import { classifyRedisCommandSafety } from "@/lib/redis/redisCommandSafety";
 import { isRedisCommentLine } from "@/lib/redis/redisCommandTokenizer";
@@ -168,6 +168,7 @@ export function useSqlExecution(deps: {
   resolveExecutableSql?: (snapshot?: SqlExecutionSnapshot, tab?: QueryTab) => Promise<string>;
   activeOutputView: Ref<"result" | "graph" | "summary" | "explain" | "chart" | "messages" | "profile">;
   blockDangerousRedisCommands?: Ref<boolean>;
+  onMissingConnection?: (tabId?: string) => void;
   onMissingDatabase?: (tabId?: string) => void;
   requestDangerConfirmation?: (request: SqlExecutionDangerRequest) => Promise<boolean>;
   onExecutionStarted?: (editorViewportRequestId: number) => void;
@@ -234,7 +235,11 @@ export function useSqlExecution(deps: {
 
   function resolveExecutionConnection(tabId: string | undefined): ConnectionConfig | undefined {
     const tab = resolveExecutionTab(tabId);
-    return (tab ? connectionStore.getConfig(tab.connectionId) : undefined) ?? deps.activeConnection.value;
+    if (tab) {
+      if (!tab.connectionId) return undefined;
+      return connectionStore.getConfig(tab.connectionId) ?? (tab.connectionId === deps.activeConnection.value?.id ? deps.activeConnection.value : undefined);
+    }
+    return deps.activeConnection.value;
   }
 
   function captureExecutionContext(tabId?: string): SqlExecutionContext | undefined {
@@ -316,6 +321,11 @@ export function useSqlExecution(deps: {
     if (tab.isExecuting) {
       cancelEditorViewportRequest(editorViewportRequestId);
       return notStarted("busy", context.tabId);
+    }
+    if (requiresConnectionSelection(tab, context.connection)) {
+      deps.onMissingConnection?.(context.tabId);
+      cancelEditorViewportRequest(editorViewportRequestId);
+      return notStarted("no-connection", context.tabId);
     }
     if (requiresDatabaseSelection(tab, context.connection, sql)) {
       deps.onMissingDatabase?.(context.tabId);
@@ -416,10 +426,12 @@ export function useSqlExecution(deps: {
   function prepareSqlParameterDialog(sql: string, sourceOffset?: number, options: SqlExecutionOptions = {}, continuation?: (sql: string, sourceOffset?: number) => Promise<void> | void): boolean {
     const connection = resolveExecutionConnection(options.tabId);
     const databaseType = effectiveDatabaseTypeForConnection(connection) ?? connection?.db_type;
-    const toggles = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, databaseType, settingsStore.editorSettings.sqlVariableSubstitutionEnabled);
+    const tab = resolveExecutionTab(options.tabId);
+    const compatibilityMode = databaseType === "opengauss" ? (tab ? connectionStore.databaseCompatibilityMode(tab.connectionId, tab.database) : undefined) : databaseType === "kingbase" ? connection?.database_info?.compatibilityMode : undefined;
+    const toggles = resolveSqlVariableSyntaxToggles(settingsStore.editorSettings.sqlVariableSyntaxOverrides, databaseType, settingsStore.editorSettings.sqlVariableSubstitutionEnabled, compatibilityMode);
     const enabledSyntaxes = enabledSqlParameterSyntaxes(toggles);
     const parameterDatabaseType = kingbaseSqlDatabaseType(connection) ?? databaseType;
-    const parameters = extractSqlParameterDescriptors(sql, { databaseType: parameterDatabaseType, enabledSyntaxes });
+    const parameters = extractSqlParameterDescriptors(sql, { databaseType: parameterDatabaseType, compatibilityMode, enabledSyntaxes });
     if (!parameters.length) {
       return false;
     }
@@ -485,8 +497,13 @@ export function useSqlExecution(deps: {
       cancelEditorViewportRequest(options.editorViewportRequestId);
       return notStarted("no-tab", executionTabId);
     }
-    const executionConnection = connectionStore.getConfig(tab.connectionId) ?? deps.activeConnection.value;
+    const executionConnection = tab.connectionId ? (connectionStore.getConfig(tab.connectionId) ?? (tab.connectionId === deps.activeConnection.value?.id ? deps.activeConnection.value : undefined)) : undefined;
     const executionDatabaseType = executionConnection?.db_type;
+    if (requiresConnectionSelection(tab, executionConnection)) {
+      deps.onMissingConnection?.(executionTabId);
+      cancelEditorViewportRequest(options.editorViewportRequestId);
+      return notStarted("no-connection", executionTabId);
+    }
     if (requiresDatabaseSelection(tab, executionConnection, sql)) {
       deps.onMissingDatabase?.(executionTabId);
       cancelEditorViewportRequest(options.editorViewportRequestId);
@@ -498,10 +515,14 @@ export function useSqlExecution(deps: {
       sqlStatementParameterOptionsForCompatibility(executionDatabaseType, executionDatabaseType === "opengauss" ? connectionStore.databaseCompatibilityMode(tab.connectionId, tab.database) : executionDatabaseType === "kingbase" ? executionConnection?.database_info?.compatibilityMode : undefined),
     ).length;
     const redisConsoleSelected = executionDatabaseType === "redis" && tab.uiState?.redisResultViewMode === "console";
+    // A single write/DDL statement has no result grid to show while it runs, so
+    // it starts on the summary tab where the in-flight status is rendered
+    // instead of leaving an empty data grid up (issue #12283).
+    const autoSummaryWhileRunning = statementCount === 1 && !redisConsoleSelected && executionDatabaseType !== "redis" && statementRunsWithoutResultGrid(sql);
     // Output-view switching belongs to the tab the user is looking at — both
     // when the query starts and when it finishes.
     if (deps.activeTab.value?.id === executionTabId) {
-      deps.activeOutputView.value = redisConsoleSelected ? "result" : statementCount > 1 ? settingsStore.editorSettings.multiStatementDefaultView : "result";
+      deps.activeOutputView.value = redisConsoleSelected ? "result" : statementCount > 1 ? settingsStore.editorSettings.multiStatementDefaultView : autoSummaryWhileRunning ? "summary" : "result";
     }
     updateExecutionTabUiState(tab, { autoSwitchedToMessagesDuringExecution: false });
     const connName = executionConnection?.name || "";
@@ -551,6 +572,10 @@ export function useSqlExecution(deps: {
           deps.activeOutputView.value = targetView;
         }
       }
+    } else if (executionTabStillActive && autoSummaryWhileRunning && deps.activeOutputView.value === "summary" && ((currentTab.result?.columns.length ?? 0) > 0 || currentTab.results?.some((result) => result.columns.length > 0))) {
+      // `INSERT ... RETURNING` and siblings do return a grid even though their
+      // leading keyword normally means "no result set"; show it once it lands.
+      deps.activeOutputView.value = "result";
     }
     updateExecutionTabUiState(currentTab, { autoSwitchedToMessagesDuringExecution: false });
     const elapsed = Date.now() - start;
@@ -626,6 +651,10 @@ export function useSqlExecution(deps: {
     if (!sql.trim()) return finish({ status: "failed", errorMessage: t("explain.emptySql") });
     if (!(await ensureReadOnlyWriteAccess({ connection, sql, source: t("production.sourceMultiDbSql") }))) {
       return finish({ status: "skipped", errorMessage: t("dangerDialog.cancel") });
+    }
+    if (requiresConnectionSelection(executionTab, connection)) {
+      deps.onMissingConnection?.(executionTab.id);
+      return finish({ status: "failed", errorMessage: t("editor.selectConnectionRequired") });
     }
     if (requiresDatabaseSelection(executionTab, connection, sql)) {
       return finish({ status: "failed", errorMessage: t("editor.selectDatabaseRequired") });
@@ -961,6 +990,14 @@ export function useSqlExecution(deps: {
       return;
     }
     const { sql, sourceOffset } = await resolvedExecutableSql(sqlOverride, context);
+    const tab = resolveExecutionTab(context.tabId);
+    if (!tab) {
+      return;
+    }
+    if (requiresConnectionSelection(tab, context.connection)) {
+      deps.onMissingConnection?.(context.tabId);
+      return;
+    }
     if (!sql.trim()) {
       toast(t("explain.emptySql"));
       return;
@@ -1107,6 +1144,11 @@ export function supportsSqlTemplateParameters(connection: Pick<ConnectionConfig,
   if (connection.db_type === "meilisearch" || connection.db_type === "solr" || connection.db_type === "couchdb") return false;
   if (connection.db_type === "elasticsearch" || connection.db_type === "easysearch") return !isElasticsearchRestRequestText(sql);
   return connection.db_type !== "redis" && connection.db_type !== "mongodb" && connection.db_type !== "victoriametrics" && connection.db_type !== "salesforce";
+}
+
+export function requiresConnectionSelection(tab: QueryTab, connection: ConnectionConfig | undefined): boolean {
+  if (tab.mode !== "query") return false;
+  return !connection;
 }
 
 export function requiresDatabaseSelection(tab: QueryTab, connection: ConnectionConfig | undefined, _sql = ""): boolean {

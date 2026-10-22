@@ -307,6 +307,14 @@ describe("EditorGroupTabBar group behavior", () => {
         expect(activeBackground).toBe("rgba(59, 130, 246, 0.24)");
       }
 
+      // Restricting connection-tab colors to active tab silences the inactive wash.
+      settings.editorSettings.colorizeConnectionTabsScope = "active";
+      await settle();
+      expect(host.querySelector<HTMLElement>(`[data-tab-id="${configuredTabId}"]`)!.style.getPropertyValue("--app-tab-background")).toBe("");
+      expect(host.querySelector<HTMLElement>(`[data-tab-id="${activeTabId}"]`)!.style.getPropertyValue("--app-tab-background")).toBe("rgba(59, 130, 246, 0.24)");
+      settings.editorSettings.colorizeConnectionTabsScope = "all";
+      await settle();
+
       // Turning the connection-tab colors off must silence the inactive wash
       // even for a configured connection color.
       settings.editorSettings.colorizeConnectionTabs = false;
@@ -377,6 +385,16 @@ describe("EditorGroupTabBar group behavior", () => {
       expect(inactiveTab.style.getPropertyValue("--app-tab-background")).toBe("rgba(59, 130, 246, 0.09)");
       expect(inactiveTab.style.getPropertyValue("--app-tab-hover-background")).toBe("rgba(59, 130, 246, 0.16)");
       expect(inactiveTab.style.borderColor).toBe("rgba(59, 130, 246, 0.18)");
+
+      // Restricting connection-tab colors to active tab keeps active accents but removes inactive styles.
+      settings.editorSettings.colorizeConnectionTabsScope = "active";
+      await settle();
+      expect(tab.style.getPropertyValue("--app-tab-background")).toBe("rgba(34, 197, 94, 0.24)");
+      expect(tab.style.getPropertyValue("--app-tab-active-border")).toBe("rgba(34, 197, 94, 0.72)");
+      expect(tab.style.getPropertyValue("--app-tab-active-accent")).toBe("#22c55e");
+      expect(inactiveTab.style.getPropertyValue("--app-tab-background")).toBe("");
+      expect(inactiveTab.style.getPropertyValue("--app-tab-hover-background")).toBe("");
+      expect(inactiveTab.style.borderColor).toBe("");
 
       settings.editorSettings.colorizeConnectionTabs = false;
       await settle();
@@ -877,6 +895,23 @@ describe("EditorGroupTabBar special page navigation", () => {
     });
     return { ...mounted, store, settings, tabId, specialPageTabs, events };
   }
+
+  it("returns from a special page when the current two-row group is clicked", async () => {
+    const activate = vi.fn();
+    const { app, host, settings, tabId } = mountSpecialBar({ "onActivate-tab": activate });
+    settings.editorSettings.tabGroupRows = "two-row";
+    try {
+      await settle();
+      const group = host.querySelector<HTMLButtonElement>(".tab-group-rail-scroll .tab-group-header");
+      expect(group).not.toBeNull();
+      group!.click();
+      await settle();
+      expect(activate).toHaveBeenCalledWith(tabId);
+    } finally {
+      app.unmount();
+      host.remove();
+    }
+  });
 
   it.each(["classic", "separated"] as const)("keeps grouped tabs and both special pages at every placement in %s layout", async (layout) => {
     const { app, host, settings, store, tabId } = mountSpecialBar();

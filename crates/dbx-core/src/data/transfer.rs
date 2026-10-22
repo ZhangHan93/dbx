@@ -4166,7 +4166,7 @@ fn format_oracle_temporal_sql_literal(
     let normalized_column_type = column_type?.trim().to_ascii_lowercase();
     let parts = oracle_export_date_parts(value)?;
     match kind {
-        "date" => Some(format_oracle_date_sql_literal_parts(&parts)),
+        "date" => Some(format_oracle_date_sql_literal_parts(&parts, db_type)),
         "datetime"
             if (normalized_column_type.contains("with time zone")
                 || normalized_column_type.contains("with local time zone"))
@@ -4196,8 +4196,11 @@ struct OracleExportDateParts<'a> {
     zone: Option<&'a str>,
 }
 
-fn format_oracle_date_sql_literal_parts(parts: &OracleExportDateParts<'_>) -> String {
-    if oracle_export_date_parts_are_midnight(parts) {
+fn format_oracle_date_sql_literal_parts(parts: &OracleExportDateParts<'_>, db_type: &DatabaseType) -> String {
+    // Oracle accepts the ANSI `DATE 'YYYY-MM-DD'` literal for midnight values.
+    // OceanBase's Oracle mode resolves that spelling through NLS_DATE_FORMAT, so the
+    // same value can raise ORA-01858; use the explicit mask there (#12841).
+    if *db_type == DatabaseType::Oracle && oracle_export_date_parts_are_midnight(parts) {
         format!("DATE '{}'", parts.date)
     } else {
         format!("TO_DATE('{} {}', 'YYYY-MM-DD HH24:MI:SS')", parts.date, parts.time)
@@ -4554,10 +4557,18 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
             DatabaseType::SqlServer => "INT".into(),
             _ => "INTEGER".into(),
         },
-        "bigint" | "int8" => "BIGINT".into(),
+        // Oracle has no BIGINT/TINYINT spelling. `INTEGER` and `SMALLINT` are ANSI
+        // synonyms for NUMBER(38, 0), so they hold the full MySQL range (#12976:
+        // a MySQL -> OceanBase Oracle structure transfer failed with ORA-00900 at
+        // `BIGINT NOT NULL`). Other targets keep their native widths.
+        "bigint" | "int8" => match target_db {
+            DatabaseType::Oracle | DatabaseType::OceanbaseOracle => "INTEGER".into(),
+            _ => "BIGINT".into(),
+        },
         "smallint" | "int2" => "SMALLINT".into(),
         "tinyint" => match target_db {
             target_db if is_postgres_transfer_dialect(target_db) => "SMALLINT".into(),
+            DatabaseType::Oracle | DatabaseType::OceanbaseOracle => "SMALLINT".into(),
             _ => "TINYINT".into(),
         },
         "serial" | "bigserial" | "smallserial" => match target_db {
@@ -4888,7 +4899,14 @@ fn generate_create_table_ddl_with_column_quoting(
                     // sources must pass the same target type gate: Doris/StarRocks accept
                     // only BIGINT auto-increment columns, so an `INT AUTO_INCREMENT` from a
                     // MySQL source must stay a plain column there too (#12691 review).
+                    // MySQL also requires the auto-increment column to be a key, and the
+                    // generated DDL only recreates the primary key: a source column with
+                    // `extra = auto_increment` but no PK (a UNIQUE-key auto-increment is
+                    // legal MySQL) must stay a plain column instead of producing DDL MySQL
+                    // rejects ("there can be only one auto column and it must be defined
+                    // as a key").
                     let mysql_auto_increment = mysql_auto_increment_type_ok
+                        && c.is_primary_key
                         && (mysql_identity_source
                             || mysql_extra_clauses.as_ref().is_some_and(|extra| extra.auto_increment));
                     if !skip_default && !mysql_auto_increment {
@@ -21340,6 +21358,11 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             "DATE '2022-08-25'"
         );
         assert_eq!(
+            escape_value_typed(&json!("2022-08-25T00:00:00Z"), &DatabaseType::OceanbaseOracle, Some("DATE")),
+            "TO_DATE('2022-08-25 00:00:00', 'YYYY-MM-DD HH24:MI:SS')",
+            "OceanBase Oracle mode must not use the ANSI DATE literal (#12841)"
+        );
+        assert_eq!(
             escape_value_typed(
                 &json!("2022-08-25T09:58:43.123456+08:00"),
                 &DatabaseType::Oracle,
@@ -21347,6 +21370,24 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
             ),
             "TO_TIMESTAMP_TZ('2022-08-25 09:58:43.123456 +08:00', 'YYYY-MM-DD HH24:MI:SS.FF TZH:TZM')"
         );
+    }
+
+    #[test]
+    fn oceanbase_oracle_insert_uses_explicit_to_date_for_midnight_dates() {
+        // #12841: OceanBase's Oracle mode resolves `DATE '...'` through NLS_DATE_FORMAT,
+        // so midnight DATE values raised ORA-01858 during transfer; use TO_DATE instead.
+        let sql = generate_insert_typed(
+            &[String::from("id"), String::from("ordertime")],
+            &[Some(String::from("NUMBER")), Some(String::from("DATE"))],
+            &[vec![json!(1), json!("2026-10-20T00:00:00Z")]],
+            "appointments",
+            "APP",
+            &DatabaseType::OceanbaseOracle,
+            None,
+        );
+
+        assert!(sql.contains("TO_DATE('2026-10-20 00:00:00', 'YYYY-MM-DD HH24:MI:SS')"), "{sql}");
+        assert!(!sql.contains("DATE '2026-10-20'"), "{sql}");
     }
 
     #[test]
@@ -21955,7 +21996,14 @@ SELECT 1 FROM dual"#
             assert!(sql.contains("ON (t.\"ID\" = s.\"ID\" AND t.\"Kind\" = s.\"Kind\")"));
             assert!(sql.contains("WHEN MATCHED THEN UPDATE SET t.\"Name\" = s.\"Name\", t.\"CREATED\" = s.\"CREATED\", t.\"UPDATED\" = s.\"UPDATED\", t.\"OPTIONAL\" = s.\"OPTIONAL\""));
             assert!(sql.contains("'O''Brien' AS \"Name\""));
-            assert!(sql.contains("DATE '2026-10-09' AS \"CREATED\""));
+            // OceanBase's Oracle mode resolves ANSI date literals through
+            // NLS_DATE_FORMAT, so midnight values use an explicit TO_DATE (#12841).
+            let created_literal = if matches!(database_type, DatabaseType::OceanbaseOracle) {
+                "TO_DATE('2026-10-09 00:00:00', 'YYYY-MM-DD HH24:MI:SS') AS \"CREATED\""
+            } else {
+                "DATE '2026-10-09' AS \"CREATED\""
+            };
+            assert!(sql.contains(created_literal), "{database_type:?}: {sql}");
             assert!(sql.contains("TO_DATE('2026-10-09 12:34:56', 'YYYY-MM-DD HH24:MI:SS') AS \"UPDATED\""));
             assert!(sql.contains("NULL AS \"OPTIONAL\""));
             assert_eq!(sql.matches("FROM dual").count(), 2);
@@ -22851,6 +22899,61 @@ SELECT 1 FROM dual"#
         // no precision to lose.
         assert_eq!(map_column_type("NUMBER", &DatabaseType::Oracle, &DatabaseType::OceanbaseOracle), "NUMERIC");
         assert_eq!(map_column_type("NUMBER", &DatabaseType::Oracle, &DatabaseType::Dameng), "NUMERIC");
+    }
+
+    #[test]
+    fn map_column_type_uses_oracle_family_integer_types_for_mysql_widths() {
+        // Issue #12976: MySQL `bigint` / `tinyint` were emitted verbatim, but
+        // Oracle-compatible targets have no BIGINT/TINYINT type. INTEGER and
+        // SMALLINT are ANSI synonyms for NUMBER(38, 0) and cover the source range.
+        for target in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+            assert_eq!(map_column_type("bigint", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("BIGINT", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("bigint unsigned", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("BIGINT(20)", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("int8", &DatabaseType::Postgres, &target), "INTEGER");
+            assert_eq!(map_column_type("tinyint", &DatabaseType::Mysql, &target), "SMALLINT");
+            assert_eq!(map_column_type("TINYINT(1)", &DatabaseType::Mysql, &target), "SMALLINT");
+            assert_eq!(map_column_type("int", &DatabaseType::Mysql, &target), "INTEGER");
+            assert_eq!(map_column_type("smallint", &DatabaseType::Mysql, &target), "SMALLINT");
+        }
+
+        // Other targets keep their native integer spellings.
+        assert_eq!(map_column_type("bigint", &DatabaseType::Postgres, &DatabaseType::Mysql), "BIGINT");
+        assert_eq!(map_column_type("bigint", &DatabaseType::Mysql, &DatabaseType::Postgres), "BIGINT");
+        assert_eq!(map_column_type("bigint", &DatabaseType::Mysql, &DatabaseType::SqlServer), "BIGINT");
+        assert_eq!(map_column_type("bigint", &DatabaseType::Mysql, &DatabaseType::Dameng), "BIGINT");
+        assert_eq!(map_column_type("tinyint", &DatabaseType::SqlServer, &DatabaseType::Mysql), "TINYINT");
+        assert_eq!(map_column_type("tinyint", &DatabaseType::Mysql, &DatabaseType::SqlServer), "TINYINT");
+        assert_eq!(map_column_type("tinyint", &DatabaseType::Mysql, &DatabaseType::Dameng), "TINYINT");
+    }
+
+    #[test]
+    fn transfer_create_table_mysql_bigint_to_oceanbase_oracle_uses_integer() {
+        let columns = vec![
+            db::ColumnInfo { is_primary_key: true, ..test_column("ID", "bigint") },
+            test_column("GROUPNO", "int"),
+            test_column("GROUPDESC", "varchar(100)"),
+            test_column("TINY", "tinyint"),
+        ];
+
+        let ddl = generate_create_table_ddl(
+            &columns,
+            "CLAIM",
+            "nw",
+            "NWGJ",
+            &DatabaseType::OceanbaseOracle,
+            &DatabaseType::Mysql,
+            None,
+            None,
+        );
+
+        assert!(ddl.contains("\"ID\" INTEGER"), "{ddl}");
+        assert!(ddl.contains("\"GROUPNO\" INTEGER"), "{ddl}");
+        assert!(ddl.contains("\"GROUPDESC\" VARCHAR(100 CHAR)"), "{ddl}");
+        assert!(ddl.contains("\"TINY\" SMALLINT"), "{ddl}");
+        assert!(!ddl.contains("BIGINT"), "{ddl}");
+        assert!(!ddl.contains("TINYINT"), "{ddl}");
     }
 
     #[test]
@@ -23756,6 +23859,50 @@ SELECT 1 FROM dual"#
         );
 
         assert!(!ddl.contains("AUTO_INCREMENT"), "ddl: {ddl}");
+    }
+
+    #[test]
+    fn transfer_create_table_keeps_non_key_auto_increment_sources_out_of_auto_increment() {
+        // A MySQL source may define AUTO_INCREMENT on a UNIQUE-key column without a
+        // primary key. The generated transfer DDL only recreates the primary key, so
+        // emitting AUTO_INCREMENT there would fail with "there can be only one auto
+        // column and it must be defined as a key"; keep it a plain column instead.
+        let non_key = vec![db::ColumnInfo {
+            is_primary_key: false,
+            is_nullable: false,
+            extra: Some("auto_increment".to_string()),
+            ..test_column("ticket", "int")
+        }];
+        let non_key_ddl = generate_create_table_ddl(
+            &non_key,
+            "users",
+            "source",
+            "shop",
+            &DatabaseType::Mysql,
+            &DatabaseType::Mysql,
+            None,
+            None,
+        );
+        assert!(!non_key_ddl.contains("AUTO_INCREMENT"), "ddl: {non_key_ddl}");
+
+        // A primary-key AUTO_INCREMENT column keeps the clause.
+        let primary_key = vec![db::ColumnInfo {
+            is_primary_key: true,
+            is_nullable: false,
+            extra: Some("auto_increment".to_string()),
+            ..test_column("id", "int")
+        }];
+        let primary_key_ddl = generate_create_table_ddl(
+            &primary_key,
+            "users",
+            "source",
+            "shop",
+            &DatabaseType::Mysql,
+            &DatabaseType::Mysql,
+            None,
+            None,
+        );
+        assert!(primary_key_ddl.contains("AUTO_INCREMENT"), "ddl: {primary_key_ddl}");
     }
 
     #[test]

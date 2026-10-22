@@ -9593,7 +9593,9 @@ pub async fn get_table_owner_core(
 /// they already iterate every relation themselves. A selected table structure
 /// export and interactive display both recurse through the PostgreSQL
 /// partition tree, while only display includes access statements. Oracle
-/// exports additionally request portable DDL normalization.
+/// exports and transfers additionally request portable DDL normalization: a
+/// transfer target must not inherit the source tablespaces, which the target
+/// user may have no quota on (#11939).
 #[derive(Clone, Copy)]
 struct TableDdlOptions {
     include_postgres_access: bool,
@@ -9610,6 +9612,12 @@ impl TableDdlOptions {
         include_sqlserver_temporal: false,
     };
     const RELATION_EXPORT: Self = Self {
+        include_postgres_access: false,
+        include_partitions: false,
+        portable_oracle: true,
+        include_sqlserver_temporal: false,
+    };
+    const TRANSFER: Self = Self {
         include_postgres_access: false,
         include_partitions: false,
         portable_oracle: true,
@@ -9666,6 +9674,27 @@ pub async fn get_table_export_ddl_core(
         table,
         object_type,
         TableDdlOptions::EXPORT,
+        None,
+    )
+    .await
+}
+
+/// Source DDL for a table transfer that reuses it on the target.
+pub(crate) async fn get_table_transfer_ddl_core(
+    state: &AppState,
+    connection_id: &str,
+    database: &str,
+    schema: &str,
+    table: &str,
+) -> Result<String, String> {
+    get_table_ddl_core_with_options(
+        state,
+        connection_id,
+        database,
+        schema,
+        table,
+        None,
+        TableDdlOptions::TRANSFER,
         None,
     )
     .await
@@ -13028,6 +13057,12 @@ mod ddl_tests {
         assert_table_ddl_options(TableDdlOptions::EXPORT, true, true, false);
         assert_table_ddl_options(TableDdlOptions::RELATION_EXPORT, false, true, false);
         assert_table_ddl_options(TableDdlOptions::DISPLAY, true, false, true);
+    }
+
+    #[test]
+    fn table_transfer_requests_portable_oracle_ddl_for_one_relation() {
+        // Reused Oracle DDL must not carry source tablespaces into the target (#11939).
+        assert_table_ddl_options(TableDdlOptions::TRANSFER, false, true, false);
     }
 
     #[test]

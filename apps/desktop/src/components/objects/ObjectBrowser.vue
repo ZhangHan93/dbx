@@ -2079,12 +2079,12 @@ async function openNewQuery(row: ObjectBrowserRow) {
     tabId,
     await buildTableSelectSql({
       databaseType: effectiveDatabaseType.value,
-      driverProfile: props.connection.driver_profile,
+      driverProfile: props.connection.driver_profile || (props.connection.db_type === "gbase8s" ? "gbase8s" : undefined),
       serverVersion: props.connection.database_info?.productVersion,
       identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connection.id),
       catalog: props.catalog,
       database: props.database,
-      schema,
+      schema: connectionTableSqlSchema(props.connection, schema),
       tableName: row.name,
       includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
       limit: 100,
@@ -4728,7 +4728,8 @@ function getProcFuncMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   return [
     ...(item.type === "PROCEDURE" ? [{ label: t("contextMenu.executeProcedure"), action: () => openProcedureExecution(item), icon: Play }] : []),
     ...(effectiveDatabaseType.value === "xugu" && buildXuguCompileSql({ objectType: item.type, schema: item.schema || selectedSchema.value, name: item.name }) ? [{ label: t("contextMenu.compileObject"), action: () => compileXuguObject(item), icon: Wrench }] : []),
-    { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
+    { sidebarActionId: "contextMenu.editObject", label: t("contextMenu.editObject"), action: () => openSource(item), icon: PencilLine },
+    { sidebarActionId: "contextMenu.viewSource", label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
     ...(canRename(item) ? [{ label: t("contextMenu.renameObject"), action: () => requestRename(item), icon: Pencil }] : []),
     { label: "", separator: true },
     {
@@ -4757,7 +4758,8 @@ function getPackageMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   return [
     ...((effectiveDatabaseType.value === "oracle" || effectiveDatabaseType.value === "oceanbase-oracle") && (item.type === "PACKAGE" || item.type === "PACKAGE_BODY") ? [{ label: t("objects.packageSaveAsTitle"), action: () => requestPackageSaveAs(item), icon: CopyPlus }] : []),
     ...(effectiveDatabaseType.value === "xugu" && buildXuguCompileSql({ objectType: item.type, schema: item.schema || selectedSchema.value, name: item.name }) ? [{ label: t("contextMenu.compileObject"), action: () => compileXuguObject(item), icon: Wrench }] : []),
-    { label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
+    { sidebarActionId: "contextMenu.editObject", label: t("contextMenu.editObject"), action: () => openSource(item), icon: PencilLine },
+    { sidebarActionId: "contextMenu.viewSource", label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 },
     { label: "", separator: true },
     { label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy },
   ];

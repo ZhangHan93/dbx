@@ -2047,14 +2047,19 @@ function isPostgresFamilyDatabase(databaseType?: DatabaseType): boolean {
   return !!databaseType && POSTGRES_FAMILY_DATABASES.has(databaseType);
 }
 
+function isOracleStyleRoutineDatabase(databaseType?: DatabaseType): boolean {
+  return isPostgresFamilyDatabase(databaseType) || databaseType === "jdbc" || databaseType === "hive";
+}
+
 /**
  * Whether a statement must stay a single statement instead of being cut at its inner semicolons:
  * Oracle PL/SQL blocks on Oracle-like dialects, and the Oracle-style routine bodies that a
- * PostgreSQL-family connection reaches on a GaussDB/openGauss Oracle-compatibility server.
+ * PostgreSQL-family connection reaches on a GaussDB/openGauss Oracle-compatibility server,
+ * as well as generic JDBC and Hive drivers reaching ArgoDB/Inceptor procedure bodies (#12321).
  */
 export function keepsOracleStyleBlockTogether(sql: string, databaseType?: DatabaseType, options?: SqlParameterOptions): boolean {
   if (isOraclePlSqlStatement(sql, databaseType, options)) return true;
-  return isPostgresFamilyDatabase(databaseType) && startsWithOracleStyleRoutineBody(sql);
+  return isOracleStyleRoutineDatabase(databaseType) && startsWithOracleStyleRoutineBody(sql);
 }
 
 export function isOraclePlSqlStatement(sql: string, databaseType?: DatabaseType, options?: SqlParameterOptions): boolean {

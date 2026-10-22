@@ -92,6 +92,8 @@ export interface DrawCanvasDataGridOptions {
   /** 连续选区矩形（displayRow/visibleCol 坐标）。用于 Navicat 风格的形态区分：
    * 多格范围浅色填充 + 一圈细外框、内部零描边；1×1 画细边框；离散点选传空数组退回逐格描边 */
   selectionFrames?: readonly CellSelectionRange[];
+  /** Ctrl/Cmd+A 整表选中：只高亮数据格，行号栏不做选区覆盖着色（复制不含行号） */
+  selectingAll?: boolean;
   cellCanHover: (row: CanvasDataGridRow, actualColIdx: number) => boolean;
   infiniteScrollEnabled: boolean;
   pageOffset: number;
@@ -388,6 +390,7 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions): boolean 
     rowCellsUseSelectionVisual,
     cellIsSelected,
     selectionFrames = [],
+    selectingAll = false,
     cellCanHover,
     infiniteScrollEnabled,
     pageOffset,
@@ -499,7 +502,7 @@ export function drawCanvasDataGrid(options: DrawCanvasDataGridOptions): boolean 
 
     // 选区覆盖指示（Navicat 风格）：行落在选区范围内时行号淡色高亮；
     // 优先级低于行选中/状态色/活动行，与 DOM 的级联顺序一致
-    const rowInSelection = !rowSelectionVisual && selectionRowCoverage && dataGridFrameCoversRow(selectionFrames, item.displayIndex);
+    const rowInSelection = !selectingAll && !rowSelectionVisual && selectionRowCoverage && dataGridFrameCoversRow(selectionFrames, item.displayIndex);
     const rowNumberFill = rowSelectionVisual
       ? theme.rowNumberSelected
       : item.status === "draft"

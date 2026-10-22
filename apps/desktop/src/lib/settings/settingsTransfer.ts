@@ -3,7 +3,7 @@ import { DEFAULT_CUSTOM_THEME_COLORS, DEFAULT_CUSTOM_THEME_DDL_COLORS, DEFAULT_E
 import { EDITOR_MAX_FONT_SIZE, EDITOR_MIN_FONT_SIZE } from "@/lib/editor/editorZoom";
 import { DATA_GRID_TYPE_COLOR_KEYS, DATA_GRID_TYPE_COLOR_SCHEME_AUTO_ID } from "@/lib/dataGrid/dataGridTypeColorScheme";
 import { SHORTCUT_DEFINITIONS } from "@/lib/editor/shortcutRegistry";
-import { DEFAULT_SQL_FORMATTER_SETTINGS, isCompleteSqlFormatterSettings, type SqlFormatterOptionSettings } from "@/lib/sql/sqlFormatterConfig";
+import { DEFAULT_SQL_FORMATTER_RULE_SETTINGS, DEFAULT_SQL_FORMATTER_SETTINGS, isCompleteSqlFormatterSettings, type SqlFormatterOptionSettings, type SqlFormatterRuleSettings } from "@/lib/sql/sqlFormatterConfig";
 import { SQL_VARIABLE_SYNTAX_KEYS } from "@/lib/sql/sqlVariableSyntax";
 
 /**
@@ -88,6 +88,7 @@ const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readon
     "insertSpaceAfterCompletion",
     "sqlServerSpaceConfirmsCompletion",
     "functionCompletionIncludeParams",
+    "sequenceCompletionEnabled",
     "sortCompletionColumnsAlphabetically",
     "selectFirstCompletionOnOpen",
     "completionTriggerMode",
@@ -124,8 +125,10 @@ const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readon
     "tabPlacement",
     "tabGroupMode",
     "colorizeConnectionTabs",
+    "colorizeConnectionTabsScope",
     "tabSortMode",
     "tabMaxWidth",
+    "tabGroupRows",
     "sidebarActivation",
     "sidebarObjectDisplay",
     "routineSourceOpenMode",
@@ -146,6 +149,7 @@ const SETTINGS_TRANSFER_CATEGORY_KEYS: Record<SettingsTransferCategoryId, readon
     "sidebarObjectInfoMode",
     "sidebarAllowHorizontalScroll",
     "sidebarShowTooltips",
+    "sidebarShowUserAdmin",
     "sidebarIndent",
     "sidebarFontSize",
     "sidebarDensity",
@@ -301,6 +305,7 @@ const PASS_THROUGH_BOOLEAN_KEYS = [
   "showExecutionTargetPicker",
   "autoAliasTables",
   "functionCompletionIncludeParams",
+  "sequenceCompletionEnabled",
   "confirmDangerousSqlExecution",
   "confirmUnsavedSqlClose",
   "showColumnCommentsInHeader",
@@ -323,6 +328,7 @@ const PASS_THROUGH_BOOLEAN_KEYS = [
   "sidebarPinDefaultDatabase",
   "sidebarAllowHorizontalScroll",
   "sidebarShowTooltips",
+  "sidebarShowUserAdmin",
   "updateNotificationsEnabled",
   "autoDownloadUpdates",
   "autoUpdateApp",
@@ -477,7 +483,7 @@ const SQL_VARIABLE_SYNTAX_KEY_SET = new Set<string>(SQL_VARIABLE_SYNTAX_KEYS);
  * because the version boundary is known; nothing is inferred about which
  * style the user meant. Every future formatter option must be added here.
  */
-const SQL_FORMATTER_KEYS_ADDED_AFTER_TRANSFER_FORMAT = new Set<keyof SqlFormatterOptionSettings>(["commaPosition", "layoutStyle"]);
+const SQL_FORMATTER_KEYS_ADDED_AFTER_TRANSFER_FORMAT = new Set<keyof SqlFormatterOptionSettings>(["commaPosition", "layoutStyle", ...(Object.keys(DEFAULT_SQL_FORMATTER_RULE_SETTINGS) as (keyof SqlFormatterRuleSettings)[])]);
 
 /**
  * Complete-schema check that tolerates the absence of the post-transfer
@@ -519,7 +525,7 @@ const NESTED_FIELD_VALIDATORS: Partial<Record<EditorSettingsDraftKey, (value: un
   snippets: (value) => isArrayOfShape(value, isSqlSnippetItem),
   modelGenerationTemplates: isModelGenerationTemplatesShape,
   sqlShortcuts: (value) => isArrayOfShape(value, isSqlShortcutActionItem),
-  sqlVariableSyntaxOverrides: (value) => isSqlVariableSyntaxOverridesShape(value, (toggle) => toggle === false),
+  sqlVariableSyntaxOverrides: (value) => isSqlVariableSyntaxOverridesShape(value, (toggle) => typeof toggle === "boolean"),
 };
 
 /**

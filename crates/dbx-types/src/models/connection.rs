@@ -1191,12 +1191,20 @@ impl ConnectionConfig {
             config.driver_profile = Some("mongodb".to_string());
             config.driver_label = Some("MongoDB".to_string());
         }
-        if config.db_type == DatabaseType::SqlServer
-            && sqlserver_legacy_compatibility_param(config.url_params.as_deref())
-        {
-            config.driver_profile = Some("sqlserver-legacy".to_string());
-            config.driver_label = Some("SQL Server legacy compatibility component".to_string());
-            config.url_params = without_sqlserver_legacy_compatibility_param(config.url_params.as_deref());
+        if config.db_type == DatabaseType::SqlServer {
+            let (normalized_host, parsed_port) = normalize_sqlserver_host_port(&config.host);
+            config.host = normalized_host;
+            if let Some(port) = parsed_port {
+                config.port = port;
+                let mut ext = config.external_config.as_ref().and_then(|v| v.as_object()).cloned().unwrap_or_default();
+                ext.insert("portExplicit".to_string(), serde_json::Value::Bool(true));
+                config.external_config = Some(serde_json::Value::Object(ext));
+            }
+            if sqlserver_legacy_compatibility_param(config.url_params.as_deref()) {
+                config.driver_profile = Some("sqlserver-legacy".to_string());
+                config.driver_label = Some("SQL Server legacy compatibility component".to_string());
+                config.url_params = without_sqlserver_legacy_compatibility_param(config.url_params.as_deref());
+            }
         }
         if config.db_type == DatabaseType::Mysql
             && config.driver_profile.as_deref().is_some_and(|profile| profile.eq_ignore_ascii_case("tdengine"))
@@ -3109,6 +3117,58 @@ fn gaussdb_single_host_port(host: &str, default_port: u16) -> (String, u16) {
     (bracket_ipv6(host), default_port)
 }
 
+pub fn normalize_sqlserver_host_port(raw_host: &str) -> (String, Option<u16>) {
+    let parse_port = |value: &str| {
+        let value = value.trim();
+        if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        value.parse::<u16>().ok().filter(|port| *port > 0)
+    };
+    let trimmed = raw_host.trim();
+    if trimmed.is_empty() {
+        return (String::new(), None);
+    }
+
+    let without_tcp = if trimmed.to_ascii_lowercase().starts_with("tcp:") { trimmed[4..].trim() } else { trimmed };
+
+    // Bracketed IPv6: [fe80::1],9005 or [::1]:9005 or [::1]
+    if without_tcp.starts_with('[') {
+        if let Some(close) = without_tcp.find(']') {
+            let bracketed = &without_tcp[..=close];
+            let remainder = without_tcp[close + 1..].trim();
+            if let Some(port_str) = remainder.strip_prefix(',').or_else(|| remainder.strip_prefix(':')) {
+                if let Some(port) = parse_port(port_str) {
+                    return (bracketed.to_string(), Some(port));
+                }
+            }
+            return (if remainder.is_empty() { bracketed } else { without_tcp }.to_string(), None);
+        }
+    }
+
+    // Comma-separated port: host,port or host\instance,port
+    if let Some((server_part, port_part)) = without_tcp.rsplit_once(',') {
+        let candidate_host = server_part.trim();
+        let candidate_port = port_part.trim();
+        if let Some(port) = parse_port(candidate_port) {
+            return (candidate_host.to_string(), Some(port));
+        }
+    }
+
+    // Colon-separated port: host:port (single colon only to avoid unbracketed IPv6)
+    if without_tcp.matches(':').count() == 1 {
+        if let Some((server_part, port_part)) = without_tcp.rsplit_once(':') {
+            let candidate_host = server_part.trim();
+            let candidate_port = port_part.trim();
+            if let Some(port) = parse_port(candidate_port) {
+                return (candidate_host.to_string(), Some(port));
+            }
+        }
+    }
+
+    (without_tcp.to_string(), None)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4193,6 +4253,64 @@ mod tests {
         assert_eq!(canonical.driver_profile.as_deref(), Some("sqlserver"));
         assert_eq!(canonical.driver_label.as_deref(), Some("SQL Server"));
         assert_eq!(canonical.url_params.as_deref(), Some("applicationName=dbx&encrypt=false"));
+    }
+
+    #[test]
+    fn normalize_sqlserver_host_port_handles_commas_colons_and_tcp_prefix() {
+        assert_eq!(super::normalize_sqlserver_host_port("gg.test.com,9005"), ("gg.test.com".to_string(), Some(9005)));
+        assert_eq!(
+            super::normalize_sqlserver_host_port("tcp:gg.test.com,9005"),
+            ("gg.test.com".to_string(), Some(9005))
+        );
+        assert_eq!(super::normalize_sqlserver_host_port("tcp:gg.test.com"), ("gg.test.com".to_string(), None));
+        assert_eq!(super::normalize_sqlserver_host_port("gg.test.com:9005"), ("gg.test.com".to_string(), Some(9005)));
+        assert_eq!(
+            super::normalize_sqlserver_host_port(" 192.168.1.100, 14333 "),
+            ("192.168.1.100".to_string(), Some(14333))
+        );
+        assert_eq!(
+            super::normalize_sqlserver_host_port(r"192.168.1.10\SQL2022,14333"),
+            (r"192.168.1.10\SQL2022".to_string(), Some(14333))
+        );
+        assert_eq!(
+            super::normalize_sqlserver_host_port(r"tcp:192.168.1.10\SQL2022"),
+            (r"192.168.1.10\SQL2022".to_string(), None)
+        );
+        assert_eq!(super::normalize_sqlserver_host_port("[::1],9005"), ("[::1]".to_string(), Some(9005)));
+        assert_eq!(super::normalize_sqlserver_host_port("[::1]:9005"), ("[::1]".to_string(), Some(9005)));
+        assert_eq!(super::normalize_sqlserver_host_port("[fe80::1]"), ("[fe80::1]".to_string(), None));
+        assert_eq!(super::normalize_sqlserver_host_port("localhost"), ("localhost".to_string(), None));
+        assert_eq!(super::normalize_sqlserver_host_port(""), ("".to_string(), None));
+    }
+
+    #[test]
+    fn sqlserver_canonicalized_normalizes_host_with_port_and_sets_explicit_flag() {
+        let mut config = mysql_config("sa", "secret", Some("master"));
+        config.db_type = DatabaseType::SqlServer;
+        config.host = "gg.test.com,9005".to_string();
+        config.port = 1433;
+
+        let canonical = config.canonicalized();
+        assert_eq!(canonical.host, "gg.test.com");
+        assert_eq!(canonical.port, 9005);
+        assert!(canonical.sqlserver_port_explicit());
+
+        let mut tcp_config = mysql_config("sa", "secret", Some("master"));
+        tcp_config.db_type = DatabaseType::SqlServer;
+        tcp_config.host = "tcp:sql.example.com,1444".to_string();
+        tcp_config.port = 1433;
+
+        let canonical_tcp = tcp_config.canonicalized();
+        assert_eq!(canonical_tcp.host, "sql.example.com");
+        assert_eq!(canonical_tcp.port, 1444);
+        assert!(canonical_tcp.sqlserver_port_explicit());
+    }
+
+    #[test]
+    fn sqlserver_invalid_endpoint_text_is_not_silently_retargeted() {
+        for host in ["[::1],70000", "[::1]:oops", "[::1]:0", "[::1]unexpected", "server:1e3", "server,0x599"] {
+            assert_eq!(super::normalize_sqlserver_host_port(host), (host.to_string(), None));
+        }
     }
 
     #[test]

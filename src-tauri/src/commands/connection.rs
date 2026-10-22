@@ -1458,7 +1458,11 @@ async fn test_connection_with_info_impl(
     state: &Arc<AppState>,
     config: ConnectionConfig,
 ) -> Result<ConnectionTestResult, String> {
-    let config = if config.uses_mongodb_oidc() { config.canonicalized() } else { config };
+    let config = if config.uses_mongodb_oidc() || config.db_type == DatabaseType::SqlServer {
+        config.canonicalized()
+    } else {
+        config
+    };
     let tunnel_id = format!("{}:test", config.id);
     let has_transport_layers = config.has_effective_transport_layers();
     let connection_id = if has_transport_layers { tunnel_id.as_str() } else { config.id.as_str() };

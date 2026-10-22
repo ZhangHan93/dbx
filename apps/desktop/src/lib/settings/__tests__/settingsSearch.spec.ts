@@ -75,6 +75,42 @@ describe("settings search", () => {
     expect(searchSettings(entries, "line number", "en").map((entry) => entry.id)).toEqual(["editor-line-numbers"]);
   });
 
+  it("indexes the new formatter rules and preview in the formatter settings group", () => {
+    const formatterEntries = resolveSettingsSearchEntries(
+      SETTINGS_SEARCH_DEFINITIONS.filter((entry) => entry.id.startsWith("formatter-")),
+      { isWeb: false, visibleCategories: new Set<SettingsCategory>(["formatter"]) },
+      (key) =>
+        ({
+          "settings.sqlFormatterCustomRules": "Custom SQL rules",
+          "settings.sqlFormatterListLayout": "General list layout",
+          "settings.sqlFormatterSelectListLayout": "SELECT list",
+          "settings.sqlFormatterInsertListLayout": "INSERT list",
+          "settings.sqlFormatterUpdateListLayout": "UPDATE list",
+          "settings.sqlFormatterListItemAlignment": "List item alignment",
+          "settings.sqlFormatterEmptyLineMode": "Empty line mode",
+          "settings.sqlFormatterAlignSelectAliases": "Align SELECT aliases",
+          "settings.sqlFormatterAlignUpdateAssignments": "Align UPDATE assignments",
+          "settings.sqlFormatterSelectCommaPosition": "SELECT comma position",
+          "settings.sqlFormatterInsertCommaPosition": "INSERT comma position",
+          "settings.sqlFormatterUpdateCommaPosition": "UPDATE comma position",
+          "settings.sqlFormatterWhereLogicalOperatorNewline": "WHERE logical operator newline",
+          "settings.sqlFormatterOnLogicalOperatorNewline": "ON logical operator newline",
+          "settings.sqlFormatterExpressionLogicalOperatorNewline": "Expression logical operator newline",
+          "settings.sqlFormatterNewlineBeforeJoinOn": "Newline before JOIN ON",
+          "settings.sqlFormatterCollapseShortStatements": "Collapse short statements",
+          "settings.sqlFormatterPreview": "Formatting preview",
+        })[key] ?? key,
+      categoryLabels,
+    );
+    expect(searchSettings(formatterEntries, "SELECT list", "en").map((entry) => entry.id)).toContain("formatter-select-layout");
+    expect(searchSettings(formatterEntries, "preview", "en").map((entry) => entry.id)).toContain("formatter-preview");
+    expect(searchSettings(formatterEntries, "empty line", "en").map((entry) => entry.id)).toContain("formatter-empty-line-mode");
+    expect(searchSettings(formatterEntries, "align UPDATE", "en").map((entry) => entry.id)).toContain("formatter-align-update-assignments");
+    expect(searchSettings(formatterEntries, "WHERE logical", "en").map((entry) => entry.id)).toContain("formatter-where-logical-newline");
+    expect(formatterEntries.find((entry) => entry.id === "formatter-custom-rules")?.targetId).toBe("formatter");
+    expect(formatterEntries.every((entry) => entry.route?.formatterMode === "form" || entry.route?.formatterMode === "json")).toBe(true);
+  });
+
   it("indexes the query editor caret-browsing preference (#11827)", () => {
     const definition = SETTINGS_SEARCH_DEFINITIONS.find((entry) => entry.id === "editor-caret-browsing");
     expect(definition).toEqual({
@@ -402,6 +438,18 @@ describe("settings search", () => {
       { titleKey: "settings.sqlFormatterDenseOperators", category: "formatter", targetId: "formatter" },
       { titleKey: "settings.sqlFormatterNewlineBeforeSemicolon", category: "formatter", targetId: "formatter" },
       { titleKey: "settings.sqlFormatterParamTypes", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterListItemAlignment", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterEmptyLineMode", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterAlignSelectAliases", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterAlignUpdateAssignments", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterSelectCommaPosition", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterInsertCommaPosition", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterUpdateCommaPosition", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterWhereLogicalOperatorNewline", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterOnLogicalOperatorNewline", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterExpressionLogicalOperatorNewline", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterNewlineBeforeJoinOn", category: "formatter", targetId: "formatter" },
+      { titleKey: "settings.sqlFormatterCollapseShortStatements", category: "formatter", targetId: "formatter" },
       { titleKey: "settings.routineSourceOpenMode", category: "navigation", targetId: "navigation" },
       { titleKey: "settings.disconnectTabHandlingMode", category: "navigation", targetId: "navigation" },
       { titleKey: "settings.compactColumnHeaderActions", category: "data", targetId: "data" },

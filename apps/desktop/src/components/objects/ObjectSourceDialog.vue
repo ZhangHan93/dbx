@@ -87,7 +87,9 @@ onBeforeUnmount(() => {
 });
 
 const canEdit = computed(() => sourceEditable.value && (props.objectType !== "SEQUENCE" || props.databaseType === "oceanbase-oracle"));
-const title = computed(() => `${editing.value ? t("contextMenu.editView") : t("contextMenu.viewSource")} - ${props.name}`);
+const isViewLike = computed(() => props.objectType === "VIEW" || props.objectType === "MATERIALIZED_VIEW");
+const editLabel = computed(() => (isViewLike.value ? t("contextMenu.editView") : t("contextMenu.editObject")));
+const title = computed(() => `${editing.value ? editLabel.value : t("contextMenu.viewSource")} - ${props.name}`);
 const hasRoutineMetadata = computed(() => !!routineMetadata.value && (routineMetadata.value.parameters.length > 0 || !!routineMetadata.value.returnType));
 
 watch(
@@ -329,7 +331,7 @@ function closeDialog() {
         </Button>
         <Button v-if="!editing && canEdit && section === 'source'" variant="outline" :disabled="!editableText" @click="editSource">
           <PencilLine class="h-4 w-4" />
-          {{ t("contextMenu.editView") }}
+          {{ editLabel }}
         </Button>
         <Button v-if="editing && section === 'source'" variant="outline" :disabled="saving" @click="cancelEditSource">
           {{ t("objects.cancelEdit") }}
