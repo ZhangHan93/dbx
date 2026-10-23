@@ -746,6 +746,16 @@ async fn list_databases_once(state: &AppState, connection_id: &str) -> Result<Ve
     }
 }
 
+fn uses_shared_database_comments(config: &ConnectionConfig) -> bool {
+    match config.db_type {
+        DatabaseType::Postgres => {
+            matches!(config.driver_profile.as_deref(), None | Some("postgres" | "opengauss" | "gaussdb"))
+        }
+        DatabaseType::OpenGauss | DatabaseType::Gaussdb => true,
+        _ => false,
+    }
+}
+
 async fn list_database_metadata_once(state: &AppState, connection_id: &str) -> Result<Vec<db::DatabaseInfo>, String> {
     let config = connection_config(state, connection_id).await;
     if config.as_ref().is_some_and(|config| {
@@ -768,7 +778,8 @@ async fn list_database_metadata_once(state: &AppState, connection_id: &str) -> R
         };
     }
     if let Some(pool) = extract_pool!(pool_handle.as_ref(), Postgres) {
-        return db::postgres::list_database_metadata(&pool).await;
+        let shared_comments = config.as_ref().is_some_and(uses_shared_database_comments);
+        return db::postgres::list_database_metadata(&pool, shared_comments).await;
     }
     list_databases_once(state, connection_id).await
 }
@@ -5000,6 +5011,38 @@ for line in sys.stdin:
 
         profiled_postgres.driver_profile = Some("gaussdb".to_string());
         assert!(super::is_opengauss_family_config(&profiled_postgres));
+    }
+
+    #[test]
+    fn database_metadata_limits_shared_comments_to_verified_postgres_families() {
+        for (db_type, profile, expected) in [
+            (DatabaseType::Postgres, None, true),
+            (DatabaseType::Postgres, Some("postgres"), true),
+            (DatabaseType::Postgres, Some("opengauss"), true),
+            (DatabaseType::Postgres, Some("gaussdb"), true),
+            (DatabaseType::OpenGauss, None, true),
+            (DatabaseType::OpenGauss, Some("opengauss"), true),
+            (DatabaseType::Gaussdb, None, true),
+            (DatabaseType::Gaussdb, Some("gaussdb"), true),
+            (DatabaseType::Postgres, Some("cockroachdb"), false),
+            (DatabaseType::Postgres, Some("redshift"), false),
+            (DatabaseType::Postgres, Some("questdb"), false),
+            (DatabaseType::Postgres, Some("cloudberry"), false),
+            (DatabaseType::Postgres, Some("kwdb"), false),
+            (DatabaseType::Postgres, Some("unknown"), false),
+            (DatabaseType::Redshift, None, false),
+            (DatabaseType::Questdb, None, false),
+            (DatabaseType::Kwdb, None, false),
+            (DatabaseType::Mysql, None, false),
+        ] {
+            let mut config = test_connection_config(db_type);
+            config.driver_profile = profile.map(str::to_string);
+            assert_eq!(
+                super::uses_shared_database_comments(&config),
+                expected,
+                "unexpected shared comment support for {db_type:?} / {profile:?}"
+            );
+        }
     }
 
     #[test]
@@ -9666,7 +9709,7 @@ pub async fn get_table_export_ddl_core(
     table: &str,
     object_type: Option<db::ObjectSourceKind>,
 ) -> Result<String, String> {
-    get_table_ddl_core_with_options(
+    let ddl = get_table_ddl_core_with_options(
         state,
         connection_id,
         database,
@@ -9676,7 +9719,8 @@ pub async fn get_table_export_ddl_core(
         TableDdlOptions::EXPORT,
         None,
     )
-    .await
+    .await?;
+    Ok(rewrite_postgres_standard_serial_defaults(&ddl, schema))
 }
 
 /// Source DDL for a table transfer that reuses it on the target.
@@ -9709,7 +9753,7 @@ pub(crate) async fn get_table_relation_export_ddl_core_for_session(
     object_type: Option<db::ObjectSourceKind>,
     client_session_id: Option<&str>,
 ) -> Result<String, String> {
-    get_table_ddl_core_with_options(
+    let ddl = get_table_ddl_core_with_options(
         state,
         connection_id,
         database,
@@ -9719,7 +9763,11 @@ pub(crate) async fn get_table_relation_export_ddl_core_for_session(
         TableDdlOptions::RELATION_EXPORT,
         client_session_id,
     )
-    .await
+    .await?;
+    // Whole-database exports and scheduled backups rely on the table DDL to
+    // recreate `created_by_table` sequences, so they need the same serial
+    // rewrite as the single-table export (#13058).
+    Ok(rewrite_postgres_standard_serial_defaults(&ddl, schema))
 }
 
 pub async fn get_table_display_ddl_core(
@@ -11192,7 +11240,7 @@ async fn mysql_object_source(
 ) -> Result<String, String> {
     let primary_sql = mysql_object_source_sql(database, name, kind);
     let primary_column_index = mysql_object_source_ddl_column_index(kind);
-    let mut conn = db::mysql::get_conn_with_timeout(pool, db::connection_timeout()).await?;
+    let mut conn = db::mysql::get_conn_with_timeout(pool, pool.checkout_timeout()).await?;
 
     match read_mysql_object_source_row(&mut conn, &primary_sql, primary_column_index).await {
         Ok(source) => Ok(source),
@@ -13362,6 +13410,37 @@ mod ddl_tests {
         let ddl = render_postgres_table_ddl("public", "orders", &[id], &[], &[], None);
 
         assert!(ddl.contains("\"id\" bigint DEFAULT nextval('shared.custom_id_source'::regclass)"), "ddl: {ddl}");
+    }
+
+    #[test]
+    fn postgres_export_ddl_infers_standard_serial_defaults() {
+        // #13058: a standalone export must not keep `bigint DEFAULT nextval(...)`
+        // for the standard serial sequence, because restoring the SQL would
+        // reference a sequence that was never created.
+        for (data_type, serial_type) in [("smallint", "smallserial"), ("integer", "serial"), ("bigint", "bigserial")] {
+            let ddl = format!(
+                "CREATE TABLE \"public\".\"ceshi\" (\n  \"ID\" {data_type} DEFAULT nextval('\"ceshi_ID_seq\"'::regclass) NOT NULL,\n  \"name\" text\n)"
+            );
+            let rewritten = rewrite_postgres_standard_serial_defaults(&ddl, "public");
+            assert!(rewritten.contains(&format!("\"ID\" {serial_type} NOT NULL")), "ddl: {rewritten}");
+            assert!(!rewritten.contains("nextval("), "ddl: {rewritten}");
+        }
+
+        // A schema-qualified standard sequence name is also recognized.
+        let ddl = "CREATE TABLE \"app\".\"ceshi\" (\n  \"ID\" bigint DEFAULT nextval('\"app\".\"ceshi_ID_seq\"'::regclass)\n)";
+        let rewritten = rewrite_postgres_standard_serial_defaults(ddl, "app");
+        assert!(rewritten.contains("\"ID\" bigserial"), "ddl: {rewritten}");
+        assert!(!rewritten.contains("nextval("), "ddl: {rewritten}");
+
+        // Custom/shared sequences keep the explicit default.
+        let custom = "CREATE TABLE \"public\".\"orders\" (\n  \"id\" bigint DEFAULT nextval('shared.custom_id_source'::regclass) NOT NULL\n)";
+        assert_eq!(rewrite_postgres_standard_serial_defaults(custom, "public"), custom);
+
+        // A standard-looking sequence name that lives in another schema belongs to
+        // a shared or manually attached sequence: keep the explicit default, or a
+        // restore would re-bind the column to a fresh sequence.
+        let shared = "CREATE TABLE \"public\".\"ceshi\" (\n  \"ID\" bigint DEFAULT nextval('\"app\".\"ceshi_ID_seq\"'::regclass) NOT NULL\n)";
+        assert_eq!(rewrite_postgres_standard_serial_defaults(shared, "public"), shared);
     }
 
     #[test]
@@ -15858,6 +15937,71 @@ pub async fn opentenbase_ddl(
             Ok(ddl)
         }
     }
+}
+
+/// Whether a `nextval` sequence is the standard `<table>_<column>_seq` serial
+/// sequence for this column, and which serial spelling it maps to.
+fn postgres_serial_type_for_sequence(
+    table: &str,
+    table_schema: &str,
+    column: &str,
+    data_type: &str,
+    sequence: &str,
+) -> Option<&'static str> {
+    // A schema-qualified reference must point into the table's own schema: a
+    // shared or manually attached sequence in another schema that merely matches
+    // the standard name pattern must keep its explicit default, otherwise a
+    // restore would re-bind the column to a freshly created sequence.
+    if let Some((sequence_schema, _)) = sequence.split_once('.') {
+        let sequence_schema = sequence_schema.trim().trim_matches('"').replace("\"\"", "\"");
+        if !sequence_schema.eq_ignore_ascii_case(table_schema) {
+            return None;
+        }
+    }
+    let unqualified = sequence.rsplit('.').next().unwrap_or(sequence).trim().trim_matches('"').replace("\"\"", "\"");
+    if !unqualified.eq_ignore_ascii_case(&format!("{table}_{column}_seq")) {
+        return None;
+    }
+    match data_type.trim().to_ascii_lowercase().as_str() {
+        "smallint" | "int2" => Some("smallserial"),
+        "integer" | "int" | "int4" => Some("serial"),
+        "bigint" | "int8" => Some("bigserial"),
+        _ => None,
+    }
+}
+
+/// Rewrites standard serial defaults in an exported PostgreSQL table DDL.
+///
+/// `BIGSERIAL` is stored as `bigint DEFAULT nextval('<table>_<column>_seq'::regclass)`.
+/// The renderer keeps that spelling when the metadata does not carry the serial
+/// marker, which is correct for transfers (the sequence is copied separately) but
+/// not for a standalone export: restoring the exported SQL would reference a
+/// sequence that was never created. Rewrite only the standard serial sequence
+/// name; shared/custom sequences keep their explicit default.
+fn rewrite_postgres_standard_serial_defaults(ddl: &str, table_schema: &str) -> String {
+    let create_table = Regex::new(r#"(?i)^CREATE TABLE\s+(?:"(?:[^"]|"")*"\.)?"((?:[^"]|"")*)""#).unwrap();
+    let serial_column = Regex::new(
+        r#"(?i)^(\s*)"((?:[^"]|"")*)"\s+(smallint|integer|bigint)\s+DEFAULT\s+nextval\('([^']*)'::regclass\)(.*)$"#,
+    )
+    .unwrap();
+    let mut current_table: Option<String> = None;
+    let mut output = Vec::with_capacity(ddl.len());
+    for line in ddl.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("CREATE TABLE ") {
+            current_table = create_table.captures(trimmed).map(|caps| caps[1].replace("\"\"", "\""));
+        } else if trimmed.starts_with(')') {
+            current_table = None;
+        }
+        let rewritten = current_table.as_deref().and_then(|table| {
+            let caps = serial_column.captures(line)?;
+            let column = caps[2].replace("\"\"", "\"");
+            let serial_type = postgres_serial_type_for_sequence(table, table_schema, &column, &caps[3], &caps[4])?;
+            Some(format!("{}\"{}\" {}{}", &caps[1], &caps[2], serial_type, &caps[5]))
+        });
+        output.push(rewritten.unwrap_or_else(|| line.to_string()));
+    }
+    output.join("\n")
 }
 
 pub fn render_postgres_table_ddl(

@@ -87,6 +87,7 @@ export const loadConnections = forward("loadConnections");
 export const loadTunnelProfiles = forward("loadTunnelProfiles");
 export const saveTunnelProfiles = forward("saveTunnelProfiles");
 export const testTunnelProfile = forward("testTunnelProfile");
+export const listSshAgentIdentities = forward("listSshAgentIdentities");
 export const resolveSshPrompt = forward("resolveSshPrompt");
 export const readKeychainPassword = forward("readKeychainPassword");
 export const readKeychainPasswords = forward("readKeychainPasswords");
@@ -1003,6 +1004,7 @@ export const cancelUpdateDownload = forward("cancelUpdateDownload");
 export const getDownloadedUpdate = forward("getDownloadedUpdate");
 export const discardDownloadedUpdate = forward("discardDownloadedUpdate");
 export const installDownloadedUpdate = forward("installDownloadedUpdate");
+export const relaunchApp = forward("relaunchApp");
 export const getAppVersion = forward("getAppVersion");
 export const getAppSupportInfo = forward("getAppSupportInfo");
 
