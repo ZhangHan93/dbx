@@ -34,7 +34,7 @@ import { useQueryEditorCompletionMetadata } from "./useQueryEditorCompletionMeta
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 
-import { Transaction } from "@codemirror/state";
+import { EditorState as CodeMirrorEditorState, Transaction } from "@codemirror/state";
 import type { Text } from "@codemirror/state";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { search as cmSearch } from "@codemirror/search";
@@ -65,6 +65,7 @@ import QueryEditorContextMenu, { type QueryEditorContextMenuState, type QueryEdi
 import { clipboardLineEndings, copyToClipboard, readTextFromClipboard } from "@/lib/common/clipboard";
 
 import { resolveExecutableSql, type SqlExecutionOverride } from "@/lib/sql/sqlExecutionTarget";
+import { resolveContextMenuExportSql } from "@/lib/sql/contextMenuExportSql";
 import { supportsExecutionTargetPicker, type SqlTextRange } from "@/lib/sql/sqlStatementRanges";
 import { executableStatementRangeAtCursor, executableStatementRangeCacheForDoc, executableStatementRangeStartingAt as executableStatementRangeStartingAtLine, type ExecutableStatementRangeCache } from "@/lib/sql/executableStatementRangeCache";
 import { statementNavigationTarget, type StatementNavigationDirection } from "@/lib/sql/statementNavigation";
@@ -109,7 +110,7 @@ import { defaultKeymapForGlobalShortcuts } from "@/lib/editor/codemirrorDefaultK
 import { createQueryEditorFoldShortcutBindings, foldKeymapWithoutAllBindings } from "@/lib/editor/queryEditorFoldKeymap";
 import { createShowWhitespaceExtension } from "@/lib/editor/codemirrorShowWhitespace";
 
-import { clampEditorFontSize, createEditorWheelZoomGestureGuard, createEditorZoomCommitScheduler, fontSizeFromGestureScale, fontSizeFromWheelDelta } from "@/lib/editor/editorZoom";
+import { clampEditorFontSize, createEditorWheelZoomController, createEditorZoomCommitScheduler, fontSizeFromGestureScale } from "@/lib/editor/editorZoom";
 import { buildSqlShortcutExecutionSql, enabledSqlShortcutActions, resolveSqlShortcutForDatabase, uniqueSqlShortcutBindings } from "@/lib/sql/sqlShortcutActions";
 import { resolveSqlShortcutTableToken } from "@/lib/sql/sqlShortcutTableTarget";
 import { normalizeShortcutSettings, shortcutToCodeMirrorKey } from "@/lib/editor/shortcutRegistry";
@@ -301,6 +302,8 @@ const gotoLinePanelRef = ref<InstanceType<typeof EditorGotoLinePanel>>();
 const { intentionPopup, closeIntentionPopup, executeIntentionAction, handleSqlIntentionActions } = useQueryEditorIntentions({ props, view, sqlBehaviorDialect, focusEditor });
 
 const selectedSql = ref("");
+// 右键菜单打开处的文档位置：导出只取该处的单条语句，避免把多语句整篇文档交给后端。
+const contextMenuPosition = ref<number | null>(null);
 const {
   delimitedListOpen,
   delimitedListSelectedText,
@@ -597,7 +600,7 @@ const zoomCommitScheduler = createEditorZoomCommitScheduler((fontSize) => {
   if (settingsStore.editorSettings.fontSize === fontSize) return;
   settingsStore.updateEditorSettings({ fontSize });
 });
-const wheelZoomGestureGuard = createEditorWheelZoomGestureGuard();
+const wheelZoom = createEditorWheelZoomController();
 
 const queryEditorAppearanceSettings = computed(() => {
   const settings = settingsStore.editorSettings;
@@ -693,6 +696,7 @@ function onEditorGestureChange(event: EditorGestureEvent) {
 function onEditorGestureEnd(event: Event) {
   event.preventDefault();
   isGestureZooming.value = false;
+  wheelZoom.holdScrollGesture(event.timeStamp);
   zoomCommitScheduler.flush(liveFontSize.value);
 }
 
@@ -931,6 +935,7 @@ function selectStarExpansionTargetForView(currentView: EditorViewType, position?
 
 function syncContextMenuStateAtEvent(currentView: EditorViewType, event: MouseEvent) {
   const pos = currentView.posAtCoords({ x: event.clientX, y: event.clientY });
+  contextMenuPosition.value = pos ?? currentView.state.selection.main.head;
   clearScheduledPreviewContextRefresh();
   // 预览按“右键点击处”解析当前语句（执行按光标处），右键处与光标一致时才直觉一致。
   syncContextMenuState(currentView, pos ?? undefined, pos ?? undefined);
@@ -1008,8 +1013,23 @@ function explainFromContextMenu() {
   focusEditor();
 }
 
-function exportQueryFromContextMenu(format: "csv" | "xlsx" | "txt") {
-  const sql = executableSql.value;
+// 右键导出与「执行」「预览变更」保持同一语句范围：选区优先，否则只导出右键处的单条语句。
+// 把整篇多语句文档交给导出后端会被判定为不可流式导出（#1894）。
+async function contextMenuExportSql(): Promise<string> {
+  const currentView = view.value;
+  const position = contextMenuPosition.value ?? currentView?.state.selection.main.head ?? null;
+  return resolveContextMenuExportSql({
+    selectedSql: selectedSql.value,
+    position,
+    documentSql: currentView ? currentEditorDocText(currentView) : executableSql.value,
+    databaseType: props.databaseType,
+    findStatementAtPosition: (sql, cursorPos, databaseType) => api.findStatementAtCursor(sql, cursorPos, databaseType),
+    statementAtPosition: (cursorPos) => (currentView ? (executableStatementRangeAtPosition(currentView, cursorPos)?.sql ?? null) : null),
+  });
+}
+
+async function exportQueryFromContextMenu(format: "csv" | "xlsx" | "txt") {
+  const sql = await contextMenuExportSql();
   if (!sql.trim()) return;
   emit("exportQuery", { sql, format, columnComments: undefined });
 }
@@ -2412,9 +2432,16 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
             return handleVimDbxAction(event, currentView);
           },
           wheel(event) {
-            if (!wheelZoomGestureGuard.accepts(event)) return false;
+            if (isGestureZooming.value) {
+              if (event.ctrlKey || event.metaKey) {
+                event.preventDefault();
+                return true;
+              }
+              return false;
+            }
+            const next = wheelZoom.nextFontSize(liveFontSize.value, event);
+            if (next === null) return false;
             event.preventDefault();
-            const next = fontSizeFromWheelDelta(liveFontSize.value, event.deltaY);
             applyLiveFontSize(next);
             scheduleFontSizeCommit(next);
             return true;
@@ -2736,6 +2763,18 @@ watch(
 );
 
 watch(
+  [view, () => props.tabId, () => props.readOnly],
+  () => {
+    if (!view.value || !codeMirrorRuntime.readOnlyComp || !codeMirrorRuntime.editorViewModule) return;
+    view.value.dispatch({
+      effects: codeMirrorRuntime.readOnlyComp.reconfigure([CodeMirrorEditorState.readOnly.of(!!props.readOnly), codeMirrorRuntime.editorViewModule.EditorView.editable.of(!props.readOnly)]),
+    });
+  },
+  // Reapply after per-tab cached EditorState restoration, even when the prop stays unchanged.
+  { flush: "post" },
+);
+
+watch(
   () => props.forceWordWrap,
   () => {
     if (!view.value || !codeMirrorRuntime.wordWrapComp) return;
@@ -2774,6 +2813,7 @@ async function applyEditorAppearance() {
   }
   if (!isGestureZooming.value && !zoomCommitScheduler.hasPendingCommit() && liveFontSize.value !== ss.fontSize) {
     liveFontSize.value = ss.fontSize;
+    wheelZoom.rebase();
   }
   syncEditorFontCssVars(liveFontSize.value, ss.fontFamily);
   syncEditorDiagnosticCssVars();

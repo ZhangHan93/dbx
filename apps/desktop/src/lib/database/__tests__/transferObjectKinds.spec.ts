@@ -1,12 +1,19 @@
 import { describe, expect, it } from "vitest";
-import { transferObjectFamily, transferObjectKindsForDatabase, isSameTransferFamily, crossFamilyTransferableKinds, isTransferPairSupported, TransferObjectFamily } from "@/lib/database/transferObjectKinds";
+import { transferObjectFamily, transferObjectKindsForDatabase, isSameTransferFamily, crossFamilyTransferableKinds, isTransferPairSupported, TransferObjectFamily, transferSchemasForDatabase } from "@/lib/database/transferObjectKinds";
+import { XUGU_PUBLIC_SYNONYM_SCOPE, XUGU_SCHEDULER_JOB_SCOPE } from "@/lib/sidebar/xuguPublicSynonyms";
 import { manifestDatabaseTypes } from "@/lib/database/databaseDriverManifest";
 import { supportsTransfer } from "@/lib/database/databaseFeatureSupport";
 import type { DatabaseType } from "@/types/database";
 
-const TABLE_ONLY_TRANSFER_DATABASES: DatabaseType[] = ["sqlite", "rqlite", "turso", "cloudflare-d1", "duckdb", "clickhouse", "mongodb", "highgo", "vastbase", "goldendb", "yashandb", "questdb", "h2", "hive", "argo", "transwarp", "kyuubi", "impala", "db2", "iris", "spark", "xugu"];
+const TABLE_ONLY_TRANSFER_DATABASES: DatabaseType[] = ["sqlite", "rqlite", "turso", "cloudflare-d1", "duckdb", "clickhouse", "mongodb", "highgo", "vastbase", "goldendb", "yashandb", "questdb", "h2", "hive", "argo", "transwarp", "kyuubi", "impala", "db2", "iris", "spark"];
 
 describe("transferObjectKinds", () => {
+  it("keeps Xugu synthetic scopes out of both transfer schema selectors without filtering other engines", () => {
+    const schemas = ["APP", "SYSDBA", XUGU_PUBLIC_SYNONYM_SCOPE, XUGU_SCHEDULER_JOB_SCOPE];
+    expect(transferSchemasForDatabase("xugu", schemas)).toEqual(["APP", "SYSDBA"]);
+    expect(transferSchemasForDatabase("postgres", schemas)).toBe(schemas);
+    expect(transferSchemasForDatabase("mysql", schemas)).toBe(schemas);
+  });
   it("groups databases into transfer families", () => {
     expect(transferObjectFamily("mysql")).toBe(TransferObjectFamily.Mysql);
     expect(transferObjectFamily("kingbase")).toBe(TransferObjectFamily.Postgres);
@@ -27,7 +34,7 @@ describe("transferObjectKinds", () => {
   });
 
   it("covers every transfer-capable database outside the richer object families", () => {
-    const manifestTypes = manifestDatabaseTypes().filter((dbType) => supportsTransfer(dbType) && !transferObjectFamily(dbType));
+    const manifestTypes = manifestDatabaseTypes().filter((dbType) => dbType !== "xugu" && supportsTransfer(dbType) && !transferObjectFamily(dbType));
     expect([...manifestTypes].sort()).toEqual([...TABLE_ONLY_TRANSFER_DATABASES].sort());
   });
 
@@ -51,6 +58,18 @@ describe("transferObjectKinds", () => {
     expect(isTransferPairSupported("mysql", "xugu")).toBe(false);
     expect(isTransferPairSupported("mysql", "postgres")).toBe(true);
     expect(isTransferPairSupported(undefined, "xugu")).toBe(true);
+  });
+
+  it("exposes native Xugu schema objects without enabling them for other engines", () => {
+    const kinds = ["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "PACKAGE", "SYNONYM"];
+    expect(transferObjectKindsForDatabase("xugu")).toEqual(kinds);
+    expect(crossFamilyTransferableKinds("xugu", "xugu")).toEqual(kinds);
+    for (const engine of ["postgres", "mysql", "oracle", "dameng", "sqlserver"] as const) {
+      expect(crossFamilyTransferableKinds("xugu", engine)).toEqual([]);
+      expect(crossFamilyTransferableKinds(engine, "xugu")).toEqual([]);
+      expect(transferObjectKindsForDatabase(engine)).not.toContain("PACKAGE");
+      expect(transferObjectKindsForDatabase(engine)).not.toContain("SYNONYM");
+    }
   });
 
   it("limits cross-family transferable kinds to sequences only", () => {

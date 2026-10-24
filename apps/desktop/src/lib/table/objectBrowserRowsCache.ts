@@ -11,6 +11,7 @@ export interface ObjectBrowserRowsCacheScope {
   database: string;
   schema: string;
   catalog?: string;
+  exactIdentity?: boolean;
 }
 
 export interface ObjectBrowserRowsCacheWriteToken {
@@ -37,7 +38,7 @@ function objectBrowserRowsScope(scope: ObjectBrowserRowsCacheScope): MetadataSco
     connectionId: scope.connectionId,
     database: scope.database,
     schema: scope.schema,
-    extra: scope.catalog ? { catalog: scope.catalog } : undefined,
+    extra: scope.catalog || scope.exactIdentity ? { catalog: scope.catalog, ...(scope.exactIdentity ? { exactIdentity: true } : {}) } : undefined,
   };
 }
 

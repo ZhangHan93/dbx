@@ -11,7 +11,7 @@ use dbx_core::connection::{
     connection_configs_pool_equivalent, connection_configs_session_credentials_compatible, AppState, PoolKind,
 };
 use dbx_core::models::connection::{
-    ConnectionConfig, ConnectionIdleClosedEvent, ConnectionLivenessMessage, ConnectionTestResult,
+    ConnectionConfig, ConnectionIdleClosedEvent, ConnectionLivenessMessage, ConnectionResponse, ConnectionTestResult,
     DatabaseConnectionInfo, DatabaseType,
 };
 use dbx_core::nacos::config::{
@@ -932,7 +932,7 @@ pub async fn save_connections(
 pub async fn mcp_add_connection(
     State(state): State<Arc<WebState>>,
     Json(body): Json<McpAddConnectionRequest>,
-) -> Result<Json<ConnectionConfig>, AppError> {
+) -> Result<Json<ConnectionResponse>, AppError> {
     let config = state.resolve_connection_credentials(body.config).await?;
     let saved = state.app.storage.add_connection_for_mcp(config).await.map_err(AppError::from)?;
     state.app.session_credentials.clear_connection(&saved.id);
@@ -944,7 +944,7 @@ pub async fn mcp_add_connection(
 pub async fn mcp_duplicate_connection(
     State(state): State<Arc<WebState>>,
     Json(body): Json<McpDuplicateConnectionRequest>,
-) -> Result<Json<ConnectionConfig>, AppError> {
+) -> Result<Json<ConnectionResponse>, AppError> {
     let saved = state
         .app
         .storage
@@ -978,7 +978,7 @@ pub async fn mcp_remove_connection(
 pub async fn load_connections(
     State(state): State<Arc<WebState>>,
     _headers: HeaderMap,
-) -> Result<Json<Vec<ConnectionConfig>>, AppError> {
+) -> Result<Json<Vec<ConnectionResponse>>, AppError> {
     let configs = state.app.storage.load_connections().await.map_err(AppError::from)?;
     let sync = sync_connection_configs(&state, &configs).await;
     remove_connection_pools_for_connection_ids(&state, &sync.connection_pool_ids_to_drop).await;
@@ -2061,14 +2061,14 @@ done
         .await
         .unwrap_or_else(|error| panic!("{}", error.message))
         .0;
-        assert_eq!(state.app.configs.read().await.get(&copied.id), Some(&copied));
+        assert_eq!(state.app.configs.read().await.get(&copied.config.id), Some(&copied.config));
         let persisted = state.app.storage.load_connections().await.unwrap();
         assert_eq!(persisted.iter().find(|config| config.id == existing.id).unwrap().host, existing.host);
         assert!(persisted.iter().any(|config| config.id == added.id));
         let layout = state.app.storage.load_sidebar_layout().await.unwrap().unwrap();
         assert_eq!(layout["concurrentField"], "keep");
         assert_eq!(layout["order"][0]["children"][0]["id"], existing.id);
-        assert_eq!(layout["order"][0]["children"][1]["id"], copied.id);
+        assert_eq!(layout["order"][0]["children"][1]["id"], copied.config.id);
         assert_eq!(layout["order"][1]["id"], added.id);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -2589,7 +2589,7 @@ done
             mcp_add_connection(State(state.clone()), Json(McpAddConnectionRequest { config: recreated.clone() }))
                 .await
                 .unwrap_or_else(|error| panic!("{}", error.message));
-        assert_eq!(reused.0.host, recreated.host);
+        assert_eq!(reused.0.config.host, recreated.host);
         assert!(!state.app.session_credentials.has("token-a", "conn-a"));
         assert!(!state.app.session_credentials.has("token-b", "conn-a"));
         assert!(!state.app.session_credentials.has_pool_owner("conn-a"));

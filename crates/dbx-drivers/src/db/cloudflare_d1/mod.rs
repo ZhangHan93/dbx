@@ -300,6 +300,7 @@ pub async fn list_indexes(client: &CloudflareD1Client, _schema: &str, table: &st
         let columns =
             column_result.rows.iter().filter_map(|row| value_by_column(&column_result.columns, row, "name")).collect();
         indexes.push(IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,

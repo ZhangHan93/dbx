@@ -7,11 +7,13 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { formatSqlForDisplay, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
-import { buildEditableObjectSource, buildExecutableObjectSourceStatements, executeObjectSourceSave, formatObjectSourceSaveError, resolveObjectSourceEditDraft } from "@/lib/table/objectSourceEditor";
+import { buildEditableObjectSource, buildExecutableObjectSourceStatements, prepareObjectSourceSave, objectSourceSaveSuccessMessage, formatObjectSourceSaveError, resolveObjectSourceEditDraft } from "@/lib/table/objectSourceEditor";
 import { loadObjectSourceWithRoutineFallback } from "@/lib/table/objectSourceLoad";
 import { assertSourceIdentity, beginSourceSave, captureSourceIdentity, renewSourceIdentity, type SourceIdentitySnapshot } from "@/lib/table/objectSourceIdentity";
 import { jdbcRoutineMetadata, xuguRoutineMetadataFromDefinition, type RoutineMetadata } from "@/lib/table/routineParameters";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
+import { isOracleFamilyTypeSource } from "@/lib/database/databaseObjectCapabilities";
+import { requestOracleTypeManagement } from "@/lib/table/oracleTypeManagementRequest";
 import * as api from "@/lib/backend/api";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
 import RoutineMetadataPanel from "@/components/objects/RoutineMetadataPanel.vue";
@@ -87,6 +89,7 @@ onBeforeUnmount(() => {
 });
 
 const canEdit = computed(() => sourceEditable.value && (props.objectType !== "SEQUENCE" || props.databaseType === "oceanbase-oracle"));
+const managedType = computed(() => isOracleFamilyTypeSource(props.databaseType, resolvedObjectType.value));
 const isViewLike = computed(() => props.objectType === "VIEW" || props.objectType === "MATERIALIZED_VIEW");
 const editLabel = computed(() => (isViewLike.value ? t("contextMenu.editView") : t("contextMenu.editObject")));
 const title = computed(() => `${editing.value ? editLabel.value : t("contextMenu.viewSource")} - ${props.name}`);
@@ -210,10 +213,26 @@ async function saveSource() {
   const schema = props.schema || props.database;
   saving.value = true;
   saveError.value = "";
+  let save: Awaited<ReturnType<typeof prepareObjectSourceSave>> | undefined;
   try {
     if (!sourceIdentity) return;
     const identity = sourceIdentity;
     assertSourceIdentity(identity);
+    if (isOracleFamilyTypeSource(databaseType, objectType)) {
+      const source = draft.value;
+      const result = await requestOracleTypeManagement({
+        target: { connectionId, database, owner: schema, name, databaseType: databaseType as "oracle" | "oceanbase-oracle" | "dameng" },
+        operation: objectType === "TYPE_BODY" ? "save-body" : "save-spec",
+        source,
+        baseSource: editableText.value,
+        isCurrent: () => serial === loadSerial && props.open && draft.value === source,
+      });
+      if (!result.complete || serial !== loadSerial) return;
+      toast(t("objects.sourceSaved"));
+      emit("saved");
+      await loadSource(false);
+      return;
+    }
     const statements = await buildExecutableObjectSourceStatements({
       databaseType,
       objectType,
@@ -222,36 +241,38 @@ async function saveSource() {
       source: draft.value,
     });
     if (serial !== loadSerial) return;
+    save = await prepareObjectSourceSave(connectionId, database, databaseType, statements, schema, { objectType, name });
+    const preparedSave = save;
     const executableSql = statements.filter((sql) => sql.trim()).join(";\n");
     const execute = async () => {
-      if (serial !== loadSerial || !props.open) return false;
+      if (serial !== loadSerial || !props.open) return;
       const release = beginSourceSave(identity);
       try {
-        await executeObjectSourceSave(connectionId, database, databaseType, statements, schema);
-        return true;
+        return { operation: await preparedSave() };
       } finally {
         release();
       }
     };
+    let result;
     if (executableSql.trim()) {
-      const saved = await executeWithProductionSqlGuard({
+      result = await executeWithProductionSqlGuard({
         connection: connectionStore.getConfig(connectionId),
         database,
         sql: executableSql,
         source: t("production.sourceObjectSource"),
         execute,
       });
-      if (!saved) return;
     } else {
-      if (!(await execute())) return;
+      result = await execute();
     }
-    if (serial !== loadSerial) return;
-    toast(t("objects.sourceSaved"));
+    if (!result || serial !== loadSerial) return;
+    toast(objectSourceSaveSuccessMessage(t("objects.sourceSaved"), result.operation), result.operation?.readback?.compilerMessages.length ? 6000 : 2000);
     emit("saved");
     await loadSource(false);
   } catch (e: unknown) {
     if (serial === loadSerial) saveError.value = formatObjectSourceSaveError(e, databaseType, objectType, t("objects.postgresViewColumnChangeHint"));
   } finally {
+    await save?.dispose?.();
     if (serial === loadSerial) saving.value = false;
   }
 }
@@ -338,7 +359,7 @@ function closeDialog() {
         </Button>
         <Button v-if="editing && section === 'source'" :disabled="saving || !draft.trim()" @click="saveSource">
           <Loader2 v-if="saving" class="h-4 w-4 animate-spin" />
-          {{ t("objects.saveSource") }}
+          {{ t(managedType ? "objects.typeManagementPreviewSave" : "objects.saveSource") }}
         </Button>
       </DialogFooter>
     </DialogContent>

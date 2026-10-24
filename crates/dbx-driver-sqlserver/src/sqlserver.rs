@@ -3372,6 +3372,7 @@ pub async fn list_indexes(client: &mut SqlServerClient, schema: &str, table: &st
             let cols_str = row.get::<&str, _>(1).unwrap_or("");
             let inc_str = row.get::<&str, _>(5).unwrap_or("");
             IndexInfo {
+                owner: None,
                 key_directions: Vec::new(),
                 visibility: None,
                 key_metadata_complete: false,

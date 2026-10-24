@@ -34,6 +34,7 @@ export interface TableMetadataRequest {
   driverProfile?: string;
   catalog?: string;
   force?: boolean;
+  exactIdentity?: boolean;
   traceLogger?: MetadataLoadTraceLogger;
 }
 
@@ -158,7 +159,7 @@ function bumpTableMetadataInvalidationStamp(scopeKey: string): void {
   tableMetadataInvalidationStamps.set(scopeKey, (tableMetadataInvalidationStamps.get(scopeKey) ?? 0) + 1);
 }
 
-export function tableMetadataScope(request: Pick<TableMetadataRequest, "connectionId" | "database" | "schema" | "tableName" | "tableType" | "driverProfile" | "databaseType" | "catalog" | "currentSchema">): MetadataScopeInput {
+export function tableMetadataScope(request: Pick<TableMetadataRequest, "connectionId" | "database" | "schema" | "tableName" | "tableType" | "driverProfile" | "databaseType" | "catalog" | "currentSchema" | "exactIdentity">): MetadataScopeInput {
   return {
     kind: "table-metadata",
     connectionId: request.connectionId,
@@ -167,7 +168,7 @@ export function tableMetadataScope(request: Pick<TableMetadataRequest, "connecti
     tableName: request.tableName,
     tableType: request.tableType,
     driverProfile: request.driverProfile || request.databaseType,
-    extra: request.catalog || request.currentSchema ? { catalog: request.catalog, currentSchema: request.currentSchema } : undefined,
+    extra: request.catalog || request.currentSchema || request.exactIdentity ? { catalog: request.catalog, currentSchema: request.currentSchema, ...(request.exactIdentity ? { exactIdentity: true } : {}) } : undefined,
   };
 }
 
@@ -178,13 +179,13 @@ function withVirtualRowIdentifier(metadata: TableMetadata, request: Pick<TableMe
   return { ...metadata, primaryKeys: virtualPrimaryKeys, virtualPrimaryKeys, rowIdentityResolved: true };
 }
 
-export function getCachedTableMetadata(request: Pick<TableMetadataRequest, "connectionId" | "database" | "schema" | "tableName" | "tableType" | "driverProfile" | "databaseType" | "catalog" | "currentSchema">): TableMetadataLoadResult | undefined {
+export function getCachedTableMetadata(request: Pick<TableMetadataRequest, "connectionId" | "database" | "schema" | "tableName" | "tableType" | "driverProfile" | "databaseType" | "catalog" | "currentSchema" | "exactIdentity">): TableMetadataLoadResult | undefined {
   const hit = tableMetadataCache.get(tableMetadataScope(request));
   if (!hit) return undefined;
   return { metadata: withVirtualRowIdentifier(hit.value, request), cacheStatus: hit.stale ? "stale" : "hit", ageMs: hit.ageMs };
 }
 
-export function updateCachedTableMetadataType(request: Pick<TableMetadataRequest, "connectionId" | "database" | "schema" | "tableName" | "tableType" | "driverProfile" | "databaseType" | "catalog" | "currentSchema">, tableType: string): boolean {
+export function updateCachedTableMetadataType(request: Pick<TableMetadataRequest, "connectionId" | "database" | "schema" | "tableName" | "tableType" | "driverProfile" | "databaseType" | "catalog" | "currentSchema" | "exactIdentity">, tableType: string): boolean {
   const scope = tableMetadataScope(request);
   const hit = tableMetadataCache.get(scope);
   if (!hit) return false;
@@ -192,7 +193,7 @@ export function updateCachedTableMetadataType(request: Pick<TableMetadataRequest
   return true;
 }
 
-export function getCachedTableColumns(request: Pick<TableMetadataRequest, "connectionId" | "database" | "schema" | "tableName" | "tableType" | "driverProfile" | "databaseType" | "catalog" | "currentSchema">): TableColumnsLoadResult | undefined {
+export function getCachedTableColumns(request: Pick<TableMetadataRequest, "connectionId" | "database" | "schema" | "tableName" | "tableType" | "driverProfile" | "databaseType" | "catalog" | "currentSchema" | "exactIdentity">): TableColumnsLoadResult | undefined {
   const hit = tableColumnsCache.get(tableMetadataScope(request));
   if (!hit) return undefined;
   return { columns: hit.value.columns, tableType: hit.value.tableType, cacheStatus: hit.stale ? "stale" : "hit", ageMs: hit.ageMs, cachedAt: hit.cachedAt };
@@ -249,9 +250,11 @@ export async function loadTableColumns(request: TableMetadataRequest): Promise<T
       scope,
       async () => {
         // Display-only loader: columns only, never index discovery.
-        const columns = request.currentSchema
-          ? await api.getColumns(request.connectionId, request.database, request.schema ?? "", request.tableName, request.catalog, undefined, request.currentSchema)
-          : await api.getColumns(request.connectionId, request.database, request.schema ?? "", request.tableName, request.catalog);
+        const columns = request.exactIdentity
+          ? await api.getColumns(request.connectionId, request.database, request.schema ?? "", request.tableName, request.catalog, undefined, undefined, true)
+          : request.currentSchema
+            ? await api.getColumns(request.connectionId, request.database, request.schema ?? "", request.tableName, request.catalog, undefined, request.currentSchema)
+            : await api.getColumns(request.connectionId, request.database, request.schema ?? "", request.tableName, request.catalog);
         const resolvedTarget = columns.find((column) => column.resolved_table);
         const resolvedSchema = (request.databaseType === "vastbase" || request.databaseType === "kingbase") && !request.schema ? columns.find((column) => column.resolved_schema)?.resolved_schema : request.schema;
         return {
@@ -306,7 +309,9 @@ export async function loadTableIndexes(request: TableMetadataRequest): Promise<I
     if (!oldestKey) break;
     tableIndexesLoads.delete(oldestKey);
   }
-  const promise = api.listIndexes(request.connectionId, request.database, request.schema || request.currentSchema || "", request.tableName, request.catalog);
+  const promise = request.exactIdentity
+    ? api.listIndexes(request.connectionId, request.database, request.schema ?? "", request.tableName, request.catalog, true)
+    : api.listIndexes(request.connectionId, request.database, request.schema || request.currentSchema || "", request.tableName, request.catalog);
   const entry = { parts: metadataScopeParts(scope), promise, expiresAt: Date.now() + TABLE_METADATA_CACHE_TTL_MS };
   tableIndexesLoads.set(scopeKey, entry);
   void promise.catch(() => {

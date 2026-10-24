@@ -2506,6 +2506,27 @@ fn postgres_preview_fallback_retry_sql(options: &QueryExecutionOptions, error: &
     external_driver_preview_fallback_sql(sql)
 }
 
+/// MySQL-compatible servers that are not actually MySQL (for example HighGo's
+/// MySQL protocol) do not have a `left(json, integer)` overload. The generated
+/// table-data preview wraps JSON columns in `LEFT(...)`, so the preview fails
+/// even though the table itself is readable. Retry once without the generated
+/// wrappers and let the existing large-value markers truncate client-side.
+fn preview_missing_left_function_fallback_sql(
+    options: &QueryExecutionOptions,
+    error: &str,
+    sql: &str,
+) -> Option<String> {
+    if !options.table_data_preview || !is_preview_missing_left_function_error(error) {
+        return None;
+    }
+    external_driver_preview_fallback_sql(sql)
+}
+
+fn is_preview_missing_left_function_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("function left(") && normalized.contains("does not exist")
+}
+
 /// Dispatches one statement on a native PostgreSQL pool according to the
 /// connection's execution mode and schema context.
 #[allow(clippy::too_many_arguments)]
@@ -3021,6 +3042,28 @@ async fn execute_sql_statement_with_options_typed_inner(
         result.map_err(|error| error.with_omitted_sql_context(sql))
     };
 
+    if let Err(error) = &result {
+        if let Some(fallback_sql) = preview_missing_left_function_fallback_sql(&options, &error.to_string(), sql) {
+            log::warn!(
+                "[query] table data preview failed because the server has no left() overload; retrying without generated left() wrappers"
+            );
+            return with_sql_context(
+                do_execute_typed(
+                    state,
+                    &pool_key,
+                    mysql_dialect,
+                    Some(database),
+                    &fallback_sql,
+                    schema,
+                    cancel_token.clone(),
+                    options.clone(),
+                    &mut None,
+                )
+                .await,
+            );
+        }
+    }
+
     let action = result.as_ref().err().map(|error| query_execution_error_action(db_type, sql, error));
     if let Some(initial_error) = result.as_ref().err() {
         if let Some(recovered) = recover_postgres_create_table_after_connection_error(
@@ -3415,6 +3458,31 @@ pub async fn close_query_session(
             db::couchdb_driver::close_cursor(&client, session_id).await?;
             Ok(true)
         }
+        _ => Ok(false),
+    }
+}
+
+/// Close only the result cursor held by this transaction; never open a normal
+/// pool or commit/roll back the transaction as part of result cleanup.
+pub async fn close_manual_transaction_query_session(
+    state: &AppState,
+    connection_id: &str,
+    txn_session_id: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    let connection = {
+        let sessions = state.transaction_sessions.read().await;
+        let Some(session) = sessions.get(txn_session_id) else {
+            return Ok(false);
+        };
+        if session.connection_id != connection_id {
+            return Err("Transaction session belongs to a different connection".to_string());
+        }
+        Arc::clone(&session.connection)
+    };
+    let connection = connection.lock().await;
+    match &*connection {
+        TxnConnection::Agent { client, .. } => client.lock().await.close_query_session(session_id).await,
         _ => Ok(false),
     }
 }
@@ -10922,6 +10990,31 @@ for line in sys.stdin:
         assert!(postgres_preview_fallback_retry_sql(&QueryExecutionOptions::default(), error, sql).is_none());
     }
 
+    #[test]
+    fn preview_missing_left_function_retry_rewrites_generated_mysql_previews() {
+        let options = QueryExecutionOptions { table_data_preview: true, ..Default::default() };
+        let sql = concat!(
+            "SELECT `id`, LEFT(`Words`, 101) AS `Words`, ",
+            "CONCAT('T:100:', LENGTH(`Words`)) AS `__DBX_LARGE_VALUE_BYTES_T_1` FROM `vocab` LIMIT 100"
+        );
+        let error = "Server error: `ERROR 32900 (HY000): function left(json, integer) does not exist'";
+
+        assert_eq!(
+            preview_missing_left_function_fallback_sql(&options, error, sql).as_deref(),
+            Some(
+                "SELECT `id`, `Words` AS `Words`, CONCAT('T:100:', LENGTH(`Words`)) AS `__DBX_LARGE_VALUE_BYTES_T_1` FROM `vocab` LIMIT 100"
+            )
+        );
+
+        // User SQL without the generated marker is never rewritten, unrelated
+        // errors never trigger a retry, and the data-grid flag is required.
+        assert!(
+            preview_missing_left_function_fallback_sql(&options, error, "SELECT LEFT(Words, 100) FROM vocab").is_none()
+        );
+        assert!(preview_missing_left_function_fallback_sql(&options, "ERROR: syntax error", sql).is_none());
+        assert!(preview_missing_left_function_fallback_sql(&QueryExecutionOptions::default(), error, sql).is_none());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn external_driver_preview_retry_preserves_marker_truncation() {
@@ -12302,9 +12395,16 @@ for line in sys.stdin:
 import sys
 
 print(json.dumps({{"ready": True}}), flush=True)
+cursor_ids = {{"cursor-1"}}
 for line in sys.stdin:
     request = json.loads(line)
     method = request.get("method")
+    if method == "close_query_session":
+        cursor_id = request.get("params", {{}}).get("sessionId")
+        closed = cursor_id in cursor_ids
+        cursor_ids.discard(cursor_id)
+        print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": closed}}), flush=True)
+        continue
     if method == "execute_query":
         params = request.get("params", {{}})
         sql = params.get("sql", "")
@@ -12380,6 +12480,35 @@ for line in sys.stdin:
             },
         );
         (state, txn_session_id, dir)
+    }
+
+    #[tokio::test]
+    async fn manual_transaction_cursor_cleanup_uses_its_owner_without_ending_transaction() {
+        let (state, txn_id, dir) = manual_transaction_test_state(DatabaseType::Oracle).await;
+        assert!(close_manual_transaction_query_session(&state, "other-connection", &txn_id, "cursor-1").await.is_err());
+        assert!(!close_manual_transaction_query_session(&state, "agent-conn", "missing-txn", "cursor-1")
+            .await
+            .unwrap());
+        // Only the held transaction has an Agent. A lookup through the normal
+        // connection pool cannot close this cursor.
+        assert!(close_manual_transaction_query_session(&state, "agent-conn", &txn_id, "cursor-1").await.unwrap());
+        assert!(!close_manual_transaction_query_session(&state, "agent-conn", &txn_id, "cursor-1").await.unwrap());
+        let result = execute_in_manual_transaction_with_options(
+            &state,
+            &txn_id,
+            "SELECT 1 FROM DUAL",
+            "ORCL",
+            Some("APP"),
+            ManualTransactionExecutionOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result[0].result.rows[0][0], "SELECT 1 FROM DUAL");
+        assert!(state.transaction_sessions.read().await.contains_key(&txn_id));
+        rollback_manual_transaction(&state, &txn_id).await.unwrap();
+        assert!(!close_manual_transaction_query_session(&state, "agent-conn", &txn_id, "cursor-1").await.unwrap());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn manual_sql_file_request(session_id: &str) -> crate::sql::SqlFileRequest {
@@ -12872,6 +13001,63 @@ for line in sys.stdin:
                 original_bytes: SERVER_LARGE_VALUE_UNKNOWN_BYTES,
                 value_ref: None
             }]
+        );
+    }
+
+    #[test]
+    fn extracts_oracle_rowid_preview_markers_indexed_by_result_position() {
+        // 无主键 Oracle 基表的截断投影以 __DBX_ROWID 开头，marker 下标是结果集
+        // 位置（源列在结果中的下标），不是表列下标——位置校验失败会整组拒识。
+        let mut result = db::QueryResult {
+            columns: vec![
+                "__DBX_ROWID".to_string(),
+                "ID".to_string(),
+                "PAYLOAD".to_string(),
+                format!("{}T_2", crate::sql_dialect::DBX_LARGE_VALUE_BYTES_COLUMN_PREFIX),
+            ],
+            column_types: vec![
+                "varchar2".to_string(),
+                "number".to_string(),
+                "varchar2".to_string(),
+                "varchar2".to_string(),
+            ],
+            column_sortables: vec![true, true, true, true],
+            spatial_columns: Vec::new(),
+            spatial_values: Vec::new(),
+            rows: vec![
+                vec![
+                    serde_json::json!("AAAR1yAAHAAAAFjAAA"),
+                    serde_json::json!(1),
+                    serde_json::json!("x".repeat(1000)),
+                    serde_json::json!("T:999:5231"),
+                ],
+                vec![
+                    serde_json::json!("AAAR1yAAHAAAAFjAAB"),
+                    serde_json::json!(2),
+                    serde_json::Value::Null,
+                    serde_json::Value::Null,
+                ],
+            ],
+            affected_rows: 0,
+            execution_time_ms: 0,
+            server_execute_time_us: None,
+            query_timings_ms: None,
+            truncated: false,
+            session_id: None,
+            has_more: false,
+            elasticsearch_raw_body: None,
+            messages: Vec::new(),
+        };
+
+        let cells = extract_server_large_value_markers(&mut result);
+
+        assert_eq!(result.columns, vec!["__DBX_ROWID", "ID", "PAYLOAD"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0][2], serde_json::json!(format!("{}...", "x".repeat(999))));
+        assert_eq!(result.rows[1][2], serde_json::Value::Null);
+        assert_eq!(
+            cells,
+            vec![db::LargeValueCell { row_index: 0, column_index: 2, original_bytes: 5231, value_ref: None }]
         );
     }
 

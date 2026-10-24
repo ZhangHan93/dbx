@@ -25,6 +25,14 @@ describe("database dependency providers", () => {
     expect(canViewDatabaseObjectDependencies("postgres", node())).toBe(false);
   });
 
+  it.each(["oracle", "oceanbase-oracle"] as const)("exposes table and view relations through the existing provider in %s", (databaseType) => {
+    for (const type of ["table", "view", "materialized_view"] as const) {
+      const target = node({ type });
+      expect(canViewDatabaseObjectDependencies(databaseType, target)).toBe(true);
+      expect(databaseDependencyProviderFor(databaseType)?.buildQuery(target)).toContain("ALL_DEPENDENCIES");
+    }
+  });
+
   it("does not expose package members or incomplete nodes", () => {
     const provider = databaseDependencyProviderFor("xugu");
     expect(provider).not.toBeNull();

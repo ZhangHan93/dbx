@@ -31,6 +31,7 @@ export interface ObjectDdlRequest {
   tableName: string;
   objectType?: ObjectSourceKind;
   catalog?: string;
+  exactIdentity?: boolean;
 }
 
 export interface ObjectDdlLoadResult {
@@ -65,7 +66,7 @@ function cacheSegment(value: string | undefined): string {
 }
 
 export function objectDdlCacheKey(request: ObjectDdlRequest): string {
-  return `${[OBJECT_DDL_CACHE_PREFIX, cacheSegment(request.connectionId), cacheSegment(request.database), cacheSegment(request.schema), cacheSegment(request.tableName), cacheSegment(request.catalog), cacheSegment(request.objectType ?? "TABLE")].join(":")}:`;
+  return `${[OBJECT_DDL_CACHE_PREFIX, cacheSegment(request.connectionId), cacheSegment(request.database), cacheSegment(request.schema), cacheSegment(request.tableName), cacheSegment(request.catalog), cacheSegment(request.objectType ?? "TABLE"), ...(request.exactIdentity ? ["exact-v1"] : [])].join(":")}:`;
 }
 
 function invalidationPrefix(match: MetadataCacheInvalidation): string {
@@ -154,11 +155,14 @@ async function loadRemoteDdl(request: ObjectDdlRequest, cacheKey: string, force:
   };
   signal.addEventListener("abort", cancel, { once: true });
   recordMetadataCacheRemoteMiss(cacheKey);
+  const remote = request.exactIdentity
+    ? api.getTableDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog, false, true)
+    : api.getTableDisplayDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog);
   entry.promise = waitForMetadata(
-    api.getTableDisplayDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog).then((rawDdl) => {
+    remote.then((rawDdl) => {
       const ddl = sanitizeDdl(rawDdl);
       const current = !entry.invalidated;
-      if (current && ddl.length <= MAX_PERSISTED_DDL_CHARS) {
+      if (current && !request.exactIdentity && ddl.length <= MAX_PERSISTED_DDL_CHARS) {
         const envelope: ObjectDdlCacheEnvelope = { version: 1, cachedAt: new Date().toISOString(), ddl };
         setMetadataRuntimeCache(cacheKey, ddl, request.connectionId);
         persistSchemaCache(cacheKey, envelope, () => entry.invalidated);
@@ -209,6 +213,7 @@ async function loadObjectDdlInternal(request: ObjectDdlRequest, signal: AbortSig
   if (!options?.force) {
     const runtime = getMetadataRuntimeCache<string>(cacheKey);
     if (runtime) return { ddl: runtime.value, cacheStatus: "memory" };
+    if (request.exactIdentity) return { ddl: await loadRemoteDdl(request, cacheKey, false, signal), cacheStatus: "remote" };
     const readToken = activeCacheReads.begin(cacheKey);
     let cached: string | null;
     try {

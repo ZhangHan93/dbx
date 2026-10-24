@@ -14,6 +14,7 @@ import { createContentSurfaceEventForwarders } from "@/lib/tabs/contentSurfaceEv
 import { isPreviewTab } from "@/lib/tabs/tabPresentation";
 import { resolveExecutableSql } from "@/lib/sql/sqlExecutionTarget";
 import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
+import { isOracleFamilyTypeSource } from "@/lib/database/databaseObjectCapabilities";
 import { usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
 import * as api from "@/lib/backend/api";
 import { externalSqlEditorMaxBytes, externalSqlFileOpenErrorMessage } from "@/lib/sql/sqlFileOpen";
@@ -122,7 +123,7 @@ const groupTabs = computed(() => {
 });
 const activeTab = computed(() => groupTabs.value.find((tab) => tab.id === props.activeTabId) ?? groupTabs.value[0] ?? null);
 const activeConnection = computed(() => (activeTab.value ? connectionStore.getConfig(activeTab.value.connectionId) : undefined));
-const showGroupToolbar = computed(() => activeTab.value?.mode === "query" && !activeTab.value.ddlViewer && !isPreviewTab(activeTab.value));
+const showGroupToolbar = computed(() => activeTab.value?.mode === "query" && !activeTab.value.ddlViewer && !isPreviewTab(activeTab.value) && !isOracleFamilyTypeSource(effectiveDatabaseTypeForConnection(activeConnection.value), activeTab.value.objectSource?.objectType));
 
 let encodingRequest = 0;
 async function changeExternalSqlEncoding(encoding: NonNullable<QueryTab["externalSqlEncoding"]>) {
@@ -190,6 +191,7 @@ const groupExecutableSql = computed(() => {
         :special-page-tabs="toolbar.specialPageTabs.value"
         @activate-tab="$emit('activate-tab', $event)"
         @locate-tab="$emit('locate-tab', $event)"
+        @locate-sql-file="$emit('locate-sql-file', $event)"
         @toggle-zen-mode="$emit('toggle-zen-mode')"
         @start-resize="$emit('start-resize', $event)"
         @toggle-collapse="$emit('toggle-collapse')"

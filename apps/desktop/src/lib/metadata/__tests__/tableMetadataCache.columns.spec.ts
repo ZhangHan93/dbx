@@ -69,6 +69,18 @@ describe("tableMetadataCache columns facet request counts", () => {
     expect(mocks.getColumns).toHaveBeenCalledOnce();
   });
 
+  it("separates exact dictionary identities from legacy snapshots and sends the mode to both facets", async () => {
+    const request = { ...usersRequest, schema: " Mixed ", tableName: " T(a) ", databaseType: "oceanbase-oracle", tableType: "TABLE" };
+    await loadTableMetadata(request);
+    const exact = { ...request, exactIdentity: true };
+    const result = await loadTableMetadata(exact);
+    expect(result.cacheStatus).toBe("miss");
+    expect(mocks.getColumns).toHaveBeenNthCalledWith(2, "c1", "db", " Mixed ", " T(a) ", undefined, undefined, undefined, true);
+    expect(mocks.listIndexes).toHaveBeenNthCalledWith(2, "c1", "db", " Mixed ", " T(a) ", undefined, true);
+    expect((await loadTableMetadata(request)).cacheStatus).toBe("hit");
+    expect((await loadTableMetadata(exact)).cacheStatus).toBe("hit");
+  });
+
   it("uses a synonym's exact resolved target for indexes while retaining its source name", async () => {
     mocks.getColumns.mockResolvedValue([{ ...column("ItemId"), is_primary_key: false, resolved_schema: "MixedOwner", resolved_table: "ActualItems", resolved_object_type: "TABLE" }]);
     mocks.listIndexes.mockResolvedValue([{ name: "ITEMS_PK", columns: ["ItemId"], is_primary: true, is_unique: true }]);

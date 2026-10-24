@@ -1,3 +1,4 @@
+import { tableColumnPastePl as tableColumnPaste } from "./tableColumnPaste";
 import { withEnglishFallback } from "./fallback";
 import { redisGroupingPl as redisGrouping } from "./redisGrouping";
 import docs from "./docs/pl";
@@ -62,6 +63,7 @@ const consul = {
 };
 
 export default withEnglishFallback({
+  tableColumnPaste,
   objectDependencies: {
     dependencies: "Zależności",
     dependents: "Obiekty zależne",
@@ -771,6 +773,7 @@ export default withEnglishFallback({
     regexSearchTooltip: "Dopasowuj nazwy, komentarze i aliasy w panelu bocznym przy użyciu wyrażeń regularnych JavaScript.",
     clearFilter: "Wyczyść filtr",
     locateTargetNotFound: "Pozycja nie jest dostępna w panelu bocznym. Mogła zostać usunięta lub ukryta.",
+    locateSqlFile: "Znajdź na liście plików SQL",
     locateActiveTab: "Znajdź na pasku bocznym",
   },
   savedSql: {
@@ -869,6 +872,8 @@ export default withEnglishFallback({
     collapseAll: "Zwiń wszystko",
     moreMatches: "+ {count} dodatkowych wyników",
     collapseMatches: "Zwiń",
+    searchContentIncomplete: "Niepełne wyniki wyszukiwania: nie udało się wczytać treści {count} plików.",
+    matchPreviewLimit: "Podgląd jest ograniczony do pierwszych {limit} z {total} pasujących wierszy.",
   },
 
   connection: {
@@ -1579,6 +1584,9 @@ export default withEnglishFallback({
     sshKeyPassphrasePlaceholder: "Pozostaw puste, jeśli klucz nie jest zaszyfrowany",
     sshKeyPathBrowse: "Przeglądaj",
     sshExposeLan: "Udostępnij tunel w sieci LAN",
+    sshLocalPort: "Port lokalny",
+    sshLocalPortPlaceholder: "Auto",
+    sshLocalPortHint: "Pozostaw puste, aby użyć losowego wolnego portu. Stały port utrzymuje tunel na tym porcie lokalnym, dopóki połączenie jest otwarte, dzięki czemu mogą z niego korzystać inne narzędzia. Dotyczy tylko ostatniej warstwy.",
     sshAllowExecChannelProxy: "Włącz zapasowe przekazywanie przez kanał SSH exec (nc)",
     sshProxyCommand: "ProxyCommand",
     sshProxyCommandPlaceholder: "nc %h %p",
@@ -1649,6 +1657,9 @@ export default withEnglishFallback({
     sshWorkerUploadConsentAccept: "Prześlij",
     sshWorkerUploadConsentReject: "Anuluj",
     sshHopInvalidTimeout: "{hop}: limit czasu SSH musi wynosić od 1 do 300 sekund",
+    sshHopInvalidLocalPort: "{hop}: port lokalny musi mieścić się w zakresie od 1 do 65535",
+    sshHopLocalPortNotLast: "{hop}: port lokalny dotyczy tylko ostatniej włączonej warstwy",
+    sshHopLocalPortUnsupported: "{hop}: port lokalny nie jest obsługiwany dla tego typu połączenia",
     connectTimeout: "Limit czasu połączenia (sekundy)",
     queryTimeout: "Limit czasu zapytania (sekundy)",
     useGlobalQueryTimeout: "Globalne",
@@ -1741,6 +1752,7 @@ export default withEnglishFallback({
     cancelConnecting: "Anuluj łączenie",
     connectCancelled: "Anulowano połączenie",
     sshTotpCancelled: "Anulowano wprowadzanie kodu jednorazowego",
+    sshLocalPortBindFailed: "Port lokalny {port} jest zajęty lub niedostępny ({error}). Zamknij program, który go używa, lub wybierz inny port lokalny.",
   },
   editor: {
     duckdbDraining: "Poprzednie zapytanie DuckDB jest nadal zatrzymywane. Spróbuj ponownie za chwilę.",
@@ -1952,6 +1964,7 @@ export default withEnglishFallback({
       replaceAll: "Zamień wszystkie",
       caseSensitive: "Uwzględniaj wielkość liter",
       regex: "Wyrażenie regularne",
+      wholeWord: "Całe słowo",
       collapseReplace: "Zwiń pole zamiany",
       expandReplace: "Rozwiń pole zamiany",
       prevMatch: "Poprzednie (Shift+Enter)",
@@ -7643,6 +7656,25 @@ export default withEnglishFallback({
     totalFiles: "Pliki: {count}",
   },
   sqlFileTree: {
+    searchIncompleteHelp: "Dlaczego wyniki wyszukiwania są niepełne:",
+    searchSkippedTooLarge: "Rozmiar ponad 32 MiB: pominięto {count} plików.",
+    searchSkippedUnreadable: "Nie można odczytać (być może usunięte lub brak dostępu): {count} plików lub folderów.",
+    searchSkippedInvalidEncoding: "Nierozpoznane kodowanie: {count} plików.",
+    searchSkippedOutsideRoot: "Rzeczywista ścieżka poza wybranym folderem głównym: {count} plików.",
+    searchSkippedNotRegularFile: "Nie są zwykłymi plikami (np. zastąpione dowiązaniami symbolicznymi): {count} elementów.",
+    searchSkippedOther: "Pominięto z innych powodów: {count} elementów.",
+    searchPreviewLimits: "Podgląd został skrócony: do {perFile} wierszy na plik i {total} na wyszukiwanie. Wyszukiwanie pasujących plików i zliczanie wierszy trwa nadal.",
+    searchMode: "Zakres wyszukiwania",
+    searchByName: "Plik",
+    searchByContent: "Treść",
+    searchContentPlaceholder: "Szukaj w treści plików...",
+    searchPlaceholder: "Szukaj nazw plików...",
+    searching: "Wyszukiwanie w treści plików...",
+    searchIncomplete: "Wyszukiwanie niepełne: pominięto {skipped} plików lub folderów; pasujące fragmenty mogą być ucięte.",
+    searchFailed: "Wyszukiwanie w treści nie powiodło się: {message}",
+    sortManual: "Kolejność ręczna",
+    sortManualHint: "Przeciągaj pliki w tym samym folderze, aby zmienić kolejność. Przeciąganie jest wyłączone podczas wyszukiwania.",
+    sortSaveFailed: "Nie udało się zapisać ustawienia sortowania plików.",
     title: "Aktualizacja zabezpieczeń danych",
     storageHelp: "Są to rzeczywiste pliki .sql na dysku otwarte przez „Otwórz folder”. Zmiany zapisywane są bezpośrednio w pliku źródłowym.",
     openFolder: "Otwórz folder",
@@ -7798,7 +7830,7 @@ export default withEnglishFallback({
     routineSelectionUnrestricted: "Porównywanie wszystkich funkcji i procedur. Wybierz konkretne elementy, aby ograniczyć porównanie.",
     routineSelectionTooLarge: "Ten schemat ma {count} procedur i funkcji (limit dla nieograniczonego porównania wynosi {limit}). Wybierz konkretne elementy przed porównaniem.",
     routineSelectionNeedSource: "Najpierw wybierz źródłowe połączenie i bazę danych, aby wybrać procedury i funkcje.",
-    routineSelectionUnsupported: "Porównywanie procedur/funkcji wymaga tego samego obsługiwanego dialektu po obu stronach (MySQL, SQL Server lub rodzina PostgreSQL).",
+    routineSelectionUnsupported: "Porównywanie procedur/funkcji wymaga zgodnych i obsługiwanych typów baz danych oraz dostępnego kodu źródłowego po obu stronach.",
     routineSameNameMatchingOnly: "Procedury i funkcje są dopasowywane według identycznej nazwy (i sygnatury). Ręczne mapowanie zmian nazw nie jest dostępne w tej wersji.",
     sourceRoutines: "Procedury i funkcje źródłowe",
     noRoutines: "Nie znaleziono procedur ani funkcji",
@@ -9965,8 +9997,20 @@ export default withEnglishFallback({
     runDirectoryPattern: "Szablon katalogu uruchomienia",
     runDirectoryPatternHint: "Ścieżka względna wewnątrz katalogu docelowego. Użyj {'{'}schedule{'}'}, {'{'}date{'}'}, {'{'}timestamp{'}'} i {'{'}runId{'}'}. Domyślnie zawiera {'{'}runId{'}'} dla izolacji. Przykład: {'{'}schedule{'}'}/{'{'}date{'}'}/{'{'}timestamp{'}'}-{'{'}runId{'}'}",
     runDirectoryPatternInvalid: "Użyj ścieżki względnej bez segmentów . lub ..",
-    compression: "Kompresja",
+    backupFormat: "Format kopii zapasowej",
     compressionGzip: "Gzip (.sql.gz)",
+    formatSql: "SQL (.sql)",
+    formatNb3: "Kopia zapasowa Navicat (.nb3)",
+    formatNb3Hint: "Format kopii zapasowej Navicat dla MySQL i PostgreSQL. DBX przywraca go jak każdą kopię SQL.",
+    restoreFromFile: "Przywróć z pliku",
+    restoreFromFileHint: "Przywróć plik kopii zapasowej .sql, .sql.gz lub .nb3 z dowolnego miejsca",
+    importBackup: "Importuj kopię zapasową",
+    importBackupHint: "Dodaj do historii pliki kopii zapasowych utworzone poza DBX, np. archiwa .nb3 z Navicat",
+    importedTrigger: "Zaimportowana",
+    externalFile: "Plik zewnętrzny",
+    backupsImported: "Dodano {count} kopii zapasowych do historii",
+    deleteImportedConfirm: "Usunąć {count} zaimportowanych kopii zapasowych z historii? Pliki pozostaną na dysku.",
+    importedFilesKept: "Zaimportowane kopie zapasowe są tylko usuwane z historii; pliki pozostają na dysku.",
     searchConnections: "Szukaj połączeń…",
     noMatchingConnections: "Brak pasujących połączeń",
     connectionsSelected: "Wybrane połączenia: {count}",

@@ -1,5 +1,6 @@
 import type { QueryResultSourceLabelKind, QueryTab, TabOutputView } from "@/types/database";
 import { sanitizeTabUiState } from "@/lib/tabs/tabUiState";
+import { restoreOracleTypeManagementDraft } from "@/lib/table/oracleTypeManagement";
 
 export const OPEN_TABS_STORAGE_KEY = "dbx-open-tabs";
 export const ACTIVE_TAB_STORAGE_KEY = "dbx-active-tab";
@@ -68,10 +69,12 @@ export interface SavedOpenTab {
   nacosNamespace?: string;
   nacosNamespaceName?: string;
   structureTableName?: string;
+  structureExactIdentity?: boolean;
   structureDraft?: QueryTab["structureDraft"];
   databaseSearchState?: QueryTab["databaseSearchState"];
   objectBrowser?: QueryTab["objectBrowser"];
   objectSource?: QueryTab["objectSource"];
+  typeManagementDraft?: QueryTab["typeManagementDraft"];
   objectDetails?: QueryTab["objectDetails"];
   sourceView?: boolean;
   ddlViewer?: QueryTab["ddlViewer"];
@@ -108,7 +111,7 @@ export interface OpenTabsStatePayload {
   sizes?: number[];
 }
 
-export type OpenTabsRestoreFilter = "all" | "pinned";
+export type OpenTabsRestoreFilter = "all" | "pinned" | "recovery";
 export interface OpenTabsRestoreOptions {
   queryOnly?: boolean;
   filter?: OpenTabsRestoreFilter;
@@ -124,7 +127,7 @@ function shouldPersistTabSql(tab: QueryTab) {
 // its request is in flight would restore an empty source tab after restart,
 // because the request itself is intentionally not durable.
 function shouldPersistOpenTab(tab: QueryTab): boolean {
-  return !tab.sourceLoad;
+  return !tab.sourceLoad || !!tab.typeManagementDraft;
 }
 
 function restoredOriginalSql(tab: SavedOpenTab, mode: QueryTab["mode"], sql: string) {
@@ -219,10 +222,12 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.nacosNamespace !== undefined ? { nacosNamespace: tab.nacosNamespace } : {}),
     ...(tab.nacosNamespaceName !== undefined ? { nacosNamespaceName: tab.nacosNamespaceName } : {}),
     ...(tab.structureTableName !== undefined ? { structureTableName: tab.structureTableName } : {}),
+    ...(tab.structureExactIdentity ? { structureExactIdentity: true } : {}),
     ...(tab.structureDraft ? { structureDraft: JSON.parse(JSON.stringify(tab.structureDraft)) } : {}),
     ...(tab.databaseSearchState ? { databaseSearchState: tab.databaseSearchState } : {}),
     objectBrowser: tab.objectBrowser,
     objectSource: tab.objectSource,
+    ...(tab.typeManagementDraft ? { typeManagementDraft: JSON.parse(JSON.stringify(tab.typeManagementDraft)) } : {}),
     ...(tab.objectDetails ? { objectDetails: { ...tab.objectDetails } } : {}),
     ...(tab.sourceView ? { sourceView: true } : {}),
     ...(tab.ddlViewer ? { ddlViewer: { ...tab.ddlViewer } } : {}),
@@ -274,8 +279,11 @@ function restoreOpenTabsArray(parsed: unknown, rawActiveTabId: string | null, op
     const saved = parsed.filter(isSavedOpenTab);
     const filtered = saved.filter((tab) => {
       const mode = tab.mode ?? "query";
+      const recovery = restoreOracleTypeManagementDraft(tab.typeManagementDraft);
+      const unfinishedTypeChange = !!recovery && recovery.state !== "complete";
       if (options.queryOnly && mode !== "query") return false;
-      if (options.filter === "pinned" && !tab.pinned) return false;
+      if (options.filter === "pinned" && !tab.pinned && !unfinishedTypeChange) return false;
+      if (options.filter === "recovery" && !unfinishedTypeChange) return false;
       if (mode !== "query" && validConnectionIds && !validConnectionIds.has(tab.connectionId)) return false;
       return true;
     });
@@ -301,6 +309,8 @@ function restoreOpenTabsArray(parsed: unknown, rawActiveTabId: string | null, op
         // sourceLoad 是纯运行期态（serializeOpenTabs 不落盘）。这里显式清空，
         // 让「恢复后的 tab 不会停在加载中」成为不变量，而不是依赖白名单的副作用。
         sourceLoad: undefined,
+        typeManagementDraft: mode === "query" ? restoreOracleTypeManagementDraft(tab.typeManagementDraft) : undefined,
+        typeSourceEditing: false,
         executingResultRunId: undefined,
         editorViewport: restoredEditorViewport(tab),
         editorSelection: restoredEditorSelection(tab, typeof tab.sql === "string" ? tab.sql.length : 0),

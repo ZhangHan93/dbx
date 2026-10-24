@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
+  getTableDdl: vi.fn(),
   getTableDisplayDdl: vi.fn(),
   saveSchemaCache: vi.fn(),
   loadSchemaCache: vi.fn(),
@@ -39,6 +40,7 @@ describe("objectDdlCache", () => {
     clearMetadataRuntimeCache();
     vi.clearAllMocks();
     mocks.getTableDisplayDdl.mockReset();
+    mocks.getTableDdl.mockReset();
     mocks.persisted.clear();
     mocks.loadSchemaCache.mockImplementation(async (cacheKey: string) => mocks.persisted.get(cacheKey) ?? null);
     mocks.saveSchemaCache.mockImplementation(async (cacheKey: string, payload: unknown) => {
@@ -56,6 +58,21 @@ describe("objectDdlCache", () => {
 
     await expect(loadObjectDdl(request)).resolves.toEqual({ ddl: "CREATE TABLE users (id int)", cacheStatus: "disk" });
     expect(mocks.getTableDisplayDdl).not.toHaveBeenCalled();
+  });
+
+  it("keeps exact DDL separate and never trusts or persists an unverified process snapshot", async () => {
+    mocks.loadSchemaCache.mockResolvedValue({ version: 1, cachedAt: new Date().toISOString(), ddl: "legacy" });
+    await loadObjectDdl(request);
+    const exact = { ...request, schema: " Mixed ", tableName: " T(a) ", exactIdentity: true };
+    mocks.getTableDdl.mockResolvedValue("exact");
+    expect(objectDdlCacheKey(exact)).not.toBe(objectDdlCacheKey({ ...exact, exactIdentity: false }));
+    await expect(loadObjectDdl(exact)).resolves.toEqual({ ddl: "exact", cacheStatus: "remote" });
+    expect(mocks.getTableDdl).toHaveBeenCalledExactlyOnceWith("c1", "app", " Mixed ", " T(a) ", undefined, "analytics", false, true);
+    expect(mocks.loadSchemaCache).toHaveBeenCalledOnce();
+    expect(mocks.saveSchemaCache).not.toHaveBeenCalled();
+    cancelObjectDdlLoadsForConnection("c1");
+    mocks.getTableDdl.mockRejectedValueOnce(new Error("exact capability unavailable"));
+    await expect(loadObjectDdl(exact)).rejects.toThrow("exact capability unavailable");
   });
 
   it("backfills memory after a disk hit", async () => {

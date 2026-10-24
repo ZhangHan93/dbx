@@ -4,6 +4,7 @@ const treeGroupNodeTypes = new Set<TreeNodeType>([
   "oracle-db-links",
   "group-columns",
   "group-indexes",
+  "group-database-indexes",
   "group-fkeys",
   "group-triggers",
   "group-events",

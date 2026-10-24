@@ -51,7 +51,7 @@ function cacheSegment(value: string | undefined): string {
 }
 
 function facetKey(request: ObjectDdlRequest, facet: ObjectMetadataFacet): string {
-  return `${[OBJECT_METADATA_CACHE_PREFIX, cacheSegment(request.connectionId), cacheSegment(request.database), cacheSegment(request.schema), cacheSegment(request.tableName), cacheSegment(request.catalog), cacheSegment(request.objectType ?? "TABLE"), facet].join(":")}:`;
+  return `${[OBJECT_METADATA_CACHE_PREFIX, cacheSegment(request.connectionId), cacheSegment(request.database), cacheSegment(request.schema), cacheSegment(request.tableName), cacheSegment(request.catalog), cacheSegment(request.objectType ?? "TABLE"), ...(request.exactIdentity ? ["exact-v1"] : []), facet].join(":")}:`;
 }
 
 function invalidationPrefix(match: MetadataCacheInvalidation): string {
@@ -155,22 +155,25 @@ async function loadObjectMetadataFacetInternal<T>(request: ObjectDdlRequest, fac
   if (!options?.force) {
     const runtime = getMetadataRuntimeCache<T>(cacheKey);
     if (runtime) return { value: runtime.value, cacheStatus: "memory" };
-    const readToken = activeCacheReads.begin(cacheKey);
-    let cached: ReturnType<typeof decodeEnvelope<T>>;
-    try {
-      cached = decodeEnvelope<T>(await waitForMetadata(loadSchemaCacheSafe<unknown>(cacheKey), metadataLoadBudgetMs(request.queryTimeoutSecs), signal));
-    } finally {
-      activeCacheReads.finish(readToken);
-    }
-    signal.throwIfAborted();
-    if (readToken.invalidated) {
-      const value = await loadObjectMetadataFacetInternal(request, facet, loader, signal, { force: false });
-      return { value: value.value, cacheStatus: "remote" };
-    }
-    if (cached?.hit) {
-      recordMetadataCacheL2Hit(cacheKey, cached.value);
-      setMetadataRuntimeCache(cacheKey, cached.value, request.connectionId);
-      return { value: cached.value, cacheStatus: "disk" };
+    // A persisted snapshot cannot prove which Agent/plugin is running now.
+    if (!request.exactIdentity) {
+      const readToken = activeCacheReads.begin(cacheKey);
+      let cached: ReturnType<typeof decodeEnvelope<T>>;
+      try {
+        cached = decodeEnvelope<T>(await waitForMetadata(loadSchemaCacheSafe<unknown>(cacheKey), metadataLoadBudgetMs(request.queryTimeoutSecs), signal));
+      } finally {
+        activeCacheReads.finish(readToken);
+      }
+      signal.throwIfAborted();
+      if (readToken.invalidated) {
+        const value = await loadObjectMetadataFacetInternal(request, facet, loader, signal, { force: false });
+        return { value: value.value, cacheStatus: "remote" };
+      }
+      if (cached?.hit) {
+        recordMetadataCacheL2Hit(cacheKey, cached.value);
+        setMetadataRuntimeCache(cacheKey, cached.value, request.connectionId);
+        return { value: cached.value, cacheStatus: "disk" };
+      }
     }
   }
 
@@ -195,7 +198,7 @@ async function loadObjectMetadataFacetInternal<T>(request: ObjectDdlRequest, fac
       const serialized = JSON.stringify(value);
       const current = !entry.invalidated;
       if (current) setMetadataRuntimeCache(cacheKey, value, request.connectionId);
-      if (current && serialized !== undefined && serialized.length <= MAX_PERSISTED_METADATA_CHARS) {
+      if (current && !request.exactIdentity && serialized !== undefined && serialized.length <= MAX_PERSISTED_METADATA_CHARS) {
         const envelope: ObjectMetadataCacheEnvelope<T> = { version: 1, cachedAt: new Date().toISOString(), value };
         persistSchemaCache(cacheKey, envelope, () => entry.invalidated);
       }

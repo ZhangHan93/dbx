@@ -49,17 +49,32 @@ pub(super) async fn build_structure_preview(
     source_pool_key: &str,
     target_pool_key: &str,
 ) -> Result<TransferStructurePreview, String> {
-    let schema_object_preview = mysql_schema_object_preview_sql(
-        state,
-        request,
-        source_db_type,
-        target_db_type,
-        source_pool_key,
-        target_pool_key,
-    )
-    .await?;
+    let xugu_plan = if *source_db_type == DatabaseType::Xugu
+        && *target_db_type == DatabaseType::Xugu
+        && should_transfer_schema_objects(source_db_type, target_db_type, request)
+    {
+        Some(xugu_objects::prepare(state, request, source_pool_key).await?)
+    } else {
+        None
+    };
+    let schema_object_preview = if let Some(plan) = &xugu_plan {
+        Some(plan.preview_after_tables())
+    } else {
+        mysql_schema_object_preview_sql(
+            state,
+            request,
+            source_db_type,
+            target_db_type,
+            source_pool_key,
+            target_pool_key,
+        )
+        .await?
+    };
     if !request.create_table {
         let mut sections = vec![CREATE_TABLE_DISABLED_NOTE.to_string()];
+        if let Some(plan) = &xugu_plan {
+            sections.push(plan.preview_before_tables());
+        }
         if let Some(sql) = &schema_object_preview {
             sections.push(sql.clone());
         }
@@ -90,6 +105,9 @@ pub(super) async fn build_structure_preview(
     let (tables, known_foreign_keys) = sorted_source_tables_with_foreign_keys(state, request).await;
 
     let mut sections: Vec<String> = Vec::new();
+    if let Some(plan) = &xugu_plan {
+        sections.push(plan.preview_before_tables());
+    }
     let mut operations = Vec::new();
     let mut deferred_fk_operations = Vec::new();
     if let Some(create_schema_sql) = &create_schema_sql {
@@ -189,14 +207,16 @@ pub(super) async fn build_structure_preview(
         sql: sections.join("\n\n"),
         tables: planned_tables,
         operations,
-        schema_objects_expanded: request.mode == TransferMode::Overwrite
-            && transfer_object_family(source_db_type) == Some(TransferObjectFamily::Mysql)
-            && transfer_object_family(target_db_type) == Some(TransferObjectFamily::Mysql)
-            && request.object_selection_mode().selections().iter().any(|selection| {
-                selection.object_type != TransferObjectKind::Table
-                    && transfer_object_kinds_for_family(&TransferObjectFamily::Mysql).contains(&selection.object_type)
-                    && !selection.names.is_empty()
-            }),
+        schema_objects_expanded: xugu_plan.is_some()
+            || request.mode == TransferMode::Overwrite
+                && transfer_object_family(source_db_type) == Some(TransferObjectFamily::Mysql)
+                && transfer_object_family(target_db_type) == Some(TransferObjectFamily::Mysql)
+                && request.object_selection_mode().selections().iter().any(|selection| {
+                    selection.object_type != TransferObjectKind::Table
+                        && transfer_object_kinds_for_family(&TransferObjectFamily::Mysql)
+                            .contains(&selection.object_type)
+                        && !selection.names.is_empty()
+                }),
     })
 }
 
@@ -638,6 +658,8 @@ fn preview_object_kind_label(kind: &TransferObjectKind) -> &'static str {
         TransferObjectKind::Trigger => "Triggers",
         TransferObjectKind::Sequence => "Sequences",
         TransferObjectKind::Event => "Events",
+        TransferObjectKind::Package => "Packages",
+        TransferObjectKind::Synonym => "Synonyms",
     }
 }
 
@@ -658,6 +680,7 @@ mod tests {
     #[test]
     fn structured_ddl_metadata_produces_operation_dtos() {
         let index = db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,

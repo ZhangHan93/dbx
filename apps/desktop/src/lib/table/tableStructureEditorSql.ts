@@ -206,6 +206,12 @@ export interface BuildTableStructureChangeSqlOptions {
   };
 }
 
+/** Change only an existing MySQL table's defaults; existing columns are left untouched. */
+export interface MysqlTableCharsetChange {
+  charset: string;
+  collation?: string;
+}
+
 export interface TranswarpCreateTableOptions {
   partitionColumns: string[];
   bucketColumns: string[];

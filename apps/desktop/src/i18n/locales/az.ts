@@ -1,3 +1,4 @@
+import { tableColumnPasteAz as tableColumnPaste } from "./tableColumnPaste";
 import { sidebarMenuAz as sidebarMenu } from "./sidebarMenuMessages";
 import { withEnglishFallback } from "./fallback";
 import docs from "./docs/az";
@@ -61,6 +62,7 @@ const consul = {
 };
 
 export default withEnglishFallback({
+  tableColumnPaste,
   objectDependencies: {
     dependencies: "Asılılıqlar",
     dependents: "Asılı obyektlər",
@@ -502,6 +504,7 @@ export default withEnglishFallback({
     regexSearchTooltip: "Yan paneldəki adları, şərhləri və ləqəbləri JavaScript müntəzəm ifadələri ilə uyğunlaşdırın.",
     clearFilter: "Süzgəci təmizlə",
     locateTargetNotFound: "Element yan paneldə mövcud deyil. O, silinmiş və ya gizlədilmiş ola bilər.",
+    locateSqlFile: "SQL fayl siyahısında tap",
     locateActiveTab: "Yan paneldə tap",
   },
   savedSql: {
@@ -601,6 +604,8 @@ export default withEnglishFallback({
     collapseAll: "Hamısını yığ",
     moreMatches: "+ {count} uyğunluq daha",
     collapseMatches: "Yığ",
+    searchContentIncomplete: "Axtarış nəticələri natamamdır: {count} faylın məzmunu yüklənə bilmədi.",
+    matchPreviewLimit: "Cəmi {total} uyğun sətirdən yalnız ilk {limit} sətir üçün önizləmə mövcuddur.",
   },
 
   connection: {
@@ -1259,6 +1264,9 @@ export default withEnglishFallback({
     sshKeyPassphrasePlaceholder: "Açar şifrələnməyibsə, boş saxlayın",
     sshKeyPathBrowse: "Gözdən keçir",
     sshExposeLan: "Tuneli LAN üçün əlçatan et",
+    sshLocalPort: "Lokal port",
+    sshLocalPortPlaceholder: "Avtomatik",
+    sshLocalPortHint: "Təsadüfi boş port üçün boş buraxın. Sabit port bağlantı açıq olduğu müddətdə tuneli həmin lokal portda saxlayır, beləliklə digər alətlər ondan istifadə edə bilər. Yalnız sonuncu qat üçün.",
     sshAllowExecChannelProxy: "SSH exec-channel ehtiyat üsulunu aktivləşdir (nc)",
     sshProxyCommand: "ProxyCommand",
     sshProxyCommandPlaceholder: "nc %h %p",
@@ -1332,6 +1340,9 @@ export default withEnglishFallback({
     sshWorkerUploadConsentAccept: "Yüklə",
     sshWorkerUploadConsentReject: "Ləğv et",
     sshHopInvalidTimeout: "{hop}: SSH vaxt limiti 1 ilə 300 saniyə arasında olmalıdır",
+    sshHopInvalidLocalPort: "{hop}: Lokal port 1 ilə 65535 arasında olmalıdır",
+    sshHopLocalPortNotLast: "{hop}: Lokal port yalnız sonuncu aktiv qata aiddir",
+    sshHopLocalPortUnsupported: "{hop}: Lokal port bu bağlantı növü üçün dəstəklənmir",
     connectTimeout: "Əlaqə üçün vaxt limiti (saniyə)",
     queryTimeout: "Sorğu üçün vaxt limiti (saniyə)",
     useGlobalQueryTimeout: "Qlobal",
@@ -1429,6 +1440,7 @@ export default withEnglishFallback({
     cancelConnecting: "Əlaqə qurulmasını ləğv et",
     connectCancelled: "Əlaqə qurulması ləğv edildi",
     sshTotpCancelled: "Birdəfəlik kodun daxil edilməsi ləğv edildi",
+    sshLocalPortBindFailed: "{port} lokal portu istifadədədir və ya əlçatan deyil ({error}). Onu istifadə edən proqramı bağlayın və ya başqa lokal port seçin.",
   },
   editor: {
     duckdbDraining: "Əvvəlki DuckDB sorğusu hələ dayandırılır. Bir az sonra yenidən cəhd edin.",
@@ -1641,6 +1653,7 @@ export default withEnglishFallback({
       searchFailed: "Axtarış uğursuz oldu və ya vaxtı bitdi. İfadəni sadələşdirib yenidən cəhd edin.",
       caseSensitive: "Böyük və kiçik hərflərə həssas",
       regex: "Müntəzəm ifadə",
+      wholeWord: "Bütöv söz",
       collapseReplace: "Əvəzetməni yığ",
       expandReplace: "Əvəzetməni genişləndir",
       prevMatch: "Əvvəlki (Shift+Enter)",
@@ -6888,6 +6901,25 @@ export default withEnglishFallback({
     completedWithErrors: "İcra tamamlandı: {succeeded} uğurlu, {failed} uğursuz",
   },
   sqlFileTree: {
+    searchIncompleteHelp: "Bu axtarışın natamam olmasının səbəbləri:",
+    searchSkippedTooLarge: "32 MiB-dan böyükdür: {count} fayl ötürüldü.",
+    searchSkippedUnreadable: "Oxumaq mümkün olmadı (silinmiş ola bilər və ya giriş icazəsi yoxdur): {count} fayl və ya qovluq.",
+    searchSkippedInvalidEncoding: "Fayl kodlaşdırması tanınmadı: {count} fayl.",
+    searchSkippedOutsideRoot: "Həqiqi yol seçilmiş kök qovluqdan kənardadır: {count} fayl.",
+    searchSkippedNotRegularFile: "Adi fayl deyil (məsələn, simvolik keçidlə əvəz edilib): {count} element.",
+    searchSkippedOther: "Digər səbəblərlə ötürüldü: {count} element.",
+    searchPreviewLimits: "Önizləmələr qısaldılıb: hər fayl üçün ən çox {perFile}, hər axtarış üçün {total} sətir. Uyğun faylların axtarışı və uyğun sətirlərin sayılması davam edir.",
+    searchMode: "Axtarış sahəsi",
+    searchByName: "Fayl",
+    searchByContent: "Məzmun",
+    searchContentPlaceholder: "Fayl məzmununda axtar...",
+    searchPlaceholder: "Fayl adlarında axtar...",
+    searching: "Fayl məzmununda axtarılır...",
+    searchIncomplete: "Axtarış natamamdır: {skipped} fayl və ya qovluq ötürüldü; uyğun fraqmentlər qısaldıla bilər.",
+    searchFailed: "Məzmun axtarışı uğursuz oldu: {message}",
+    sortManual: "Əl ilə sıralama",
+    sortManualHint: "Sıralamaq üçün eyni qovluqdakı faylları sürükləyin. Axtarış zamanı sürükləmə deaktivdir.",
+    sortSaveFailed: "Fayl sıralama seçimini saxlamaq mümkün olmadı.",
     folderNameInvalid: "Yol deyil, tək qovluq adı daxil edin.",
     folderNameExcluded: "Bu qovluq adı SQL fayl brauzerindən istisna edilib.",
     folderDepthExceeded: "Maksimum qovluq dərinliyinə çatılıb.",
@@ -9101,8 +9133,20 @@ export default withEnglishFallback({
     runDirectoryPatternHint:
       "Təyinat qovluğu daxilində nisbi yol. {'{'}schedule{'}'}, {'{'}date{'}'}, {'{'}timestamp{'}'} və {'{'}runId{'}'} şablonlarından istifadə edin. Standart şablona əlavə təcrid üçün {'{'}runId{'}'} daxildir. Nümunə: {'{'}schedule{'}'}/{'{'}date{'}'}/{'{'}timestamp{'}'}-{'{'}runId{'}'}",
     runDirectoryPatternInvalid: ". və ya .. hissələri olmayan nisbi yoldan istifadə edin.",
-    compression: "Sıxılma",
+    backupFormat: "Ehtiyat nüsxə formatı",
     compressionGzip: "Gzip (.sql.gz)",
+    formatSql: "SQL (.sql)",
+    formatNb3: "Navicat ehtiyat nüsxəsi (.nb3)",
+    formatNb3Hint: "MySQL və PostgreSQL üçün Navicat ehtiyat nüsxə formatı. DBX onu istənilən SQL ehtiyat nüsxəsi kimi bərpa edir.",
+    restoreFromFile: "Fayldan bərpa et",
+    restoreFromFileHint: "İstənilən yerdən .sql, .sql.gz və ya .nb3 ehtiyat nüsxə faylını bərpa edin",
+    importBackup: "Ehtiyat nüsxəni idxal et",
+    importBackupHint: "DBX xaricində yaradılmış ehtiyat nüsxə fayllarını (məsələn, Navicat .nb3 arxivləri) tarixçəyə əlavə edin",
+    importedTrigger: "İdxal edilib",
+    externalFile: "Xarici fayl",
+    backupsImported: "Tarixçəyə {count} ehtiyat nüsxə əlavə edildi",
+    deleteImportedConfirm: "{count} idxal edilmiş ehtiyat nüsxə tarixçədən silinsin? Fayllar diskdə qalır.",
+    importedFilesKept: "İdxal edilmiş ehtiyat nüsxə faylları yalnız tarixçədən silinir və diskdə qalır.",
     searchConnections: "Əlaqələrdə axtarış…",
     noMatchingConnections: "Uyğun əlaqə yoxdur",
     connectionsSelected: "{count} əlaqə seçilib",

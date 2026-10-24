@@ -3082,7 +3082,7 @@ fn starts_with_postgres_dollar_quoted_routine_prefix(sql: &str) -> bool {
         && block.tokens.iter().rev().find_map(OraclePlSqlToken::as_word) == Some("AS")
 }
 
-fn oracle_plsql_block_is_complete(sql: &str) -> bool {
+pub(crate) fn oracle_plsql_block_is_complete(sql: &str) -> bool {
     OraclePlSqlBlock::parse(sql).is_complete()
 }
 

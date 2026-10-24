@@ -105,6 +105,9 @@ import DataGridCellDetailHexViewer from "@/components/grid/DataGridCellDetailHex
 import TemporalCellEditor from "@/components/grid/TemporalCellEditor.vue";
 import EnumCellEditor from "@/components/grid/EnumCellEditor.vue";
 import DataGridReadonlyTextSelection from "@/components/grid/DataGridReadonlyTextSelection.vue";
+import ObjectDependenciesPanel from "@/components/objects/ObjectDependenciesPanel.vue";
+import { objectDependencyTarget, type ObjectDependencyTarget, type ObjectDetailsSection } from "@/lib/database/objectDependencyDetails";
+import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import GridSnapshotDialog from "@/components/grid/GridSnapshotDialog.vue";
 import type { QueryResult, ColumnInfo, ConstraintInfo, DatabaseType, ForeignKeyInfo, IndexInfo, ObjectStatistics, PgTablePartitioning, TriggerInfo, TableInfoTab, QueryResultSourceColumnRef, QueryPageJumpProgress } from "@/types/database";
 import { isQueryExecutionErrorResult } from "@/lib/query/queryResultError";
@@ -733,6 +736,7 @@ const emit = defineEmits<{
   "local-column-filters-change": [value: Record<string, string[]>];
   changeQueryTimeout: [connectionId: string];
   cancel: [];
+  openDependencyObject: [context: ObjectDependencyTarget, target: SqlObjectNavigationTarget];
 }>();
 
 const autoRefresh = useDataGridAutoRefresh({
@@ -861,6 +865,16 @@ const columnTypeMap = computed(() => {
 });
 const resolvedConnectionConfig = computed(() => connectionStore.getConfig(props.connectionId ?? ""));
 const resolvedDatabaseType = computed(() => props.databaseType ?? effectiveDatabaseTypeForConnection(resolvedConnectionConfig.value));
+const tableRelationsSection = ref<ObjectDetailsSection>("dependencies");
+const tableDependencyTarget = computed(() => {
+  const metadata = props.tableMeta;
+  const database = metadata?.database || props.database;
+  if (!metadata?.tableName || !props.connectionId || !database) return undefined;
+  return objectDependencyTarget({ connectionId: props.connectionId, database, catalog: metadata.catalog, schema: metadata.schema || props.schema || database, name: metadata.tableName, objectType: (metadata.tableType || "TABLE").toUpperCase().replaceAll(" ", "_") }, resolvedDatabaseType.value);
+});
+function viewRelationSql(context: ObjectDependencyTarget, sql: string) {
+  queryStore.createTab(context.connectionId, context.database, t("objectDependencies.viewSql"), "query", context.schema, sql, context.catalog, { forceNew: true });
+}
 const productionContext = computed(() => productionContextForDatabase(resolvedConnectionConfig.value, props.database));
 // The collection grid and Mongo query-result grids share the document-grid value
 // encoding (BSON null sentinel + JSON-prefixed containers), so every display,
@@ -13087,6 +13101,7 @@ const tableInfoTabs = computed(() => {
       count: partitioning.value?.partitions.length,
     });
   }
+  if (tableDependencyTarget.value) tabs.push({ id: "relations", label: t("objectRelations.title"), icon: Network });
   return tabs;
 });
 const tableInfoTabListStyle = computed(() => ({
@@ -13113,7 +13128,7 @@ async function selectTableInfoTab(tab: TableInfoTab) {
   // The drawer is often opened after the table was already selected, so the
   // partition status may never have been probed; do it here (once) before the
   // tab list is consulted, or the Partitions tab would be missing entirely.
-  if (!partitionStatusResolved.value) await probeTablePartitionStatus();
+  if (tab !== "relations" && !partitionStatusResolved.value) await probeTablePartitionStatus();
   const tabSupported = tableInfoTabs.value.some((item) => item.id === tab);
   const nextTab = tabSupported ? tab : tableInfoTabs.value[0]?.id;
   if (!nextTab) return;
@@ -13520,7 +13535,7 @@ function copyDdl() {
 
 function openTableStructureEditor(initialTab: TableInfoTab = "columns"): boolean {
   if (!props.connectionId || !props.database || !props.tableMeta?.tableName || !canOpenTableStructureEditor.value) return false;
-  queryStore.openTableStructure(props.connectionId, props.database, props.tableMeta.schema, props.tableMeta.tableName, initialTab, undefined, props.tableMeta.catalog, (props.tableMeta.tableType || "").toUpperCase() === "VIEW" ? "view" : "table");
+  queryStore.openTableStructure(props.connectionId, props.database, props.tableMeta.schema, props.tableMeta.tableName, initialTab === "relations" ? "columns" : initialTab, undefined, props.tableMeta.catalog, (props.tableMeta.tableType || "").toUpperCase() === "VIEW" ? "view" : "table");
   return true;
 }
 
@@ -16389,7 +16404,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
               </button>
             </div>
 
-            <div class="px-2 py-1.5 border-b shrink-0 bg-background">
+            <div v-if="activeTableInfoTab !== 'relations'" class="px-2 py-1.5 border-b shrink-0 bg-background">
               <div class="flex min-w-0 items-center gap-1">
                 <div class="relative min-w-0 flex-1">
                   <Search class="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
@@ -16415,8 +16430,9 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
               </div>
             </div>
 
+            <ObjectDependenciesPanel v-if="activeTableInfoTab === 'relations'" :target="tableDependencyTarget" v-model:section="tableRelationsSection" :include-source="false" @view-sql="viewRelationSql" @open-object="(context, target) => emit('openDependencyObject', context, target)" />
             <DataGridTableInfoPanels
-              v-if="activeTableInfoTab !== 'ddl'"
+              v-else-if="activeTableInfoTab !== 'ddl'"
               :active-tab="activeTableInfoTab"
               :search-query="searchQuery"
               :table-name="props.tableMeta?.tableName ?? ''"

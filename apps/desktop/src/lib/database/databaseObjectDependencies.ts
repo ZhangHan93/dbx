@@ -1,6 +1,7 @@
 import type { DatabaseType, TreeNode } from "@/types/database";
 import { xuguDependencyProvider } from "@/lib/database/xuguObjectDependencies";
 import { oracleDependencyProvider } from "@/lib/database/oracleObjectDependencies";
+import { supportsTypeObjectSource } from "@/lib/database/databaseObjectCapabilities";
 
 /**
  * The subset of a sidebar node needed by a database dependency provider.
@@ -33,5 +34,9 @@ export function databaseDependencyProviderFor(databaseType?: DatabaseType): Data
 }
 
 export function canViewDatabaseObjectDependencies(databaseType: DatabaseType | undefined, node: DependencyTreeNode): boolean {
+  if (databaseType === "oracle" || databaseType === "oceanbase-oracle") {
+    if ((node.type === "type" || node.type === "type-body") && !supportsTypeObjectSource(databaseType)) return false;
+    if (node.type === "index" && (!node.parentName || !node.parentSchema)) return false;
+  }
   return databaseDependencyProviderFor(databaseType)?.supports(node) ?? false;
 }

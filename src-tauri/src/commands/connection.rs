@@ -18,7 +18,7 @@ use dbx_core::db;
 use dbx_core::db::agent_driver::{AgentDriverClient, AgentMethod};
 use dbx_core::models::connection::{
     database_info_from_protocol_value, rewrite_jdbc_url_host, ConnectionConfig, ConnectionLivenessMessage,
-    ConnectionTestResult, DatabaseConnectionInfo, DatabaseType,
+    ConnectionResponse, ConnectionTestResult, DatabaseConnectionInfo, DatabaseType,
 };
 pub use dbx_core::path_utils::expand_tilde;
 use dbx_core::runtime_config::{release_runtime_config_on_disconnect, should_retain_runtime_config};
@@ -219,21 +219,61 @@ async fn connect_agent_pool(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "mq-admin")]
-    use super::load_connection_configs;
     use super::{
         connect_db, connect_sqlite_from_config, gaussdb_m_jdbc_command_config, jdbc_command_config_for_endpoint,
-        mark_mongo_legacy_driver, mongo_legacy_connect_params, mongo_legacy_fallback_error,
-        persist_mongo_legacy_driver_profile, save_connection_configs, sync_connection_configs,
-        test_connection_with_info_inner, MONGO_LEGACY_DRIVER_LABEL, MONGO_LEGACY_DRIVER_PROFILE,
+        load_connection_configs, load_connection_responses, mark_mongo_legacy_driver, mongo_legacy_connect_params,
+        mongo_legacy_fallback_error, persist_mongo_legacy_driver_profile, save_connection_configs,
+        sync_connection_configs, test_connection_with_info_inner, MONGO_LEGACY_DRIVER_LABEL,
+        MONGO_LEGACY_DRIVER_PROFILE,
     };
     use dbx_core::connection::{AppState, PoolKind};
     use dbx_core::models::connection::{
-        AttachedDatabaseConfig, ConnectionConfig, DatabaseType, ProxyTunnelConfig, ProxyType, TransportLayerConfig,
+        AttachedDatabaseConfig, ConnectionConfig, ConnectionResponse, DatabaseType, ProxyTunnelConfig, ProxyType,
+        TransportLayerConfig,
     };
     use std::sync::Arc;
     use std::time::Duration;
     use tauri::Manager;
+
+    #[tokio::test]
+    async fn tauri_load_response_is_flat_and_does_not_put_hint_in_storage_or_runtime_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dbx_core::persistence::test_storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.path().join("plugins"));
+        let mut input = serde_json::json!({
+            "id": "jdbc-oracle-mode", "name": "JDBC", "db_type": "jdbc", "driver_profile": "jdbc",
+            "host": "host", "port": 2881, "username": "user", "password": "", "save_password": false,
+            "connection_string": "jdbc:oceanbase:oracle://host/service", "jdbc_dialect": "oceanbase-oracle"
+        });
+        let config: ConnectionConfig = serde_json::from_value(input.clone()).unwrap();
+        save_connection_configs(&state, std::slice::from_ref(&config), Vec::new()).await.unwrap();
+
+        let responses = load_connection_responses(&state).await.unwrap();
+        let output = serde_json::to_value(&responses[0]).unwrap();
+        assert_eq!(output["jdbc_dialect"], "oceanbase-oracle");
+        assert_eq!(output["db_type"], "jdbc");
+        assert!(output.get("config").is_none());
+        assert_eq!(responses[0].config.db_type, DatabaseType::Jdbc);
+        assert_eq!(responses[0].config.connection_string.as_deref(), config.connection_string.as_deref());
+        assert!(serde_json::to_value(state.configs.read().await[&config.id].clone())
+            .unwrap()
+            .get("jdbc_dialect")
+            .is_none());
+        let persisted = state.storage.load_connections().await.unwrap();
+        assert!(serde_json::to_value(&persisted[0]).unwrap().get("jdbc_dialect").is_none());
+
+        input["jdbc_dialect"] = serde_json::json!("oracle");
+        let forged: ConnectionConfig = serde_json::from_value(input).unwrap();
+        assert_eq!(
+            ConnectionResponse::from_config(forged).jdbc_dialect,
+            Some(dbx_core::models::connection::JdbcDialectHint::OceanbaseOracle)
+        );
+        assert!(load_connection_configs(&state)
+            .await
+            .unwrap()
+            .iter()
+            .all(|loaded| loaded.db_type == DatabaseType::Jdbc));
+    }
 
     fn rocketmq_config(password: &str) -> ConnectionConfig {
         let mut config = mongodb_config();
@@ -1278,8 +1318,12 @@ async fn remove_connection_pools_for_connection_ids(state: &AppState, connection
 }
 
 #[tauri::command]
-pub async fn load_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<ConnectionConfig>, String> {
-    load_connection_configs(state.inner()).await
+pub async fn load_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<ConnectionResponse>, String> {
+    load_connection_responses(state.inner()).await
+}
+
+async fn load_connection_responses(state: &AppState) -> Result<Vec<ConnectionResponse>, String> {
+    Ok(load_connection_configs(state).await?.into_iter().map(ConnectionResponse::from_config).collect())
 }
 
 async fn load_connection_configs(state: &AppState) -> Result<Vec<ConnectionConfig>, String> {

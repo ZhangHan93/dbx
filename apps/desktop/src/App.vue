@@ -102,8 +102,10 @@ import {
   type SqlObjectNavigationTarget,
 } from "@/lib/sql/sqlNavigation";
 import { isObjectDependencySection, type ObjectDependencyTarget } from "@/lib/database/objectDependencyDetails";
-import { buildEditableObjectSource, buildExecutableObjectSourceStatements, executeObjectSourceSave } from "@/lib/table/objectSourceEditor";
-import { assertSourceIdentity, beginSourceSave } from "@/lib/table/objectSourceIdentity";
+import { buildEditableObjectSource } from "@/lib/table/objectSourceEditor";
+import { isOracleFamilyTypeSource } from "@/lib/database/databaseObjectCapabilities";
+import { oracleTypeManagementRequest } from "@/lib/table/oracleTypeManagementRequest";
+import { saveObjectSourceTab } from "@/lib/table/objectSourceTabSave";
 import { loadEditableObjectSourceForEditor } from "@/lib/table/objectSourceLoad";
 import { schemaAfterConnectionSwitch } from "@/lib/schema/connectionSchemaInitialization";
 import { canReuseTabForHistoryRestore, resolveHistorySqlRestoreTarget } from "@/lib/history/historyRestoreTarget";
@@ -113,7 +115,7 @@ import { getPlatform, isMacOS, isWindows } from "@/lib/backend/platform";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { openQueryResultArchiveFile } from "@/lib/query/queryResultArchiveFile";
 import { activeTabExternalSqlFileTarget, rememberExternalSqlFileTarget, resolveExternalSqlFileTarget, resolveExternalSqlFileTargetForActiveTab, unassociatedExternalSqlFileTarget, type ExternalSqlFileTarget } from "@/lib/sql/externalSqlFileTarget";
-import { defaultSavedQueryFileName, externalSqlFileOpenErrorMessage, externalSqlEditorMaxBytes, isSqlFilePath, queryEditorOpenFileAccept, queryEditorOpenFileFilters, readBrowserSqlFile, sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
+import { defaultSavedQueryFileName, externalSqlFileOpenErrorMessage, externalSqlEditorMaxBytes, isSqlFilePath, queryEditorOpenFileAccept, queryEditorOpenFileFilters, queryTabExternalFilePath, readBrowserSqlFile, sqlFileTitleFromPath } from "@/lib/sql/sqlFileOpen";
 import type { ConnectionConfig, DatabaseType, ObjectBrowserFilter, ObjectSourceKind, QueryTab, TableInfoTab, TabOutputView, TreeNode } from "@/types/database";
 import { OPEN_PLUGIN_SETTINGS, type PluginCenterFocus } from "@/lib/plugins/pluginCenterNavigation";
 import { parsePluginInstallDeepLink } from "@/lib/plugins/pluginInstallDeepLink";
@@ -190,7 +192,6 @@ import { buildAppendedEditorSql, buildDeduplicatedAppendedEditorSql } from "@/li
 import { resolveAiSqlTargetTabId, type AiSqlApplyTargetMode } from "@/lib/ai/aiSqlTargetTab";
 import { assessProductionSql } from "@/lib/database/productionSafety";
 import { normalizeSqlExecutionTarget, sqlExecutionTargetCapabilities } from "@/lib/database/sqlExecutionTargetCapabilities";
-import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { buildHistoryAiAnalysisPrompt } from "@/lib/history/historyAiAnalysis";
 import { countAvailableAgentDriverUpdates } from "@/lib/connection/agentDriverUpdateBadge";
 import type { DriverStoreFocus, DriverStoreTab } from "@/lib/connection/agentDriverInstallHint";
@@ -252,6 +253,7 @@ const QuickOpenDialog = defineAsyncComponent(() => import("@/components/quick-op
 const TabSwitcherDialog = defineAsyncComponent(() => import("@/components/tabs/TabSwitcherDialog.vue"));
 const QueryEditorDdlViewDialog = defineAsyncComponent(() => import("@/components/objects/DdlViewDialog.vue"));
 const QueryEditorObjectSourceDialog = defineAsyncComponent(() => import("@/components/objects/ObjectSourceDialog.vue"));
+const OracleTypeManagementDialog = defineAsyncComponent(() => import("@/components/objects/OracleTypeManagementDialog.vue"));
 
 type AiAssistantHandle = {
   openPluginConversation: (request: AiPluginConversationRequest) => void;
@@ -483,7 +485,16 @@ const isAiPanelMaximized = ref(false);
 const isHistoryPanelMaximized = ref(false);
 const isZenMode = ref(false);
 const showSqlLibraryPanel = ref(safeLocalStorageGet("dbx-sql-library-open") === "true");
+const sqlFileLocateRequest = ref<{ id: number; path: string } | null>(null);
+let sqlFileLocateRequestId = 0;
 const showSqlFilePanel = ref(safeLocalStorageGet("dbx-sql-file-panel-open") === "true");
+watch(
+  showSqlFilePanel,
+  (open) => {
+    if (!open) sqlFileLocateRequest.value = null;
+  },
+  { flush: "sync" },
+);
 const rightSidebarPanelRefs: Record<RightSidebarPanelId, typeof showAiPanel> = {
   ai: showAiPanel,
   history: showHistory,
@@ -2745,54 +2756,7 @@ async function openSaveSqlDialog(tabId?: string) {
 }
 
 async function saveActiveObjectSource(tab: QueryTab): Promise<boolean> {
-  const connection = connectionStore.getConfig(tab.connectionId);
-  const source = tab.objectSource;
-  if (!connection || !source) return false;
-
-  try {
-    const identity = queryStore.getObjectSourceIdentitySnapshot(tab)!;
-    assertSourceIdentity(identity);
-    const { connectionId, database } = tab;
-    const schema = source.schema || tab.schema || database;
-    const sql = tab.sql;
-    const databaseType = effectiveDatabaseTypeForConnection(connection) ?? connection.db_type;
-    const statements = await buildExecutableObjectSourceStatements({
-      databaseType,
-      objectType: source.objectType,
-      schema,
-      name: source.name,
-      source: sql,
-    });
-    const execute = async () => {
-      if (!queryStore.tabs.includes(tab) || tab.objectSource !== source || tab.connectionId !== connectionId || tab.database !== database || (source.schema || tab.schema || database) !== schema) return false;
-      const release = beginSourceSave(identity);
-      try {
-        await executeObjectSourceSave(connectionId, database, databaseType, statements, schema);
-        return true;
-      } finally {
-        release();
-      }
-    };
-    const executableSql = statements.filter((sql) => sql.trim()).join(";\n");
-    if (executableSql.trim()) {
-      const saved = await executeWithProductionSqlGuard({
-        connection,
-        database,
-        sql: executableSql,
-        source: t("production.sourceObjectSource"),
-        execute,
-      });
-      if (!saved) return false;
-    } else {
-      if (!(await execute())) return false;
-    }
-    if (tab.sql === sql) queryStore.markTabClean(tab);
-    toast(t("objects.sourceSaved"), 2000);
-    return true;
-  } catch (e: any) {
-    toast(t("objects.sourceSaveFailed", { message: e?.message || String(e) }), 5000);
-    return false;
-  }
+  return saveObjectSourceTab(tab, { connection: connectionStore.getConfig(tab.connectionId), queryStore, t, toast });
 }
 
 function saveSqlFolderDisplayName(id: string) {
@@ -3504,6 +3468,12 @@ function tableTargetFromActiveTab(table: string | SqlObjectNavigationTarget, con
 }
 
 async function onClickTable(table: SqlObjectNavigationTarget, context?: SqlObjectNavigationContext) {
+  if (table.type === "index") {
+    const origin = context ?? activeTab.value;
+    if (!origin || !table.parentName || !table.parentSchema || !table.schema) return;
+    queryStore.openObjectProperties({ connectionId: origin.connectionId, database: origin.database, catalog: origin.catalog, schema: table.parentSchema, name: table.parentName, objectType: "TABLE", initialTab: "indexes", focusObject: { owner: table.schema, name: table.name, type: "INDEX" } });
+    return;
+  }
   // Procedures/functions/packages open source (same as sidebar view-source), not table data/DDL.
   if (isSqlObjectNavigationRoutineType(table.type)) {
     await onOpenObjectSource(table, false, context);
@@ -3710,6 +3680,18 @@ function openDbxWebsite() {
 function setSidebarOpen(open: boolean) {
   sidebarOpen.value = open;
   safeLocalStorageSet("dbx-sidebar-open", open ? "true" : "false");
+}
+
+function locateSqlFile(tab: QueryTab) {
+  const path = queryTabExternalFilePath(tab);
+  if (!path || isDetachedWindowContext) return;
+  isZenMode.value = false;
+  openRightSidebarPanel("sqlFile");
+  sqlFileLocateRequest.value = { id: ++sqlFileLocateRequestId, path };
+}
+
+function finishSqlFileLocate(requestId: number) {
+  if (sqlFileLocateRequest.value?.id === requestId) sqlFileLocateRequest.value = null;
 }
 
 async function locateTabInSidebar(tab: QueryTab) {
@@ -4190,6 +4172,10 @@ async function handleQuickOpenSelect(item: any) {
       const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(item.connectionId));
       if (!databaseType) throw new Error("Connection type is unavailable.");
       const objectName = item.objectName || item.tableName;
+      if (isOracleFamilyTypeSource(databaseType, objectType)) {
+        queryStore.openObjectSourceTabPending({ connectionId: item.connectionId, database: item.database, schema, title: `Source - ${objectName}`, initialEditing: false, request: { name: objectName, objectType, signature: item.signature } });
+        return;
+      }
       const { editableSource, objectType: resolvedType } = await loadEditableObjectSourceForEditor(api.getObjectSource, buildEditableObjectSource, {
         connectionId: item.connectionId,
         database: item.database,
@@ -5535,6 +5521,7 @@ onUnmounted(() => {
                     ref="contentAreaRef"
                     :content-suppressed="activeTab?.mode === 'plugin-workbench'"
                     @locate-tab="locateTabInSidebar"
+                    @locate-sql-file="locateSqlFile"
                     @close-tab="
                       (tabId: string) => {
                         if (tabId === queryStore.activeTabId) void closeActiveSurface();
@@ -5652,6 +5639,7 @@ onUnmounted(() => {
                             schema: tab.schema,
                             catalog: tab.catalog,
                             tableName: tab.structureTableName || '',
+                            exactIdentity: tab.structureExactIdentity,
                           },
                           commentChanged,
                           !!createdTableName,
@@ -5780,7 +5768,7 @@ onUnmounted(() => {
           >
             <div class="panel-resize-handle panel-resize-handle--left" @pointerdown="startSqlFilePanelResize" />
             <div class="h-full min-h-0 overflow-hidden rounded-[inherit]">
-              <SqlFilePanel @close="closeRightSidebarPanel('sqlFile')" />
+              <SqlFilePanel :locate-request="sqlFileLocateRequest" @locate-handled="finishSqlFileLocate" @close="closeRightSidebarPanel('sqlFile')" />
             </div>
           </div>
           <PluginShortcutBar v-if="!isDetachedWindowContext && !isZenMode && settingsStore.editorSettings.pluginShortcuts.enabled && settingsStore.editorSettings.pluginShortcuts.position.startsWith('right-')" :position="settingsStore.editorSettings.pluginShortcuts.position" />
@@ -5889,6 +5877,7 @@ onUnmounted(() => {
         <CloseActionPromptDialog v-if="isDesktop && showCloseActionPrompt" :open="showCloseActionPrompt" @update:open="handleCloseActionPromptOpenChange" @quit="chooseQuit" @minimize="chooseMinimize" />
         <AiRunsClosePromptDialog v-if="isDesktop && showAiRunsClosePrompt" v-model:open="showAiRunsClosePrompt" :count="blockingAiRunCount" @cancel="cancelPendingAppClose" @quit="confirmQuitWithActiveAiRuns" />
         <QuickOpenDialog :open="showQuickOpen" :initial-content-mode="quickOpenForceContent" @update:open="showQuickOpen = $event" @select="handleQuickOpenSelect" />
+        <OracleTypeManagementDialog v-if="oracleTypeManagementRequest" />
         <TabSwitcherDialog :open="showTabSwitcher" :tabs="tabSwitcherTabs" :selected-index="tabSwitcherIndex" :shortcut-hint="tabSwitcherShortcutHint" @update:open="handleTabSwitcherOpenChange" @update:selected-index="tabSwitcherIndex = $event" @select="handleTabSwitcherSelect" />
       </div>
       <Teleport to="body">

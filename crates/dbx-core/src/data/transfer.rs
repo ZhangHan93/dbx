@@ -26,6 +26,7 @@ mod db2;
 mod ddl_plan;
 mod overwrite_clear;
 mod structure_plan;
+pub(crate) mod xugu_objects;
 
 pub use overwrite_clear::clear_foreign_key_linked_overwrite_targets;
 
@@ -268,6 +269,8 @@ pub enum TransferObjectKind {
     Trigger,
     Sequence,
     Event,
+    Package,
+    Synonym,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -306,6 +309,9 @@ pub fn transfer_object_kinds_for_family(family: &TransferObjectFamily) -> Vec<Tr
 }
 
 pub fn transfer_object_kinds(db_type: &DatabaseType) -> Vec<TransferObjectKind> {
+    if *db_type == DatabaseType::Xugu {
+        return xugu_objects::supported_kinds();
+    }
     match transfer_object_family(db_type) {
         Some(family) => transfer_object_kinds_for_family(&family),
         None => Vec::new(),
@@ -718,6 +724,13 @@ pub fn validate_transfer_target_table_names(request: &TransferRequest) -> Result
 /// target for the cross-family DDL pipeline (the executor rejects it).
 pub fn cross_family_transferable_object_kinds(source: &DatabaseType, target: &DatabaseType) -> Vec<TransferObjectKind> {
     use TransferObjectKind::*;
+    if *source == DatabaseType::Xugu || *target == DatabaseType::Xugu {
+        return if *source == DatabaseType::Xugu && *target == DatabaseType::Xugu {
+            xugu_objects::supported_kinds()
+        } else {
+            vec![]
+        };
+    }
     if is_same_transfer_family(source, target) {
         return transfer_object_kinds(source);
     }
@@ -1144,8 +1157,10 @@ pub fn validate_transfer_database_pair(
     if !matches!((source_db_type, target_db_type), (DatabaseType::Xugu, DatabaseType::Xugu)) {
         return Err("虚谷数据传输当前仅支持虚谷到虚谷".to_string());
     }
-    if request.objects.as_ref().is_some_and(|objects| !objects.is_empty()) {
-        return Err("虚谷数据传输当前仅支持表对象".to_string());
+    if request.objects.as_ref().is_some_and(|objects| {
+        objects.iter().any(|selection| !xugu_objects::supported_kinds().contains(&selection.object_type))
+    }) {
+        return Err("虚谷数据传输不支持所选对象类型".to_string());
     }
     if request.mode == TransferMode::Upsert || request.drop_target_before_create {
         return Err("虚谷数据传输当前仅支持追加或覆盖，暂不支持更新插入或重建".to_string());
@@ -4440,6 +4455,13 @@ fn target_text_type(target_db: &DatabaseType) -> &'static str {
     }
 }
 
+fn has_max_length_param(lowered_source_type: &str) -> bool {
+    lowered_source_type
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .is_some_and(|(params, _)| params.trim() == "max")
+}
+
 /// DuckDB reads a bare `NUMERIC`/`DECIMAL` as DECIMAL(18, 3), which keeps only
 /// 15 integer digits, so a transferred NUMBER(18) key failed every insert with
 /// "Could not convert string ... to DECIMAL(18,3)" (#12846). A precision/scale
@@ -4521,6 +4543,13 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
         } else {
             "bigint"
         };
+    }
+
+    // SQL Server `timestamp` is a synonym for `rowversion`: an 8 byte binary row
+    // counter read as `0x...`, not a date and time. Mapping it to a temporal type
+    // made every insert fail with an invalid timestamp format (#13190).
+    if *source_db == DatabaseType::SqlServer && is_sqlserver_rowversion_type(&t) {
+        base = "binary";
     }
 
     if matches!(
@@ -4624,7 +4653,12 @@ pub fn map_column_type(source_type: &str, source_db: &DatabaseType, target_db: &
             }
         }
         "varchar" | "nvarchar" | "character varying" | "varchar2" => {
-            if t.contains('(') {
+            // `(max)` is SQL Server only syntax for an up to 2 GB string. Other
+            // targets reject `VARCHAR(max)` in CREATE TABLE (#13190), so the
+            // column becomes the target's unbounded text type instead.
+            if has_max_length_param(&t) && *target_db != DatabaseType::SqlServer {
+                target_text_type(target_db).into()
+            } else if t.contains('(') {
                 let len_part = transfer_length_params(&t, source_db, target_db);
                 match target_db {
                     target_db if is_postgres_transfer_dialect(target_db) => format!("VARCHAR{len_part}"),
@@ -9515,6 +9549,8 @@ pub fn ordered_transfer_object_kinds(kinds: Vec<TransferObjectKind>) -> Vec<Tran
         TransferObjectKind::Procedure => 4,
         TransferObjectKind::Trigger => 5,
         TransferObjectKind::Event => 6,
+        TransferObjectKind::Package => 3,
+        TransferObjectKind::Synonym => 4,
     };
     let mut kinds = kinds;
     kinds.sort_by_key(rank);
@@ -9658,10 +9694,44 @@ where
     if matches!(request.content, TransferContent::DataOnly) {
         return Ok(TransferObjectOutcome::default());
     }
+    let routine_context = crate::schema::oracle_routines::capture_routine_transfer_context(
+        state,
+        &request.source_connection_id,
+        &request.target_connection_id,
+    )
+    .await?;
+    transfer_schema_objects_with_routine_context(
+        state,
+        request,
+        source_pool_key,
+        target_pool_key,
+        routine_context.as_ref(),
+        progress_callback,
+    )
+    .await
+}
+
+pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
+    state: &AppState,
+    request: &TransferRequest,
+    source_pool_key: &str,
+    target_pool_key: &str,
+    routine_context: Option<&crate::schema::oracle_routines::RoutineTransferContext>,
+    progress_callback: F,
+) -> Result<TransferObjectOutcome, String>
+where
+    F: FnMut(TransferProgress),
+{
+    if matches!(request.content, TransferContent::DataOnly) {
+        return Ok(TransferObjectOutcome::default());
+    }
     let source_db_type = get_db_type(state, &request.source_connection_id).await?;
     let target_db_type = get_db_type(state, &request.target_connection_id).await?;
     if !should_transfer_schema_objects(&source_db_type, &target_db_type, request) {
         return Ok(TransferObjectOutcome::default());
+    }
+    if source_db_type == DatabaseType::Xugu && target_db_type == DatabaseType::Xugu {
+        return Err("Xugu schema objects must run through the prepared transfer plan".into());
     }
     if !is_same_transfer_family(&source_db_type, &target_db_type) {
         return transfer_cross_family_schema_objects(
@@ -9704,6 +9774,7 @@ where
                 &target_db_type,
                 source_pool_key,
                 target_pool_key,
+                routine_context,
                 progress_callback,
             )
             .await
@@ -9975,6 +10046,7 @@ async fn transfer_oracle_schema_objects<F>(
     target_db_type: &DatabaseType,
     source_pool_key: &str,
     target_pool_key: &str,
+    routine_context: Option<&crate::schema::oracle_routines::RoutineTransferContext>,
     mut progress_callback: F,
 ) -> Result<TransferObjectOutcome, String>
 where
@@ -10011,6 +10083,47 @@ where
             if exists {
                 outcome.skipped.push(format!("{kind:?}:{name}"));
                 progress(&mut outcome, TransferStatus::Running, None);
+                continue;
+            }
+            if let Some(context) =
+                routine_context.filter(|_| matches!(kind, TransferObjectKind::Procedure | TransferObjectKind::Function))
+            {
+                let identity = crate::schema::oracle_routines::RoutineIdentity {
+                    owner: source_schema.clone(),
+                    name: name.clone(),
+                    kind: if kind == TransferObjectKind::Procedure {
+                        db::ObjectSourceKind::Procedure
+                    } else {
+                        db::ObjectSourceKind::Function
+                    },
+                };
+                let result = crate::schema::oracle_routines::transfer_oracle_routine_core(
+                    state,
+                    context,
+                    crate::schema::oracle_routines::RoutineTransferInput {
+                        source_connection_id: request.source_connection_id.clone(),
+                        source_database: request.source_database.clone(),
+                        identity,
+                        target_connection_id: request.target_connection_id.clone(),
+                        target_database: request.target_database.clone(),
+                        target_owner: target_schema.clone(),
+                    },
+                )
+                .await;
+                match result {
+                    Ok(operation) if operation.verified() => {
+                        outcome.transferred.push(format!("{kind:?}:{name}"));
+                        progress(&mut outcome, TransferStatus::Running, None);
+                    }
+                    result => {
+                        let error = match result {
+                            Ok(operation) => operation.failure_message(),
+                            Err(error) => error,
+                        };
+                        outcome.failed.push(format!("{kind:?}:{name}"));
+                        progress(&mut outcome, TransferStatus::Error, Some(error));
+                    }
+                }
                 continue;
             }
             let query = oracle_object_source_query(&kind, &source_schema, &name)?;
@@ -15483,7 +15596,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         }
 
         #[test]
-        fn xugu_transfer_is_same_engine_table_only_and_append_or_overwrite() {
+        fn xugu_transfer_is_same_engine_only_and_append_or_overwrite() {
             let request = base_request();
             assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu).is_ok());
             // Existing non-Xugu transfer combinations retain their prior policy.
@@ -15540,7 +15653,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         }
 
         #[test]
-        fn xugu_structure_transfer_rejects_renamed_tables_and_non_table_objects() {
+        fn xugu_structure_transfer_preserves_names_and_accepts_native_objects() {
             let request = TransferRequest { target_table_name_case: TransferTableNameCase::Upper, ..base_request() };
             assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu)
                 .unwrap_err()
@@ -15553,9 +15666,29 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 }]),
                 ..base_request()
             };
-            assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu)
-                .unwrap_err()
-                .contains("仅支持表对象"));
+            assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu).is_ok());
+            for kind in [
+                TransferObjectKind::Package,
+                TransferObjectKind::Synonym,
+                TransferObjectKind::Sequence,
+                TransferObjectKind::Procedure,
+                TransferObjectKind::Function,
+                TransferObjectKind::Trigger,
+            ] {
+                let request = TransferRequest {
+                    objects: Some(vec![TransferObjectSelection { object_type: kind, names: vec!["O".into()] }]),
+                    ..base_request()
+                };
+                assert!(validate_transfer_database_pair(&request, &DatabaseType::Xugu, &DatabaseType::Xugu).is_ok());
+            }
+            let unsupported = TransferRequest {
+                objects: Some(vec![TransferObjectSelection {
+                    object_type: TransferObjectKind::Event,
+                    names: vec!["E".into()],
+                }]),
+                ..base_request()
+            };
+            assert!(validate_transfer_database_pair(&unsupported, &DatabaseType::Xugu, &DatabaseType::Xugu).is_err());
         }
 
         #[test]
@@ -20590,6 +20723,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_generates_index_and_foreign_key_sql() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20648,6 +20782,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_includes_opclass_for_gin_trigram() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20679,6 +20814,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
         // (`syntax error at or near "NOT"`), so the transfer must fall back to the
         // plain form there (issue #8853).
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20717,6 +20853,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_no_opclass_when_all_default() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20751,6 +20888,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
         // `indclass` into `column_opclasses`, so transfer DDL must append it to an
         // expression key just like a real column.
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20780,6 +20918,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_mixed_opclass_and_default() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20808,6 +20947,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_preserves_per_key_ordering_and_include_columns() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20841,6 +20981,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_ignores_access_method_options_for_non_btree_indexes() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -20870,6 +21011,7 @@ PARTITION p_old VALUES LESS THAN (TO_DAYS('2026-01-01')))";
     #[test]
     fn postgres_index_ddl_empty_column_opclasses_vec_falls_back_to_no_opclass() {
         let indexes = vec![db::IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -23360,7 +23502,8 @@ SELECT 1 FROM dual"#
             map_column_type("varchar(20 byte)", &DatabaseType::Mysql, &DatabaseType::Oracle),
             "VARCHAR(20 byte)"
         );
-        assert_eq!(map_column_type("nvarchar(max)", &DatabaseType::SqlServer, &DatabaseType::Dameng), "VARCHAR(max)");
+        // SQL Server `(max)` has no Dameng spelling and becomes CLOB (#13190).
+        assert_eq!(map_column_type("nvarchar(max)", &DatabaseType::SqlServer, &DatabaseType::Dameng), "CLOB");
     }
 
     #[test]
@@ -23460,6 +23603,31 @@ SELECT 1 FROM dual"#
         assert_eq!(map_column_type("NUMBER(14,2)", &DatabaseType::Oracle, &DatabaseType::DuckDb), "DECIMAL(14,2)");
         assert_eq!(map_column_type("decimal(10, 4)", &DatabaseType::Mysql, &DatabaseType::DuckDb), "DECIMAL(10,4)");
         assert_eq!(map_column_type("numeric(38,38)", &DatabaseType::Postgres, &DatabaseType::DuckDb), "DECIMAL(38,38)");
+    }
+
+    #[test]
+    fn map_column_type_maps_sqlserver_max_length_strings_to_text() {
+        // `(max)` is SQL Server only syntax: DuckDB failed CREATE TABLE with
+        // `syntax error at or near "max"` on `VARCHAR(max)` (#13190).
+        for source_type in ["nvarchar(max)", "varchar(max)", "NVARCHAR(MAX)"] {
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::DuckDb), "TEXT");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Postgres), "TEXT");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Mysql), "TEXT");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Oracle), "CLOB");
+        }
+        assert_eq!(map_column_type("nvarchar(50)", &DatabaseType::SqlServer, &DatabaseType::DuckDb), "VARCHAR(50)");
+    }
+
+    #[test]
+    fn map_column_type_maps_sqlserver_rowversion_to_binary() {
+        // SQL Server `timestamp` is a rowversion (8 binary bytes), not a date and
+        // time, so its `0x...` values cannot be inserted into a TIMESTAMP column.
+        for source_type in ["timestamp", "rowversion"] {
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::DuckDb), "BLOB");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Postgres), "BYTEA");
+            assert_eq!(map_column_type(source_type, &DatabaseType::SqlServer, &DatabaseType::Mysql), "BLOB");
+        }
+        assert_eq!(map_column_type("timestamp", &DatabaseType::Postgres, &DatabaseType::DuckDb), "TIMESTAMP");
     }
 
     #[test]

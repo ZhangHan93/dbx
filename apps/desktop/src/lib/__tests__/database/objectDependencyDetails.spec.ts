@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isObjectDependencySection, objectDependencyNavigation, objectDependencyRows, objectDependencySql, objectDependencyTarget, type ObjectDependencyRow } from "@/lib/database/objectDependencyDetails";
+import { isObjectDependencySection, objectDependencyNavigation, objectDependencyRows, objectDependencySql, objectDependencyTarget, objectForeignKeyRows, objectOwnershipRows, relationObjectNavigation, type ObjectDependencyRow } from "@/lib/database/objectDependencyDetails";
 import { oracleObjectDependenciesSql } from "@/lib/database/oracleObjectDependencies";
 import { normalizeOracleNavigationTarget, sqlObjectNavigationContextTarget, sqlObjectNavigationSourceKind } from "@/lib/sql/sqlNavigation";
 import type { QueryResult, QueryTab } from "@/types/database";
@@ -14,7 +14,8 @@ describe("object dependency details", () => {
     expect(objectDependencySql(target)).toBe(oracleObjectDependenciesSql({ schema: details.schema, objectName: details.name, objectType: "PROCEDURE" }));
     expect(objectDependencyTarget({ ...details, objectType: "PACKAGE_BODY" }, "oracle")?.objectType).toBe("PACKAGE");
     expect(objectDependencyTarget(details, "xugu")).toBeUndefined();
-    expect(objectDependencyTarget({ ...details, objectType: "TYPE" }, "oracle")).toBeUndefined();
+    expect(objectDependencyTarget({ ...details, objectType: "TYPE" }, "oracle")?.objectType).toBe("TYPE");
+    expect(objectDependencyTarget({ ...details, objectType: "TABLE" }, "oracle")?.objectType).toBe("TABLE");
   });
 
   it("maps both directions from column names, retaining package body origin and nullable links", () => {
@@ -66,5 +67,50 @@ describe("object dependency details", () => {
     expect(isObjectDependencySection({ ...tab, schema: "DIFFERENT" })).toBe(false);
     expect(isObjectDependencySection({ ...tab, connectionId: "new" })).toBe(false);
     expect(isObjectDependencySection({ ...tab, objectDetails: { ...details, section: "source" } })).toBe(false);
+  });
+
+  it("groups foreign keys by owner and direction and pairs columns by position rather than row order", () => {
+    const result: QueryResult = {
+      columns: ["DIRECTION", "CONSTRAINT_OWNER", "CONSTRAINT_NAME", "CHILD_OWNER", "CHILD_NAME", "CHILD_COLUMN", "POSITION", "PARENT_OWNER", "PARENT_NAME", "PARENT_COLUMN", "COLUMN_COUNT"],
+      rows: [
+        ["REFERENCES", "Child.Owner", "Same.FK", "Child.Owner", "Child.Table", "C Two", 2, "Parent.Owner", "Parent.Table", "P Two", 2],
+        ["REFERENCES", "Child.Owner", "Same.FK", "Child.Owner", "Child.Table", "C One", 1, "Parent.Owner", "Parent.Table", "P One", 2],
+        ["REFERENCED_BY", "Child.Owner", "Same.FK", "Child.Owner", "Child.Table", "C One", 1, "Parent.Owner", "Parent.Table", "P One", 2],
+        ["REFERENCES", "Hidden", "Same.FK", "Hidden", "T", "C", 1, null, null, null, 1],
+      ],
+      affected_rows: 0,
+      execution_time_ms: 1,
+    };
+    const rows = objectForeignKeyRows(result);
+    expect(rows).toHaveLength(3);
+    expect(rows[0]).toMatchObject({
+      direction: "REFERENCES",
+      complete: true,
+      parent: { schema: "Parent.Owner", name: "Parent.Table" },
+      columns: [
+        { position: 1, child: "C One", parent: "P One" },
+        { position: 2, child: "C Two", parent: "P Two" },
+      ],
+    });
+    expect(rows[1]?.complete).toBe(false);
+    expect(rows[2]?.complete).toBe(false);
+    expect(relationObjectNavigation(rows[2]!.parent)).toBeUndefined();
+  });
+
+  it("retains both owners and rejects schema triggers as fabricated table parents", () => {
+    const rows = objectOwnershipRows({
+      columns: ["CHILD_OWNER", "CHILD_NAME", "CHILD_TYPE", "PARENT_OWNER", "PARENT_NAME", "PARENT_TYPE"],
+      rows: [
+        ["Other", "Idx.Dot", "INDEX", "Parent", "Table.Dot", "TABLE"],
+        ["Other", "Tr", "TRIGGER", null, null, "SCHEMA"],
+      ],
+      affected_rows: 0,
+      execution_time_ms: 1,
+    });
+    expect(rows[0]?.child).toEqual({ schema: "Other", name: "Idx.Dot", type: "INDEX" });
+    expect(relationObjectNavigation(rows[0]!.parent)).toMatchObject({ schema: "Parent", name: "Table.Dot", type: "table", nameQuoted: true });
+    expect(relationObjectNavigation(rows[1]!.parent)).toBeUndefined();
+    expect(objectDependencySql({ ...details, objectType: "TABLE" }, "foreignKeys")).toContain("ALL_CONSTRAINTS");
+    expect(() => objectDependencySql({ ...details, objectType: "PROCEDURE" }, "foreignKeys")).toThrow("not supported");
   });
 });

@@ -4470,12 +4470,11 @@ pub async fn get_table_partition_info(
     }
 
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
-    let rows = query_with_compat_fallback(
-        "get_table_partition_info",
-        &[postgres_table_partition_info_sql(), postgres_table_partition_info_compat_sql()],
-        |sql| postgres_query_cached(client, sql, &params),
-    )
-    .await?;
+    let rows =
+        query_with_compat_fallback("get_table_partition_info", &postgres_table_partition_info_query_tiers(), |sql| {
+            postgres_query_cached(client, sql, &params)
+        })
+        .await?;
     let Some(row) = rows.first() else {
         let inherits_parents = if has_inherits_parent {
             get_table_inherits_parents_inner(client, schema, table).await?
@@ -5064,6 +5063,27 @@ fn postgres_partition_tree_compat_sql() -> &'static str {
      WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f')"
 }
 
+/// Redshift is based on PostgreSQL 8.0.2 and has neither `pg_foreign_table`
+/// nor `pg_foreign_server` (both PostgreSQL 9.1+), so the pre-10 compat query
+/// still fails there. Keep the same column shape with NULL foreign-table
+/// fields; Redshift has no declarative partitions, so the requested relation
+/// is the whole tree (issue #13293).
+fn postgres_partition_tree_legacy_sql() -> &'static str {
+    "SELECT c.oid::bigint AS oid, n.nspname::text AS schema, c.relname::text AS relname, \
+            NULL::bigint AS parent_oid, NULL::text AS parent_schema, NULL::text AS parent_relname, \
+            c.relkind::text AS relkind, \
+            NULL::text AS partition_bound, NULL::text AS partition_key, \
+            NULL::text AS foreign_server, \
+            NULL::text[] AS foreign_options \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f')"
+}
+
+fn postgres_partition_tree_query_tiers() -> [&'static str; 3] {
+    [postgres_partition_tree_sql(), postgres_partition_tree_compat_sql(), postgres_partition_tree_legacy_sql()]
+}
+
 /// The whole partition tree rooted at (schema, table) — the root itself plus
 /// every descendant partition at any depth — plus each node's partition info,
 /// in a single round trip. Used by `pg_ddl_with_partitions` instead of
@@ -5078,12 +5098,11 @@ pub async fn fetch_postgres_partition_tree(
     let client = checkout_postgres_client(pool, None, super::connection_timeout()).await?;
     let client = &EncodingClient::new(&client);
     let params: [&(dyn tokio_postgres::types::ToSql + Sync); 2] = [&schema, &table];
-    let rows = query_with_compat_fallback(
-        "fetch_postgres_partition_tree",
-        &[postgres_partition_tree_sql(), postgres_partition_tree_compat_sql()],
-        |sql| postgres_query_cached(client, sql, &params),
-    )
-    .await?;
+    let rows =
+        query_with_compat_fallback("fetch_postgres_partition_tree", &postgres_partition_tree_query_tiers(), |sql| {
+            postgres_query_cached(client, sql, &params)
+        })
+        .await?;
     Ok(rows
         .into_iter()
         .filter_map(|row| {
@@ -5411,6 +5430,7 @@ async fn list_indexes_for_relations_with_sql(
         let all_key_options: Vec<i16> = row.try_get::<_, Vec<i16>>(12).unwrap_or_default();
         let key_options = if all_key_options.len() == split_at { all_key_options } else { Vec::new() };
         result.entry(relid).or_default().push(IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,
@@ -6244,6 +6264,28 @@ fn postgres_table_partition_info_compat_sql() -> &'static str {
      LIMIT 1"
 }
 
+/// Redshift (PostgreSQL 8.0.2) lacks `pg_foreign_table`/`pg_foreign_server`
+/// (PostgreSQL 9.1+), so the pre-10 compat query still fails there. Keep the
+/// same column shape with NULL foreign-table fields (issue #13293).
+fn postgres_table_partition_info_legacy_sql() -> &'static str {
+    "SELECT NULL::text AS parent_schema, NULL::text AS parent_table, NULL::text AS partition_bound, \
+            NULL::text AS partition_key, \
+            NULL::text AS foreign_server, \
+            NULL::text[] AS foreign_options \
+     FROM pg_catalog.pg_class c \
+     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+     WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind IN ('r','p','f') \
+     LIMIT 1"
+}
+
+fn postgres_table_partition_info_query_tiers() -> [&'static str; 3] {
+    [
+        postgres_table_partition_info_sql(),
+        postgres_table_partition_info_compat_sql(),
+        postgres_table_partition_info_legacy_sql(),
+    ]
+}
+
 fn postgres_table_inherits_parents_sql() -> &'static str {
     // Traditional-inheritance parents only: a declarative partition child
     // is also a `pg_inherits` row, but its parent has relkind 'p', which we
@@ -6575,6 +6617,38 @@ fn redshift_routine_objects_sql() -> &'static str {
        AND schema_name = $1 \
        AND function_type IN ('STORED PROCEDURE', 'REGULAR FUNCTION') \
      ORDER BY sort_order, object_name"
+}
+
+/// Source of a Redshift stored procedure.
+///
+/// Redshift's `pg_proc` is the PostgreSQL 8.0 catalog: it has no `prokind`
+/// (PostgreSQL 11) and no `pg_get_functiondef` (PostgreSQL 8.4). The routine
+/// kind is exposed by the Redshift-only `pg_proc_info` view, and a stored
+/// procedure's complete `CREATE [OR REPLACE] PROCEDURE` text is stored in
+/// `pg_proc.prosrc`, so it is read directly (issue #13293). The signature from
+/// `svv_redshift_functions` only orders same-named procedures; it is not a
+/// filter so a formatting difference can never hide the only match.
+pub fn redshift_procedure_source_sql(schema: &str, name: &str, signature: Option<&str>) -> String {
+    let signature_order = signature
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                "CASE WHEN pg_catalog.oidvectortypes(p.proargtypes) = {} THEN 0 ELSE 1 END, ",
+                pg_quote_literal(value)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "SELECT p.prosrc \
+         FROM pg_catalog.pg_proc p \
+         JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+         JOIN pg_catalog.pg_proc_info pi ON pi.prooid = p.oid \
+         WHERE n.nspname = {} AND p.proname = {} AND pi.prokind = 'p' \
+         ORDER BY {signature_order}p.oid LIMIT 1",
+        pg_quote_literal(schema),
+        pg_quote_literal(name)
+    )
 }
 
 /// SQL for listing user-defined types in one schema.
@@ -7896,6 +7970,11 @@ fn build_custom_type_ddl(
                 warnings: all,
             }
         }
+        CustomTypeKind::Object | CustomTypeKind::Collection | CustomTypeKind::Other => CustomTypeDdl {
+            sql: String::new(),
+            complete: false,
+            warnings: vec!["Not a PostgreSQL custom type category".to_string()],
+        },
     }
 }
 
@@ -7970,6 +8049,9 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
             warnings.extend(custom_type_range_attributes(client, info.oid, true, &mut properties).await);
         }
         CustomTypeKind::Base => {}
+        CustomTypeKind::Object | CustomTypeKind::Collection | CustomTypeKind::Other => {
+            return Err("not a PostgreSQL custom type category".to_string());
+        }
     }
 
     let ddl = build_custom_type_ddl(schema, name, kind, &info, &members, &properties, &warnings);
@@ -7981,6 +8063,7 @@ pub async fn get_custom_type_details(pool: &Pool, schema: &str, name: &str) -> R
         members,
         properties,
         ddl: Some(ddl),
+        oracle_metadata: None,
     })
 }
 
@@ -9965,6 +10048,7 @@ async fn list_indexes_with_sql(
             let all_key_options: Vec<i16> = row.try_get::<_, Vec<i16>>(11).unwrap_or_default();
             let key_options = if all_key_options.len() == split_at { all_key_options } else { Vec::new() };
             IndexInfo {
+                owner: None,
                 key_directions: Vec::new(),
                 visibility: None,
                 key_metadata_complete: false,
@@ -16279,6 +16363,51 @@ mod tests {
         assert!(!sql.contains("pg_proc"));
         assert!(!sql.contains("pg_get_function"));
         assert!(!sql.contains("UNION"));
+    }
+
+    #[test]
+    fn redshift_procedure_source_uses_proc_info_and_prosrc() {
+        let sql = redshift_procedure_source_sql("tenant's", "load_orders", None);
+        assert!(sql.contains("SELECT p.prosrc"));
+        assert!(sql.contains("JOIN pg_catalog.pg_proc_info pi ON pi.prooid = p.oid"));
+        assert!(sql.contains("pi.prokind = 'p'"));
+        assert!(sql.contains("n.nspname = 'tenant''s'"));
+        assert!(sql.contains("p.proname = 'load_orders'"));
+        // Redshift's pg_proc is the 8.0 catalog; these would fail there.
+        assert!(!sql.contains("pg_get_functiondef"));
+        assert!(!sql.contains("p.prokind"));
+    }
+
+    #[test]
+    fn redshift_procedure_source_orders_by_signature_without_filtering() {
+        let sql = redshift_procedure_source_sql("public", "load_orders", Some("integer, character varying"));
+        assert!(sql.contains(
+            "CASE WHEN pg_catalog.oidvectortypes(p.proargtypes) = 'integer, character varying' THEN 0 ELSE 1 END, p.oid"
+        ));
+        assert!(!sql.contains("AND pg_catalog.oidvectortypes"));
+        let without_signature = redshift_procedure_source_sql("public", "load_orders", None);
+        assert!(without_signature.contains("ORDER BY p.oid LIMIT 1"));
+        assert!(!without_signature.contains("CASE WHEN"));
+    }
+
+    #[test]
+    fn partition_query_tiers_fall_back_without_foreign_catalogs() {
+        let tree = postgres_partition_tree_query_tiers();
+        assert!(tree[0].contains("pg_catalog.pg_foreign_table"));
+        assert!(tree[1].contains("pg_catalog.pg_foreign_table"));
+        assert!(!tree[2].contains("pg_foreign_table"));
+        assert!(!tree[2].contains("pg_foreign_server"));
+        assert!(!tree[2].contains("relispartition"));
+        assert!(!tree[2].contains("pg_get_partkeydef"));
+        assert!(tree[2].contains("NULL::text[] AS foreign_options"));
+
+        let info = postgres_table_partition_info_query_tiers();
+        assert!(info[1].contains("pg_catalog.pg_foreign_table"));
+        assert!(!info[2].contains("pg_foreign_table"));
+        assert!(!info[2].contains("pg_foreign_server"));
+        assert!(!info[2].contains("relispartition"));
+        assert!(!info[2].contains("pg_get_expr"));
+        assert!(info[2].contains("NULL::text[] AS foreign_options"));
     }
 
     #[test]

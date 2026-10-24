@@ -81,6 +81,19 @@ describe("objectMetadataCache", () => {
     expect(loader).not.toHaveBeenCalled();
   });
 
+  it("does not grant an exact baseline from legacy memory or any persisted facet", async () => {
+    mocks.loadSchemaCache.mockResolvedValue({ version: 1, cachedAt: new Date().toISOString(), value: ["legacy"] });
+    const loader = vi.fn().mockResolvedValue(["exact"]);
+    await loadObjectMetadataFacet(request, "indexes", loader);
+    await expect(loadObjectMetadataFacet({ ...request, exactIdentity: true }, "indexes", loader)).resolves.toEqual({ value: ["exact"], cacheStatus: "remote" });
+    expect(loader).toHaveBeenCalledOnce();
+    expect(mocks.loadSchemaCache).toHaveBeenCalledOnce();
+    expect(mocks.saveSchemaCache).not.toHaveBeenCalled();
+    cancelObjectMetadataLoadsForConnection("c1");
+    loader.mockRejectedValueOnce(new Error("exact capability unavailable"));
+    await expect(loadObjectMetadataFacet({ ...request, exactIdentity: true }, "indexes", loader)).rejects.toThrow("exact capability unavailable");
+  });
+
   it("backfills memory after a disk hit", async () => {
     mocks.loadSchemaCache.mockResolvedValue({ version: 1, cachedAt: new Date().toISOString(), value: [] });
     const loader = vi.fn();

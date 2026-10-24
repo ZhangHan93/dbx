@@ -6,9 +6,9 @@ import ObjectBrowser from "@/components/objects/ObjectBrowser.vue";
 import { invalidateObjectBrowserRowsCache } from "@/lib/table/objectBrowserRowsCache";
 import type { ConnectionConfig, ObjectBrowserFilter, ObjectInfo } from "@/types/database";
 
-const mocks = vi.hoisted(() => ({ listObjects: vi.fn(), listSchemas: vi.fn() }));
+const mocks = vi.hoisted(() => ({ listObjects: vi.fn(), listSchemas: vi.fn(), listSchemaIndexes: vi.fn().mockResolvedValue([]) }));
 vi.mock("@/lib/backend/api", () => ({
-  listObjects: (...args: unknown[]) => mocks.listObjects(...args),
+  listObjects: (...args: unknown[]) => (args[10] === true ? mocks.listSchemaIndexes(...args) : mocks.listObjects(...args)),
   listSchemas: (...args: unknown[]) => mocks.listSchemas(...args),
   listObjectStatistics: vi.fn().mockResolvedValue([]),
 }));
@@ -132,7 +132,7 @@ describe("OceanBase Oracle object pagination (#11418)", () => {
     mocks.listObjects.mockResolvedValueOnce([object("O11418_10"), object("O11418_2"), object("O11418_3")]).mockResolvedValueOnce([object("O11418_3")]);
     const { host } = await mountBrowser();
     await vi.waitFor(() => expect(host.querySelector('[title="O11418_10"]')).not.toBeNull());
-    expect(mocks.listObjects).toHaveBeenNthCalledWith(1, connection.id, "APP", "APP", undefined, undefined, 3, 0, undefined);
+    expect(mocks.listObjects).toHaveBeenNthCalledWith(1, connection.id, "APP", "APP", expect.not.arrayContaining(["INDEX"]), undefined, 3, 0, undefined);
     expect(host.querySelector('[title="O11418_3"]')).toBeNull();
     expect(Array.from(host.querySelectorAll('[title^="O11418_"]')).map((el) => el.getAttribute("title"))).toEqual(["O11418_10", "O11418_2"]);
 
@@ -140,7 +140,7 @@ describe("OceanBase Oracle object pagination (#11418)", () => {
     expect(more).not.toBeNull();
     more!.click();
     await vi.waitFor(() => expect(host.querySelector('[title="O11418_3"]')).not.toBeNull());
-    expect(mocks.listObjects).toHaveBeenNthCalledWith(2, connection.id, "APP", "APP", undefined, undefined, 3, 2, undefined);
+    expect(mocks.listObjects).toHaveBeenNthCalledWith(2, connection.id, "APP", "APP", expect.not.arrayContaining(["INDEX"]), undefined, 3, 2, undefined);
     expect(host.querySelector("[data-object-load-more]")).toBeNull();
   });
 
@@ -153,7 +153,7 @@ describe("OceanBase Oracle object pagination (#11418)", () => {
     await searchObjects(host, "needle");
     await vi.waitFor(() => expect(host.querySelector('[title="O11418_LATE_VIEW"]')).not.toBeNull());
     expect(host.querySelector('[title="O11418_1"]')).toBeNull();
-    expect(mocks.listObjects).toHaveBeenNthCalledWith(2, connection.id, "APP", "APP", undefined, "needle", 3, 0, undefined);
+    expect(mocks.listObjects).toHaveBeenNthCalledWith(2, connection.id, "APP", "APP", expect.not.arrayContaining(["INDEX"]), "needle", 3, 0, undefined);
 
     const views = Array.from(host.querySelectorAll("button")).find((button) => button.textContent?.trim() === "objects.views");
     expect(views).toBeDefined();

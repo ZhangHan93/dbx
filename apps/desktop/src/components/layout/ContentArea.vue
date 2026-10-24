@@ -220,6 +220,8 @@ import type { QueryMessage, QueryResult, QueryTab, RedisResultViewMode, TableInf
 import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
+import { isOracleFamilyTypeSource } from "@/lib/database/databaseObjectCapabilities";
+import { requestOracleTypeManagement } from "@/lib/table/oracleTypeManagementRequest";
 import { sqlStatementParameterOptionsForCompatibility } from "@/lib/sql/sqlStatementRanges";
 import { connectionIsEffectivelyReadOnly } from "@/lib/database/readOnlyWriteAccess";
 import { isAiRedisConsoleTarget, type AiConversationBinding } from "@/lib/ai/aiConversationBinding";
@@ -421,6 +423,25 @@ const activeResultDatabase = computed(() => activeResultExecutionTarget.value?.d
 const activeResultSchema = computed(() => activeResultExecutionTarget.value?.schema ?? props.activeTab.schema);
 const graphViewKey = computed(() => JSON.stringify([props.activeTab.id, props.activeTab.resultViewGeneration, props.activeTab.activeResultRunId, props.activeTab.activeResultIndex, activeResultConnectionId.value, activeResultDatabase.value]));
 const activeEffectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(activeResultConnection.value));
+const managedTypeSource = computed(() => isOracleFamilyTypeSource(effectiveDatabaseTypeForConnection(props.activeConnection), props.activeTab.objectSource?.objectType));
+const unfinishedTypeChange = computed(() => !!props.activeTab.typeManagementDraft && props.activeTab.typeManagementDraft.state !== "complete");
+const verifiedTypeDeletion = computed(() => props.activeTab.typeManagementDraft?.state === "complete" && props.activeTab.typeManagementDraft.operation.startsWith("delete"));
+function resumeTypeManagement() {
+  const tab = props.activeTab;
+  const draft = tab.typeManagementDraft;
+  if (!draft) return;
+  void requestOracleTypeManagement({
+    target: draft.target,
+    operation: draft.operation,
+    tabId: tab.id,
+    isCurrent: () => queryStore.tabs.includes(tab) && tab.typeManagementDraft?.planId === draft.planId && tab.connectionId === draft.target.connectionId && tab.database === draft.target.database,
+  }).catch((error) => toast(String(error), 5000));
+}
+function refreshTypeSource() {
+  const tab = props.activeTab;
+  if (queryStore.isTabDirty(tab) && !window.confirm(t("objects.refreshDiscardConfirm"))) return;
+  queryStore.retryObjectSourceTab(tab.id);
+}
 const activeObjectDependencyTarget = computed(() => {
   const tab = props.activeTab;
   const details = tab.objectDetails;
@@ -2089,6 +2110,13 @@ defineExpose({
                 {{ t("contextMenu.viewData") }}
               </Button>
             </div>
+            <div v-if="managedTypeSource && !activeTab.sourceLoad" class="flex min-h-10 shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1.5" data-type-source-actions>
+              <Button v-if="!activeTab.typeSourceEditing && !unfinishedTypeChange && !verifiedTypeDeletion" variant="outline" size="sm" @click="activeTab.typeSourceEditing = true">{{ t("contextMenu.editObject") }}</Button>
+              <Button v-if="activeTab.typeSourceEditing && !unfinishedTypeChange && !verifiedTypeDeletion" size="sm" @click="emit('saveSql', activeTab.id)">{{ t("objects.typeManagementPreviewSave") }}</Button>
+              <Button v-if="unfinishedTypeChange" variant="outline" size="sm" @click="resumeTypeManagement">{{ t("objects.typeManagementResume") }}</Button>
+              <Button v-if="!unfinishedTypeChange && !verifiedTypeDeletion" variant="outline" size="sm" @click="refreshTypeSource">{{ t("structureEditor.refresh") }}</Button>
+              <span v-if="verifiedTypeDeletion" role="status" class="text-sm text-muted-foreground">{{ t("objects.typeManagementDeleted") }}</span>
+            </div>
             <ProductionWatermark v-if="activeProductionContext.active" />
             <ObjectDependenciesPanel :target="activeObjectDependencyTarget" :section="activeObjectSection" @update:section="setObjectSection" @view-sql="viewObjectDependencySql" @open-object="(context, target) => emit('openDependencyObject', context, target)">
               <!-- issue #9035：源码 tab 先出现再加载。pending 期间不挂载编辑器
@@ -2143,8 +2171,8 @@ defineExpose({
                 :initial-selection="activeTab.editorSelection"
                 :reveal-request="activeTab.editorRevealRequest"
                 :force-word-wrap="activeTab.forceWordWrap"
-                :read-only="!!activeTab.ddlViewer"
-                :hide-execution-controls="!!activeTab.ddlViewer"
+                :read-only="!!activeTab.ddlViewer || (managedTypeSource && (!activeTab.typeSourceEditing || unfinishedTypeChange || verifiedTypeDeletion))"
+                :hide-execution-controls="!!activeTab.ddlViewer || managedTypeSource"
                 enable-explain-shortcut
                 :can-explain="!activeTab.isExecuting && !activeTab.isExplaining && !!executableSql.trim()"
                 :is-executing="activeTab.isExecuting"
@@ -2831,6 +2859,7 @@ defineExpose({
               <DataGrid
                 v-else-if="activeTab.result && hasTabularResult && (!activeTab.isExecuting || !isQueryExecutionErrorResult(activeTab.result))"
                 ref="dataGridRef"
+                @open-dependency-object="(context, target) => emit('openDependencyObject', context, target)"
                 :key="activeResultGridInstanceKey"
                 :cache-key="activeResultGridCacheKey"
                 :column-width-cache-key="activeResultGridColumnWidthCacheKey"
@@ -3379,6 +3408,7 @@ defineExpose({
         <DataGrid
           v-if="activeTab.result && (!activeTab.isExecuting || !isQueryExecutionErrorResult(activeTab.result))"
           ref="dataGridRef"
+          @open-dependency-object="(context, target) => emit('openDependencyObject', context, target)"
           class="flex-1 min-h-0"
           :key="activeTab.id"
           :cache-key="activeTab.id"
@@ -3676,9 +3706,30 @@ defineExpose({
           :initial-event-open-request-id="activeTab.objectBrowser?.eventOpenRequestId"
           :initial-event-create-request-id="activeTab.objectBrowser?.eventCreateRequestId"
           :initial-object-filter="activeTab.objectBrowser?.initialObjectFilter"
+          :initial-index-create-request-id="activeTab.objectBrowser?.indexCreateRequestId"
+          :initial-view-target="activeTab.objectBrowser?.initialViewTarget"
+          :initial-view-request-id="activeTab.objectBrowser?.initialViewRequestId"
+          @index-request-consumed="
+            (kind) => {
+              if (activeTab.objectBrowser) {
+                if (kind === 'create') activeTab.objectBrowser.indexCreateRequestId = undefined;
+                else {
+                  activeTab.objectBrowser.initialViewTarget = undefined;
+                  activeTab.objectBrowser.initialViewRequestId = undefined;
+                }
+              }
+            }
+          "
           :selected-object-filter="activeTab.objectBrowser?.filter"
           :initial-search-query="activeTab.objectBrowser?.searchQuery"
           :viewport="activeTab.objectBrowser?.viewport"
+          :property-request="activeTab.objectPropertiesRequest"
+          @property-request-consumed="
+            (id) => {
+              if (activeTab.objectPropertiesRequest?.requestId === id) activeTab.objectPropertiesRequest = undefined;
+            }
+          "
+          @open-dependency-object="(context, target) => emit('openDependencyObject', context, target)"
           @open-table="emit('openObjectTable', activeTab.id, $event)"
           @locate-table="onLocateObjectTable"
           @schema-change="emit('objectSchemaChange', activeTab.id, $event)"
@@ -3702,6 +3753,7 @@ defineExpose({
           :schema="activeTab.schema"
           :table-name="activeTab.structureTableName || ''"
           :table-type="activeTab.structureTableType"
+          :exact-identity="activeTab.structureExactIdentity"
           :initial-tab="activeTab.structureInitialTab"
           :initial-tab-request-id="activeTab.structureInitialTabRequestId"
           :initial-target="activeTab.structureInitialTarget"

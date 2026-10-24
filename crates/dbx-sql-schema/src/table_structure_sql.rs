@@ -12,6 +12,7 @@ mod existing_primary_key;
 mod foreign_keys;
 mod indexes;
 mod mysql_engine;
+mod mysql_table_charset;
 mod oracle_constraints;
 mod oracle_foreign_keys;
 mod owner;
@@ -32,6 +33,7 @@ pub use create_options::*;
 pub use create_table::{
     build_create_table_sql, build_create_table_sql_for_version, build_create_table_sql_with_dialect_options,
 };
+pub use mysql_table_charset::{build_mysql_table_charset_change_sql, MysqlTableCharsetChange};
 pub use owner::build_table_owner_change_sql;
 pub use partitions::{build_create_partitioned_table_sql, build_table_partition_operation_sql};
 pub use types::*;

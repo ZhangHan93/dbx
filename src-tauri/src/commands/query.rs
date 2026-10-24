@@ -133,9 +133,22 @@ pub async fn execute_conditional_update(
     client_session_id: Option<String>,
     timeout_secs: Option<u64>,
     execution_mode: Option<dbx_core::query::QueryExecutionMode>,
+    type_recovery: Option<dbx_core::storage::TypeRecoveryContext>,
 ) -> Result<db::QueryResult, BackendError> {
     let execution_id =
         execution_id.filter(|id| !id.trim().is_empty()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let recovery = type_recovery.map(|context| dbx_core::storage::TypeExecutionBinding {
+        execution_id: execution_id.clone(),
+        context,
+        connection_id: connection_id.clone(),
+        database: database.clone(),
+        schema: schema.clone(),
+        sql: sql.clone(),
+    });
+    if let Some(binding) = &recovery {
+        state.storage.claim_type_execution(binding).await.map_err(|error| BackendError::from_legacy_backend(&error))?;
+    }
+    let durable_recovery = recovery.is_some();
     let registered = state.running_queries.register_task_for_terminal_confirmation(
         execution_id.clone(),
         RunningTaskMetadata::query(connection_id.clone(), database.clone(), client_session_id.clone()),
@@ -169,31 +182,44 @@ pub async fn execute_conditional_update(
             },
         )
         .await;
+        let result = dbx_core::query_cancel::finish_conditional_update(
+            registered,
+            &app_state.storage,
+            recovery.as_ref(),
+            result,
+        )
+        .await;
         let _ = result_tx.send(result);
-        drop(registered);
     });
 
-    let result = match response_timeout {
+    match response_timeout {
         Some(timeout) => match tokio::time::timeout(timeout, result_rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => {
-                return Err(BackendError::from_sql_detail("Conditional update execution task stopped unexpectedly"));
+                let message = "Conditional update execution task stopped unexpectedly";
+                Err(if durable_recovery {
+                    BackendError::from_legacy_backend(message)
+                } else {
+                    BackendError::from_sql_detail(message)
+                })
             }
-            Err(_) => {
-                return Err(BackendError::from_timeout_detail(&format!(
-                    "Query timed out after {} seconds",
-                    timeout.as_secs().max(1)
-                )));
-            }
+            Err(_) => Err(BackendError::from_timeout_detail(&format!(
+                "Query timed out after {} seconds",
+                timeout.as_secs().max(1)
+            ))),
         },
         None => match result_rx.await {
             Ok(result) => result,
             Err(_) => {
-                return Err(BackendError::from_sql_detail("Conditional update execution task stopped unexpectedly"));
+                let message = "Conditional update execution task stopped unexpectedly";
+                Err(if durable_recovery {
+                    BackendError::from_legacy_backend(message)
+                } else {
+                    BackendError::from_sql_detail(message)
+                })
             }
         },
-    };
-    result.map_err(dbx_core::query::QueryExecutionError::into_backend_error)
+    }
 }
 
 #[tauri::command]
@@ -328,8 +354,26 @@ pub async fn cancel_query(state: State<'_, Arc<AppState>>, execution_id: String)
 pub async fn cancel_conditional_update(
     state: State<'_, Arc<AppState>>,
     execution_id: String,
+    cancel: Option<bool>,
+    type_recovery: Option<dbx_core::storage::TypeExecutionBinding>,
 ) -> Result<dbx_core::query_cancel::CancellationWaitResult, String> {
-    Ok(state.running_queries.cancel_and_wait(&execution_id, Duration::from_secs(10)).await)
+    if let Some(binding) = type_recovery {
+        if cancel != Some(false) || binding.execution_id != execution_id {
+            return Err("TYPE recovery observation requires the original execution ID and cancel=false".into());
+        }
+        return dbx_core::query_cancel::observe_type_execution(
+            &state.storage,
+            &state.running_queries,
+            &binding,
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+    Ok(if cancel == Some(false) {
+        state.running_queries.wait_for_completion(&execution_id, Duration::from_secs(10)).await
+    } else {
+        state.running_queries.cancel_and_wait(&execution_id, Duration::from_secs(10)).await
+    })
 }
 
 #[tauri::command]
@@ -340,7 +384,17 @@ pub async fn close_query_session(
     session_id: String,
     client_session_id: Option<String>,
     catalog: Option<String>,
+    txn_session_id: Option<String>,
 ) -> Result<bool, String> {
+    if let Some(txn_session_id) = txn_session_id {
+        return dbx_core::query::close_manual_transaction_query_session(
+            &state,
+            &connection_id,
+            &txn_session_id,
+            &session_id,
+        )
+        .await;
+    }
     dbx_core::query::close_query_session(
         &state,
         &connection_id,
@@ -936,8 +990,16 @@ pub fn review_oracle_view_rename_source(
 pub fn build_table_structure_change_sql(
     options: dbx_core::table_structure_sql::TableStructureSqlOptions,
     starrocks: Option<dbx_core::table_structure_sql::StarRocksAlterOptions>,
+    mysql_table_charset: Option<dbx_core::table_structure_sql::MysqlTableCharsetChange>,
 ) -> Result<dbx_core::table_structure_sql::TableStructureSqlResult, String> {
-    Ok(dbx_core::table_structure_sql::build_table_structure_change_sql_with_context(options, starrocks))
+    let table_charset = mysql_table_charset
+        .map(|change| dbx_core::table_structure_sql::build_mysql_table_charset_change_sql(&options, change));
+    let mut result = dbx_core::table_structure_sql::build_table_structure_change_sql_with_context(options, starrocks);
+    if let Some(extra) = table_charset {
+        result.statements.extend(extra.statements);
+        result.warnings.extend(extra.warnings);
+    }
+    Ok(result)
 }
 
 #[tauri::command]

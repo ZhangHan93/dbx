@@ -382,6 +382,10 @@ pub struct ConnectionLifecycleSnapshot {
 }
 
 impl ConnectionLifecycleSnapshot {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
     }
@@ -425,6 +429,7 @@ pub struct AppState {
     shared_resource_budgets: std::sync::Mutex<HashMap<String, SharedResourceBudget>>,
     pub configs: RwLock<HashMap<String, ConnectionConfig>>,
     pub running_queries: RunningQueries,
+    pub routine_operations: crate::schema::oracle_routines::RoutineOperationRegistry,
     pub tunnels: TunnelManager,
     pub proxy_tunnels: ProxyTunnelManager,
     pub http_tunnels: HttpTunnelManager,
@@ -435,6 +440,11 @@ pub struct AppState {
     pub nacos_registry: crate::nacos::NacosAdminRegistry,
     duckdb_worker_process_isolation: AtomicBool,
     duckdb_worker_max_processes: AtomicUsize,
+    /// Whether a saved connection's fixed SSH `local_port` is bound. Off by
+    /// default so a state that lives beside the app (scheduled backup jobs,
+    /// backup workers, stdio MCP, CLI) never fights it for the same port. Only
+    /// the long-lived primary runtimes (desktop app, dbx-web server) turn it on.
+    honor_fixed_ssh_local_ports: AtomicBool,
     /// PostgreSQL TLS cancel context, keyed by pool_key.
     /// Used to reconstruct a TLS connector compatible with the original connection when cancelling.
     postgres_cancel_contexts: Arc<RwLock<HashMap<String, db::postgres::PostgresCancelContext>>>,
@@ -467,6 +477,146 @@ pub struct AppState {
     salesforce_browser_opener: std::sync::RwLock<Option<SfBrowserOpener>>,
     #[cfg(feature = "mq-admin")]
     pub mq_registry: crate::mq::MqAdminRegistry,
+}
+
+/// Fixed local port requested by the last transport layer, only for the
+/// connection's own primary tunnel. Test, probe, and plugin-action endpoints
+/// resolve under another id and keep a random port, so they never collide with
+/// the live tunnel. One-time drafts do too, and Redis Cluster and Sentinel
+/// route their primary path per node instead of through one static tunnel.
+fn primary_tunnel_fixed_local_port(
+    honor_fixed_ssh_local_ports: bool,
+    connection_id: &str,
+    config: &ConnectionConfig,
+    transport_layers: &[TransportLayerConfig],
+) -> Option<u16> {
+    if !honor_fixed_ssh_local_ports
+        || connection_id != config.id
+        || config.one_time
+        || config.uses_redis_cluster()
+        || config.uses_redis_sentinel()
+        || runtime_config::is_transient_runtime_config_id(connection_id)
+    {
+        return None;
+    }
+    last_ssh_layer_local_port(transport_layers)
+}
+
+fn ssh_layer_local_port(layer: &TransportLayerConfig) -> Option<u16> {
+    match layer {
+        TransportLayerConfig::Ssh(ssh) if ssh.profile_id.is_empty() => ssh.local_port.filter(|port| *port != 0),
+        _ => None,
+    }
+}
+
+fn last_ssh_layer_local_port(transport_layers: &[TransportLayerConfig]) -> Option<u16> {
+    transport_layers.last().and_then(ssh_layer_local_port)
+}
+
+/// Connection kinds whose primary path never listens on the static SSH tunnel,
+/// as `(kind, route)` for the error message. `plugin_proxy_route` carries the
+/// provider label of a plugin that declared `proxy_route`.
+fn static_tunnel_bypass(config: &ConnectionConfig, plugin_proxy_route: Option<&str>) -> Option<(String, &'static str)> {
+    let (kind, route) = match config.db_type {
+        DatabaseType::Sqlite => ("SQLite", "a remote worker over SSH"),
+        DatabaseType::ClickHouse => ("ClickHouse", "a SOCKS5 route"),
+        DatabaseType::Turso => ("Turso", "a SOCKS5 route"),
+        DatabaseType::Redis if config.uses_redis_cluster() => ("Redis Cluster", "per-node tunnels"),
+        DatabaseType::Redis if config.uses_redis_sentinel() => ("Redis Sentinel", "per-node tunnels"),
+        DatabaseType::MessageQueue if connection_secrets::is_rocketmq_connection(config) => {
+            ("RocketMQ", "a SOCKS5 route")
+        }
+        DatabaseType::Plugin => {
+            let label = plugin_proxy_route?.trim();
+            return Some((if label.is_empty() { "this plugin's" } else { label }.to_string(), "a SOCKS5 route"));
+        }
+        _ => return None,
+    };
+    Some((kind.to_string(), route))
+}
+
+/// The dialog has no tunnel settings for Cloudflare D1 and drops its layers on
+/// save, so the remedy differs from the other kinds.
+const CLOUDFLARE_D1_LOCAL_PORT_ERROR: &str = "Local Port is not supported for Cloudflare D1 connections, which do not use tunnel layers; open the connection and save it to remove them.";
+
+/// How the dialog names the layer at `effective_index` among the enabled
+/// layers: its own name, otherwise its 1-based position in the full list that
+/// includes disabled layers.
+fn effective_layer_label(config: &ConnectionConfig, effective_index: usize) -> String {
+    match config.transport_layers.iter().enumerate().filter(|(_, layer)| layer.enabled()).nth(effective_index) {
+        Some((position, layer)) => match layer.name().trim() {
+            "" => (position + 1).to_string(),
+            name => name.to_string(),
+        },
+        None => (effective_index + 1).to_string(),
+    }
+}
+
+/// Rejects a fixed SSH `local_port` that the connection cannot bind instead of
+/// silently using a random port. This is a property of the config, so it does
+/// not depend on the connection id or on `honor_fixed_ssh_local_ports`: Test
+/// and Connect agree, whether the config came from the dialog, an import, a
+/// cloud sync, or a hand-edited config. A layer that references a shared tunnel
+/// profile supplies its own configuration and is not checked. Kafka with a
+/// single loopback bootstrap server keeps its own rule,
+/// `kafka_loopback_local_port_error`.
+fn ssh_local_port_config_error(
+    config: &ConnectionConfig,
+    transport_layers: &[TransportLayerConfig],
+    plugin_proxy_route: Option<&str>,
+) -> Result<(), String> {
+    let Some((last, earlier)) = transport_layers.split_last() else {
+        return Ok(());
+    };
+    if let Some(index) = earlier.iter().position(|layer| ssh_layer_local_port(layer).is_some()) {
+        return Err(format!(
+            "Local Port only applies to the last enabled transport layer; clear it on SSH layer {}.",
+            effective_layer_label(config, index)
+        ));
+    }
+    if ssh_layer_local_port(last).is_none() {
+        return Ok(());
+    }
+    if config.db_type == DatabaseType::CloudflareD1 {
+        return Err(CLOUDFLARE_D1_LOCAL_PORT_ERROR.to_string());
+    }
+    match static_tunnel_bypass(config, plugin_proxy_route) {
+        Some((kind, route)) => Err(format!(
+            "Local Port is not supported for {kind} connections because they connect through {route}; clear Local Port in the SSH layer."
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Kafka with a single `127.0.0.1` bootstrap server binds its SSH tunnel to the
+/// bootstrap port so the advertised listeners stay reachable, which leaves no
+/// room for a separate fixed local port.
+#[cfg(any(feature = "mq-admin", test))]
+fn kafka_loopback_local_port_error(bootstrap_port: u16, transport_layers: &[TransportLayerConfig]) -> Option<String> {
+    last_ssh_layer_local_port(transport_layers).filter(|port| *port != bootstrap_port).map(|_| {
+        format!(
+            "Kafka with a single 127.0.0.1 bootstrap server listens on bootstrap port {bootstrap_port}; leave Local Port empty or set it to {bootstrap_port}."
+        )
+    })
+}
+
+/// Bootstrap port of a Kafka connection whose single `127.0.0.1` bootstrap
+/// server is reached through a final SSH layer.
+#[cfg(feature = "mq-admin")]
+fn kafka_ssh_loopback_bootstrap_port(
+    config: &ConnectionConfig,
+    transport_layers: &[TransportLayerConfig],
+) -> Result<Option<u16>, String> {
+    if config.db_type != DatabaseType::MessageQueue
+        || !matches!(transport_layers.last(), Some(TransportLayerConfig::Ssh(_)))
+    {
+        return Ok(None);
+    }
+    let mqc = crate::mq::config::MqAdminConfig::from_connection(config)?;
+    if mqc.system_kind != crate::mq::types::MqSystemKind::Kafka {
+        return Ok(None);
+    }
+    Ok(kafka_single_loopback_bootstrap_endpoint(&mqc.extra).map(|(_, port)| port))
 }
 
 fn transport_layers_through_last_ssh(layers: &[TransportLayerConfig]) -> Result<&[TransportLayerConfig], String> {
@@ -1784,6 +1934,7 @@ impl AppState {
             shared_resource_budgets: std::sync::Mutex::new(HashMap::new()),
             configs: RwLock::new(HashMap::new()),
             running_queries: RunningQueries::default(),
+            routine_operations: crate::schema::oracle_routines::RoutineOperationRegistry::default(),
             tunnels: TunnelManager::new(data_dir),
             proxy_tunnels: ProxyTunnelManager::new(),
             http_tunnels: HttpTunnelManager::new(),
@@ -1797,6 +1948,7 @@ impl AppState {
             nacos_registry: crate::nacos::NacosAdminRegistry::new(),
             duckdb_worker_process_isolation: AtomicBool::new(false),
             duckdb_worker_max_processes: AtomicUsize::new(DUCKDB_WORKER_MAX_PROCESSES_DEFAULT),
+            honor_fixed_ssh_local_ports: AtomicBool::new(false),
             postgres_cancel_contexts: Arc::new(RwLock::new(HashMap::new())),
             mysql_preserved_transactions: Arc::new(RwLock::new(HashSet::new())),
             transaction_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1902,6 +2054,10 @@ impl AppState {
 
     pub fn set_duckdb_worker_process_isolation_enabled(&self, enabled: bool) {
         self.duckdb_worker_process_isolation.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_honor_fixed_ssh_local_ports(&self, enabled: bool) {
+        self.honor_fixed_ssh_local_ports.store(enabled, Ordering::Relaxed);
     }
 
     pub fn set_duckdb_worker_max_processes(&self, max_processes: usize) {
@@ -2143,6 +2299,12 @@ impl AppState {
         let state = self.agent_manager.load_state();
         if state.java_runtime.mode == JavaRuntimeMode::Managed && !self.agent_manager.is_jre_installed(DEFAULT_JRE_KEY)
         {
+            // The wrapper falls back to JAVA_HOME / PATH. Do NOT gate this on a
+            // version check here: the runtime env is built before the plugin
+            // executable is known, and non-Java plugin drivers (including the
+            // python fakes in h2_jdbc_tests) launch fine on any Java. A real
+            // Java-21 plugin dying under an older JVM is explained reactively
+            // via the stderr UnsupportedClassVersionError hint.
             return Ok(PluginRuntimeEnv::default());
         }
         let java = self.agent_manager.resolve_java_runtime(&state, DEFAULT_JRE_KEY)?;
@@ -3770,6 +3932,7 @@ impl AppState {
         config: &ConnectionConfig,
     ) -> Result<ConnectionEndpoint, String> {
         let transport_layers = self.resolved_transport_layers(config).await?;
+        self.ensure_ssh_local_port_supported(config, &transport_layers)?;
         let transport_summary = transport_layers
             .iter()
             .map(|layer| match layer {
@@ -3888,11 +4051,13 @@ impl AppState {
                     .to_string(),
             );
         }
-        let local_port = db::transport_layer_tunnel::start_transport_layers(
+        let fixed_local_port = self.static_tunnel_fixed_local_port(connection_id, config, &transport_layers)?;
+        let local_port = db::transport_layer_tunnel::start_transport_layers_with_final_ssh_local_port(
             connection_id,
             &transport_layers,
             &remote_host,
             remote_port,
+            fixed_local_port,
             &self.tunnels,
             &self.proxy_tunnels,
             &self.http_tunnels,
@@ -3900,6 +4065,45 @@ impl AppState {
         .await?;
 
         Ok(ConnectionEndpoint { host: "127.0.0.1".to_string(), port: local_port, proxy: None })
+    }
+
+    /// Config check that runs ahead of the early returns in `connection_endpoint`,
+    /// which every Test and Connect path reaches first, and in
+    /// `mq_admin_config_for_connection`, which message queue admin calls reach
+    /// without going through `connection_endpoint`.
+    fn ensure_ssh_local_port_supported(
+        &self,
+        config: &ConnectionConfig,
+        transport_layers: &[TransportLayerConfig],
+    ) -> Result<(), String> {
+        let plugin_proxy_route = if config.db_type == DatabaseType::Plugin
+            && transport_layers.iter().any(|layer| ssh_layer_local_port(layer).is_some())
+        {
+            self.plugin_host.proxy_route_provider_label(config)
+        } else {
+            None
+        };
+        ssh_local_port_config_error(config, transport_layers, plugin_proxy_route.as_deref())
+    }
+
+    fn static_tunnel_fixed_local_port(
+        &self,
+        connection_id: &str,
+        config: &ConnectionConfig,
+        transport_layers: &[TransportLayerConfig],
+    ) -> Result<Option<u16>, String> {
+        // `mq_admin_config_for_connection` binds the bootstrap port itself for this Kafka
+        // layout and would tear down a tunnel opened here on the user's port first.
+        #[cfg(feature = "mq-admin")]
+        if let Some(bootstrap_port) = kafka_ssh_loopback_bootstrap_port(config, transport_layers)? {
+            return kafka_loopback_local_port_error(bootstrap_port, transport_layers).map_or(Ok(None), Err);
+        }
+        Ok(primary_tunnel_fixed_local_port(
+            self.honor_fixed_ssh_local_ports.load(Ordering::Relaxed),
+            connection_id,
+            config,
+            transport_layers,
+        ))
     }
 
     async fn clickhouse_proxy_for_transport_layers(
@@ -4295,22 +4499,28 @@ impl AppState {
         if !config.has_effective_transport_layers() {
             return Ok(mqc);
         }
+        let transport_layers = self.resolved_transport_layers(config).await?;
+        self.ensure_ssh_local_port_supported(config, &transport_layers)?;
 
         if mqc.system_kind == crate::mq::types::MqSystemKind::RocketMq {
-            let transport_layers = self.resolved_transport_layers(config).await?;
             let proxy = self.rocketmq_socks_proxy_for_transport_layers(connection_id, &transport_layers).await?;
             return Ok(mqc.with_socks_proxy(&proxy.host, proxy.port, &proxy.username, &proxy.password));
         }
 
         if mqc.system_kind == crate::mq::types::MqSystemKind::RabbitMq {
-            let transport_layers = self.resolved_transport_layers(config).await?;
             let (amqp_host, amqp_port) = crate::mq::adapters::rabbitmq::primary_amqp_endpoint(&mqc)?;
             let management_endpoint = crate::mq::adapters::rabbitmq::management_endpoint(&mqc)?;
-            let amqp_local_port = db::transport_layer_tunnel::start_transport_layers(
+            let amqp_local_port = db::transport_layer_tunnel::start_transport_layers_with_final_ssh_local_port(
                 connection_id,
                 &transport_layers,
                 &amqp_host,
                 amqp_port,
+                primary_tunnel_fixed_local_port(
+                    self.honor_fixed_ssh_local_ports.load(Ordering::Relaxed),
+                    connection_id,
+                    config,
+                    &transport_layers,
+                ),
                 &self.tunnels,
                 &self.proxy_tunnels,
                 &self.http_tunnels,
@@ -4358,8 +4568,10 @@ impl AppState {
 
         if mqc.system_kind == crate::mq::types::MqSystemKind::Kafka {
             if let Some((bootstrap_host, bootstrap_port)) = kafka_single_loopback_bootstrap_endpoint(&mqc.extra) {
-                let transport_layers = self.resolved_transport_layers(config).await?;
                 if matches!(transport_layers.last(), Some(TransportLayerConfig::Ssh(_))) {
+                    if let Some(error) = kafka_loopback_local_port_error(bootstrap_port, &transport_layers) {
+                        return Err(error);
+                    }
                     let local_port = db::transport_layer_tunnel::start_transport_layers_with_final_ssh_local_port(
                         connection_id,
                         &transport_layers,
@@ -7738,14 +7950,16 @@ mod tests {
         connection_configs_session_credentials_compatible, connection_probe_endpoints, connection_remote_endpoint,
         connection_url_for_endpoint, database_connection_config, database_connection_config_with_catalog,
         gaussdb_identifier_quote_from_query_result, gaussdb_m_jdbc_config_for_endpoint, gaussdb_uses_m_jdbc_driver,
-        kafka_single_loopback_bootstrap_endpoint, keepalive_failure_proves_pool_dead, metadata_connection_config,
-        metadata_pool_database, mysql_metadata_fallback_url, mysql_pool_setup_queries, oceanbase_mysql_setup_queries,
-        prestosql_jdbc_config_for_endpoint, redact_transport_url, redacted_connection_url_for_endpoint,
-        redis_sentinel_transport_id, redis_sentinel_transport_prefix, report_connection_liveness_lost,
-        sqlserver_legacy_agent_config, sqlserver_legacy_driver_error, sqlserver_uses_legacy_driver,
+        kafka_loopback_local_port_error, kafka_single_loopback_bootstrap_endpoint, keepalive_failure_proves_pool_dead,
+        metadata_connection_config, metadata_pool_database, mysql_metadata_fallback_url, mysql_pool_setup_queries,
+        oceanbase_mysql_setup_queries, prestosql_jdbc_config_for_endpoint, primary_tunnel_fixed_local_port,
+        redact_transport_url, redacted_connection_url_for_endpoint, redis_sentinel_transport_id,
+        redis_sentinel_transport_prefix, report_connection_liveness_lost, sqlserver_legacy_agent_config,
+        sqlserver_legacy_driver_error, sqlserver_uses_legacy_driver, ssh_local_port_config_error,
         task_client_session_id, transport_layers_through_last_ssh, upsert_connection_url_param, uses_bare_mysql_pool,
         uses_tcp_probe, validate_connection_url_params, validate_h2_database_path, AppState, MysqlMode, PoolKind,
-        TxnConnection, GAUSSDB_M_JDBC_DRIVER_CLASS, GAUSSDB_M_JDBC_DRIVER_PROFILE, PRESTOSQL_JDBC_DRIVER_CLASS,
+        TxnConnection, CLOUDFLARE_D1_LOCAL_PORT_ERROR, GAUSSDB_M_JDBC_DRIVER_CLASS, GAUSSDB_M_JDBC_DRIVER_PROFILE,
+        PRESTOSQL_JDBC_DRIVER_CLASS,
     };
     use crate::agent_connection::{
         agent_connect_params, mongo_legacy_error_with_auth_hint, mongo_uses_legacy_driver,
@@ -9069,6 +9283,664 @@ mod tests {
     }
 
     #[test]
+    fn primary_tunnel_fixed_local_port_applies_only_to_the_primary_ssh_tunnel() {
+        let ssh = |port: Option<u16>, profile_id: &str| {
+            let mut layer = ssh_layer("ssh", profile_id);
+            layer.local_port = port;
+            TransportLayerConfig::Ssh(layer)
+        };
+        let proxy = || TransportLayerConfig::Proxy(proxy_layer("proxy", ""));
+        let config = |id: &str, one_time: bool, redis_mode: Option<&str>| {
+            let mut config = mysql_config(None);
+            config.id = id.to_string();
+            config.one_time = one_time;
+            if let Some(mode) = redis_mode {
+                config.db_type = DatabaseType::Redis;
+                config.redis_connection_mode = Some(mode.to_string());
+            }
+            config
+        };
+
+        let cases = [
+            (
+                "last ssh layer with a port",
+                true,
+                "conn",
+                config("conn", false, None),
+                vec![ssh(Some(4059), "")],
+                Some(4059),
+            ),
+            (
+                "ssh after a proxy layer",
+                true,
+                "conn",
+                config("conn", false, None),
+                vec![proxy(), ssh(Some(4059), "")],
+                Some(4059),
+            ),
+            ("ssh without a port", true, "conn", config("conn", false, None), vec![ssh(None, "")], None),
+            ("port zero", true, "conn", config("conn", false, None), vec![ssh(Some(0), "")], None),
+            (
+                "proxy is the last layer",
+                true,
+                "conn",
+                config("conn", false, None),
+                vec![ssh(Some(4059), ""), proxy()],
+                None,
+            ),
+            (
+                "ssh is not the last ssh layer",
+                true,
+                "conn",
+                config("conn", false, None),
+                vec![ssh(Some(4059), ""), ssh(None, "")],
+                None,
+            ),
+            (
+                "layer references a tunnel profile",
+                true,
+                "conn",
+                config("conn", false, None),
+                vec![ssh(Some(4059), "shared")],
+                None,
+            ),
+            ("no transport layers", true, "conn", config("conn", false, None), vec![], None),
+            ("flag off", false, "conn", config("conn", false, None), vec![ssh(Some(4059), "")], None),
+            ("test connection id", true, "conn:test", config("conn", false, None), vec![ssh(Some(4059), "")], None),
+            (
+                "plugin action id",
+                true,
+                "conn:plugin-action:refresh",
+                config("conn", false, None),
+                vec![ssh(Some(4059), "")],
+                None,
+            ),
+            (
+                "ssh test id",
+                true,
+                "__connection_ssh_test__:1",
+                config("conn", false, None),
+                vec![ssh(Some(4059), "")],
+                None,
+            ),
+            (
+                "temporary test probe",
+                true,
+                "__test_1",
+                config("__test_1", false, None),
+                vec![ssh(Some(4059), "")],
+                None,
+            ),
+            (
+                "visible database draft",
+                true,
+                "__visible_draft_1",
+                config("__visible_draft_1", false, None),
+                vec![ssh(Some(4059), "")],
+                None,
+            ),
+            (
+                "visible schema draft",
+                true,
+                "__visible_schema_draft_1",
+                config("__visible_schema_draft_1", false, None),
+                vec![ssh(Some(4059), "")],
+                None,
+            ),
+            ("one-time draft", true, "conn", config("conn", true, None), vec![ssh(Some(4059), "")], None),
+            (
+                "production database picker draft",
+                true,
+                "__production_database_draft_1",
+                config("__production_database_draft_1", true, None),
+                vec![ssh(Some(4059), "")],
+                None,
+            ),
+            ("redis cluster", true, "conn", config("conn", false, Some("cluster")), vec![ssh(Some(4059), "")], None),
+            ("redis sentinel", true, "conn", config("conn", false, Some("sentinel")), vec![ssh(Some(4059), "")], None),
+            (
+                "redis standalone",
+                true,
+                "conn",
+                config("conn", false, Some("standalone")),
+                vec![ssh(Some(4059), "")],
+                Some(4059),
+            ),
+        ];
+
+        for (label, honor, connection_id, config, layers, expected) in cases {
+            assert_eq!(primary_tunnel_fixed_local_port(honor, connection_id, &config, &layers), expected, "{label}");
+        }
+    }
+
+    #[test]
+    fn kafka_loopback_bootstrap_rejects_a_different_fixed_local_port() {
+        let ssh = |port: Option<u16>, profile_id: &str| {
+            let mut layer = ssh_layer("ssh", profile_id);
+            layer.local_port = port;
+            TransportLayerConfig::Ssh(layer)
+        };
+        let proxy = || TransportLayerConfig::Proxy(proxy_layer("proxy", ""));
+        let rejected = "Kafka with a single 127.0.0.1 bootstrap server listens on bootstrap port 9093; leave Local Port empty or set it to 9093.";
+
+        let cases = [
+            ("no local port", vec![ssh(None, "")], None),
+            ("local port equals the bootstrap port", vec![ssh(Some(9093), "")], None),
+            ("local port zero", vec![ssh(Some(0), "")], None),
+            ("local port differs", vec![ssh(Some(4059), "")], Some(rejected)),
+            ("local port differs behind a proxy", vec![proxy(), ssh(Some(4059), "")], Some(rejected)),
+            ("tunnel profile owns its own port", vec![ssh(Some(4059), "shared")], None),
+        ];
+
+        for (label, layers, expected) in cases {
+            assert_eq!(kafka_loopback_local_port_error(9093, &layers).as_deref(), expected, "{label}");
+        }
+    }
+
+    fn unsupported_local_port(kind: &str, route: &str) -> String {
+        format!(
+            "Local Port is not supported for {kind} connections because they connect through {route}; clear Local Port in the SSH layer."
+        )
+    }
+
+    fn ssh_layer_with_port(port: Option<u16>, profile_id: &str) -> TransportLayerConfig {
+        let mut layer = ssh_layer("ssh", profile_id);
+        layer.local_port = port;
+        TransportLayerConfig::Ssh(layer)
+    }
+
+    fn config_of_type(db_type: DatabaseType) -> ConnectionConfig {
+        let mut config = mysql_config(None);
+        config.db_type = db_type;
+        config
+    }
+
+    fn message_queue_config(system_kind: &str) -> ConnectionConfig {
+        let mut config = config_of_type(DatabaseType::MessageQueue);
+        config.external_config = Some(serde_json::json!({ "systemKind": system_kind }));
+        config
+    }
+
+    fn redis_config(mode: &str) -> ConnectionConfig {
+        let mut config = config_of_type(DatabaseType::Redis);
+        config.redis_connection_mode = Some(mode.to_string());
+        config
+    }
+
+    fn with_layers(mut config: ConnectionConfig, layers: Vec<TransportLayerConfig>) -> ConnectionConfig {
+        config.transport_layers = layers;
+        config
+    }
+
+    fn named_ssh_layer(name: &str, port: Option<u16>, enabled: bool) -> TransportLayerConfig {
+        let mut layer = ssh_layer("ssh", "");
+        layer.name = name.to_string();
+        layer.local_port = port;
+        layer.enabled = enabled;
+        TransportLayerConfig::Ssh(layer)
+    }
+
+    fn non_last_layer_local_port(layer: &str) -> String {
+        format!("Local Port only applies to the last enabled transport layer; clear it on SSH layer {layer}.")
+    }
+
+    #[test]
+    fn ssh_local_port_is_rejected_only_where_the_primary_path_cannot_bind_it() {
+        let ssh = |port: Option<u16>| ssh_layer_with_port(port, "");
+        let proxy = || TransportLayerConfig::Proxy(proxy_layer("proxy", ""));
+        let disabled_proxy = || {
+            let mut layer = proxy_layer("proxy", "");
+            layer.enabled = false;
+            TransportLayerConfig::Proxy(layer)
+        };
+        let single = |config: ConnectionConfig| with_layers(config, vec![ssh(Some(4059))]);
+        let unsupported = |kind: &str, route: &str| Some(unsupported_local_port(kind, route));
+        let non_last = |layer: &str| Some(non_last_layer_local_port(layer));
+        let mut rocketmq_by_profile = config_of_type(DatabaseType::MessageQueue);
+        rocketmq_by_profile.driver_profile = Some("rocketmq".to_string());
+        let mut kafka_loopback = message_queue_config("kafka");
+        kafka_loopback.external_config = Some(serde_json::json!({
+            "systemKind": "kafka",
+            "extra": { "bootstrapServers": "127.0.0.1:9093" }
+        }));
+
+        let cases = [
+            ("mysql", single(config_of_type(DatabaseType::Mysql)), None, None),
+            ("postgres", single(config_of_type(DatabaseType::Postgres)), None, None),
+            ("mongodb", single(config_of_type(DatabaseType::MongoDb)), None, None),
+            ("elasticsearch", single(config_of_type(DatabaseType::Elasticsearch)), None, None),
+            ("jdbc", single(config_of_type(DatabaseType::Jdbc)), None, None),
+            ("agent driver", single(config_of_type(DatabaseType::Oracle)), None, None),
+            ("nacos", single(config_of_type(DatabaseType::Nacos)), None, None),
+            ("redis standalone", single(redis_config("standalone")), None, None),
+            ("redis without a mode", single(config_of_type(DatabaseType::Redis)), None, None),
+            ("plugin without proxy_route", single(config_of_type(DatabaseType::Plugin)), None, None),
+            ("kafka", single(message_queue_config("kafka")), None, None),
+            ("kafka loopback bootstrap keeps its own rule", single(kafka_loopback), None, None),
+            ("rabbitmq", single(message_queue_config("rabbitmq")), None, None),
+            ("pulsar", single(message_queue_config("pulsar")), None, None),
+            (
+                "ssh after a proxy layer",
+                with_layers(config_of_type(DatabaseType::Mysql), vec![proxy(), ssh(Some(4059))]),
+                None,
+                None,
+            ),
+            (
+                "sqlite",
+                single(config_of_type(DatabaseType::Sqlite)),
+                None,
+                unsupported("SQLite", "a remote worker over SSH"),
+            ),
+            (
+                "clickhouse",
+                single(config_of_type(DatabaseType::ClickHouse)),
+                None,
+                unsupported("ClickHouse", "a SOCKS5 route"),
+            ),
+            (
+                "cloudflare d1",
+                single(config_of_type(DatabaseType::CloudflareD1)),
+                None,
+                Some(CLOUDFLARE_D1_LOCAL_PORT_ERROR.to_string()),
+            ),
+            ("turso", single(config_of_type(DatabaseType::Turso)), None, unsupported("Turso", "a SOCKS5 route")),
+            ("rocketmq", single(message_queue_config("rocketmq")), None, unsupported("RocketMQ", "a SOCKS5 route")),
+            (
+                "rocketmq named by the driver profile",
+                single(rocketmq_by_profile),
+                None,
+                unsupported("RocketMQ", "a SOCKS5 route"),
+            ),
+            ("redis cluster", single(redis_config("cluster")), None, unsupported("Redis Cluster", "per-node tunnels")),
+            (
+                "redis cluster in another case",
+                single(redis_config("Cluster")),
+                None,
+                unsupported("Redis Cluster", "per-node tunnels"),
+            ),
+            (
+                "redis sentinel",
+                single(redis_config("sentinel")),
+                None,
+                unsupported("Redis Sentinel", "per-node tunnels"),
+            ),
+            (
+                "plugin with proxy_route is named by its provider label",
+                single(config_of_type(DatabaseType::Plugin)),
+                Some("Acme Kafka"),
+                unsupported("Acme Kafka", "a SOCKS5 route"),
+            ),
+            (
+                "plugin with proxy_route and a blank label",
+                single(config_of_type(DatabaseType::Plugin)),
+                Some("  "),
+                unsupported("this plugin's", "a SOCKS5 route"),
+            ),
+            (
+                "proxy_route is ignored for other kinds",
+                single(config_of_type(DatabaseType::Mysql)),
+                Some("Acme Kafka"),
+                None,
+            ),
+            (
+                "unsupported kind without a port",
+                with_layers(config_of_type(DatabaseType::Sqlite), vec![ssh(None)]),
+                None,
+                None,
+            ),
+            (
+                "unsupported kind with port zero",
+                with_layers(config_of_type(DatabaseType::ClickHouse), vec![ssh(Some(0))]),
+                None,
+                None,
+            ),
+            (
+                "unsupported kind with a tunnel profile layer",
+                with_layers(config_of_type(DatabaseType::Sqlite), vec![ssh_layer_with_port(Some(4059), "shared")]),
+                None,
+                None,
+            ),
+            ("unsupported kind without layers", config_of_type(DatabaseType::Sqlite), None, None),
+            (
+                "unsupported kind behind a proxy layer",
+                with_layers(config_of_type(DatabaseType::ClickHouse), vec![proxy(), ssh(Some(4059))]),
+                None,
+                unsupported("ClickHouse", "a SOCKS5 route"),
+            ),
+            (
+                "unsupported kind with a disabled layer after the port",
+                with_layers(
+                    config_of_type(DatabaseType::ClickHouse),
+                    vec![ssh(Some(4059)), named_ssh_layer("", None, false)],
+                ),
+                None,
+                unsupported("ClickHouse", "a SOCKS5 route"),
+            ),
+            (
+                "ssh before the last layer",
+                with_layers(config_of_type(DatabaseType::Mysql), vec![ssh(Some(4059)), ssh(None)]),
+                None,
+                non_last("1"),
+            ),
+            (
+                "ssh before a proxy layer",
+                with_layers(config_of_type(DatabaseType::Mysql), vec![ssh(Some(4059)), proxy()]),
+                None,
+                non_last("1"),
+            ),
+            (
+                "the second of three layers",
+                with_layers(config_of_type(DatabaseType::Mysql), vec![ssh(None), ssh(Some(4059)), proxy()]),
+                None,
+                non_last("2"),
+            ),
+            (
+                "a disabled layer before it still counts toward its position",
+                with_layers(
+                    config_of_type(DatabaseType::Mysql),
+                    vec![disabled_proxy(), named_ssh_layer("", Some(4059), true), ssh(None)],
+                ),
+                None,
+                non_last("2"),
+            ),
+            (
+                "several disabled layers before it",
+                with_layers(
+                    config_of_type(DatabaseType::Mysql),
+                    vec![
+                        disabled_proxy(),
+                        named_ssh_layer("", None, false),
+                        named_ssh_layer("", Some(4059), true),
+                        proxy(),
+                    ],
+                ),
+                None,
+                non_last("3"),
+            ),
+            (
+                "a disabled layer between the port and the last layer",
+                with_layers(
+                    config_of_type(DatabaseType::Mysql),
+                    vec![named_ssh_layer("", Some(4059), true), disabled_proxy(), ssh(None)],
+                ),
+                None,
+                non_last("1"),
+            ),
+            (
+                "the layer name is used when set",
+                with_layers(
+                    config_of_type(DatabaseType::Mysql),
+                    vec![disabled_proxy(), named_ssh_layer(" Bastion ", Some(4059), true), ssh(None)],
+                ),
+                None,
+                non_last("Bastion"),
+            ),
+            (
+                "a blank layer name falls back to the position",
+                with_layers(
+                    config_of_type(DatabaseType::Mysql),
+                    vec![named_ssh_layer("   ", Some(4059), true), ssh(None)],
+                ),
+                None,
+                non_last("1"),
+            ),
+            (
+                "the last layer owns the port",
+                with_layers(config_of_type(DatabaseType::Mysql), vec![ssh(None), ssh(Some(4059))]),
+                None,
+                None,
+            ),
+            (
+                "an earlier port is reported before an unsupported kind",
+                with_layers(config_of_type(DatabaseType::ClickHouse), vec![ssh(Some(4059)), proxy()]),
+                None,
+                non_last("1"),
+            ),
+            (
+                "a profile layer before the last layer is ignored",
+                with_layers(
+                    config_of_type(DatabaseType::Mysql),
+                    vec![ssh_layer_with_port(Some(4059), "shared"), ssh(None)],
+                ),
+                None,
+                None,
+            ),
+            (
+                "port zero before the last layer is ignored",
+                with_layers(config_of_type(DatabaseType::Mysql), vec![ssh(Some(0)), ssh(None)]),
+                None,
+                None,
+            ),
+        ];
+
+        for (label, config, plugin_proxy_route, expected) in cases {
+            let layers = config.effective_transport_layers();
+            assert_eq!(ssh_local_port_config_error(&config, &layers, plugin_proxy_route).err(), expected, "{label}");
+        }
+        assert!(kafka_loopback_local_port_error(9093, &[ssh(Some(4059))]).is_some());
+    }
+
+    #[test]
+    fn ssh_local_port_is_rejected_for_exactly_the_connection_types_without_a_static_tunnel() {
+        let layers = [ssh_layer_with_port(Some(4059), "")];
+        let rejected =
+            [DatabaseType::Sqlite, DatabaseType::ClickHouse, DatabaseType::CloudflareD1, DatabaseType::Turso];
+
+        for db_type in DatabaseType::ALL {
+            let result = ssh_local_port_config_error(&config_of_type(*db_type), &layers, None);
+            assert_eq!(result.is_err(), rejected.contains(db_type), "{db_type:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_endpoint_binds_the_fixed_ssh_local_port_only_for_opted_in_primary_tunnels() {
+        let (state, dir) = test_app_state().await;
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let fixed_port = held.local_addr().unwrap().port();
+        let mut config = mysql_config(None);
+        config.transport_layers = vec![unreachable_ssh_layer(fixed_port)];
+        let bind_error = format!("Failed to bind requested local port {fixed_port}");
+
+        // A fresh state, like the one every scheduled backup job builds, keeps random ports.
+        let fresh = state.connection_host_port(&config.id, &config).await.unwrap_err();
+        assert!(!fresh.contains(&bind_error), "{fresh}");
+
+        state.set_honor_fixed_ssh_local_ports(true);
+        let primary = state.connection_host_port(&config.id, &config).await.unwrap_err();
+        assert!(primary.contains(&bind_error), "{primary}");
+
+        let probe_id = format!("{}:test", config.id);
+        let probe = state.connection_host_port(&probe_id, &config).await.unwrap_err();
+        assert!(!probe.contains(&bind_error), "{probe}");
+
+        let mut draft = config.clone();
+        draft.id = "__production_database_draft_1".to_string();
+        draft.one_time = true;
+        let draft_error = state.connection_host_port(&draft.id, &draft).await.unwrap_err();
+        assert!(!draft_error.contains(&bind_error), "{draft_error}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn connection_endpoint_rejects_a_fixed_ssh_local_port_its_primary_path_cannot_bind() {
+        let (state, dir) = test_app_state().await;
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let fixed_port = held.local_addr().unwrap().port();
+        let bind_error = format!("Failed to bind requested local port {fixed_port}");
+        let last = |config: ConnectionConfig| with_layers(config, vec![unreachable_ssh_layer(fixed_port)]);
+        let mut disabled = proxy_layer("proxy-off", "");
+        disabled.enabled = false;
+        let before_the_last_layer = with_layers(
+            config_of_type(DatabaseType::Mysql),
+            vec![
+                TransportLayerConfig::Proxy(disabled),
+                unreachable_ssh_layer(fixed_port),
+                TransportLayerConfig::Proxy(proxy_layer("proxy", "")),
+            ],
+        );
+        let rejected = [
+            (
+                "sqlite",
+                last(config_of_type(DatabaseType::Sqlite)),
+                unsupported_local_port("SQLite", "a remote worker over SSH"),
+            ),
+            (
+                "clickhouse",
+                last(config_of_type(DatabaseType::ClickHouse)),
+                unsupported_local_port("ClickHouse", "a SOCKS5 route"),
+            ),
+            ("turso", last(config_of_type(DatabaseType::Turso)), unsupported_local_port("Turso", "a SOCKS5 route")),
+            (
+                "cloudflare d1",
+                last(config_of_type(DatabaseType::CloudflareD1)),
+                CLOUDFLARE_D1_LOCAL_PORT_ERROR.to_string(),
+            ),
+            (
+                "redis cluster",
+                last(redis_config("cluster")),
+                unsupported_local_port("Redis Cluster", "per-node tunnels"),
+            ),
+            (
+                "redis sentinel",
+                last(redis_config("sentinel")),
+                unsupported_local_port("Redis Sentinel", "per-node tunnels"),
+            ),
+            ("an earlier layer, after a disabled one", before_the_last_layer, non_last_layer_local_port("2")),
+        ];
+
+        // The error describes the config, so it must not depend on the runtime opting in to fixed ports.
+        for honor in [false, true] {
+            state.set_honor_fixed_ssh_local_ports(honor);
+            for (label, config, expected) in rejected.iter().cloned() {
+                let mut draft = config.clone();
+                draft.id = "__production_database_draft_1".to_string();
+                draft.one_time = true;
+                let test_id = format!("{}:test", config.id);
+                for (id, config) in [(config.id.clone(), &config), (test_id, &config), (draft.id.clone(), &draft)] {
+                    let error = state.connection_host_port(&id, config).await.unwrap_err();
+                    assert_eq!(error, expected, "{label} honor={honor} id={id}");
+                }
+            }
+
+            let supported = last(config_of_type(DatabaseType::Mysql));
+            let primary = state.connection_host_port(&supported.id, &supported).await.unwrap_err();
+            assert!(!primary.contains("Local Port"), "honor={honor}: {primary}");
+            assert_eq!(primary.contains(&bind_error), honor, "honor={honor}: {primary}");
+            let probe = state.connection_host_port("conn:test", &supported).await.unwrap_err();
+            assert!(!probe.contains("Local Port") && !probe.contains(&bind_error), "{probe}");
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn rocketmq_rejects_a_fixed_ssh_local_port_before_opening_any_tunnel() {
+        let (state, dir) = test_app_state().await;
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut config = message_queue_config("rocketmq");
+        config.id = "fixed-rocketmq".to_string();
+        config.host = "172.19.191.166".to_string();
+        config.port = 9876;
+        config.external_config = Some(serde_json::json!({
+            "systemKind": "rocketmq",
+            "adminUrl": "",
+            "auth": { "kind": "none" },
+            "extra": { "namesrvAddr": "172.19.191.166:9876" }
+        }));
+        config.transport_layers = vec![unreachable_ssh_layer(held.local_addr().unwrap().port())];
+        let expected = unsupported_local_port("RocketMQ", "a SOCKS5 route");
+
+        for honor in [false, true] {
+            state.set_honor_fixed_ssh_local_ports(honor);
+            for id in [config.id.clone(), format!("{}:test", config.id)] {
+                let endpoint = state.connection_host_port(&id, &config).await.unwrap_err();
+                assert_eq!(endpoint, expected, "endpoint honor={honor} id={id}");
+                let admin = state.mq_admin_config_for_connection(&id, &config).await.unwrap_err();
+                assert_eq!(admin, expected, "admin honor={honor} id={id}");
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_endpoint_rejects_a_fixed_ssh_local_port_only_for_proxy_route_providers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let plugins = [
+            ("sample.routed", "Routed Sample", Some("Acme Kafka"), true),
+            ("sample.unlabelled", "Unlabelled Sample", None, true),
+            ("sample.static", "Static Sample", Some("Static Label"), false),
+        ];
+        for (plugin_id, name, provider_label, proxy_route) in plugins {
+            let plugin_dir = dir.path().join("plugins").join(plugin_id);
+            std::fs::create_dir_all(&plugin_dir).unwrap();
+            let script = plugin_dir.join("plugin.sh");
+            std::fs::write(&script, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut provider = serde_json::json!({
+                "type": "connection-provider",
+                "id": "sample.connection",
+                "database_type": "sample",
+                "capabilities": ["connect"],
+                "proxy_route": proxy_route
+            });
+            if let Some(label) = provider_label {
+                provider["label"] = serde_json::json!(label);
+            }
+            std::fs::write(
+                plugin_dir.join("manifest.json"),
+                serde_json::json!({
+                    "manifest_version": 1,
+                    "id": plugin_id,
+                    "name": name,
+                    "version": "1.0.0",
+                    "publisher": "sample",
+                    "engines": { "dbx": ">=0.1.0", "host_api": "^1.0" },
+                    "entrypoints": { "backend": {
+                        "protocol_versions": [1],
+                        "transport": "stdio-jsonl",
+                        "executable": "plugin.sh"
+                    } },
+                    "contributions": [provider]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+        let storage = crate::persistence::test_storage::open(&dir.path().join("storage.db")).await.unwrap();
+        let state = AppState::new_with_plugin_dir(storage, dir.path().join("plugins"));
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+
+        for (plugin_id, expected_label) in [
+            ("sample.routed", Some("Acme Kafka")),
+            ("sample.unlabelled", Some("Unlabelled Sample")),
+            ("sample.static", None),
+        ] {
+            let mut config = config_of_type(DatabaseType::Plugin);
+            config.plugin_id = Some(plugin_id.to_string());
+            config.plugin_connection_provider = Some("sample.connection".to_string());
+            config.plugin_connection_type = Some("sample".to_string());
+            config.transport_layers = vec![unreachable_ssh_layer(held.local_addr().unwrap().port())];
+            let expected = expected_label.map(|label| unsupported_local_port(label, "a SOCKS5 route"));
+            for honor in [false, true] {
+                state.set_honor_fixed_ssh_local_ports(honor);
+                for id in [config.id.clone(), format!("{}:test", config.id)] {
+                    let error = state.plugin_connection_endpoint(&id, &config).await.unwrap_err();
+                    match &expected {
+                        Some(expected) => assert_eq!(&error, expected, "{plugin_id} honor={honor} id={id}"),
+                        None => assert!(!error.contains("Local Port"), "{plugin_id} honor={honor} id={id}: {error}"),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn ssh_tunnel_test_rejects_chain_without_ssh() {
         let layers = vec![TransportLayerConfig::Proxy(ProxyTunnelConfig {
             id: "proxy".to_string(),
@@ -9124,6 +9996,7 @@ mod tests {
             key_passphrase: String::new(),
             connect_timeout_secs: 5,
             expose_lan: false,
+            local_port: None,
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
             ssh_agent_key_fingerprint: String::new(),
@@ -9456,9 +10329,11 @@ sleep 30
             "0.0.0-test",
         );
 
-        let env = state.external_driver_runtime_env("jdbc").unwrap();
-
-        assert_eq!(env.get("DBX_JAVA_BIN"), None);
+        // The fallback validates this machine's JAVA_HOME / PATH Java, which may be older than 21.
+        match state.external_driver_runtime_env("jdbc") {
+            Ok(env) => assert_eq!(env.get("DBX_JAVA_BIN"), None),
+            Err(error) => assert!(error.starts_with("Agent requires Java 21"), "unexpected error: {error}"),
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -12037,6 +12912,7 @@ for line in sys.stdin:
             key_passphrase: String::new(),
             connect_timeout_secs: 5,
             expose_lan: false,
+            local_port: None,
             use_ssh_agent: false,
             ssh_agent_sock_path: String::new(),
             ssh_agent_key_fingerprint: String::new(),
@@ -12045,6 +12921,20 @@ for line in sys.stdin:
             proxy_command: String::new(),
             profile_id: profile_id.to_string(),
         }
+    }
+
+    /// SSH layer that asks for `local_port` but points at a closed SSH port, so a
+    /// connect attempt fails right after (or instead of) binding the local port.
+    fn unreachable_ssh_layer(local_port: u16) -> TransportLayerConfig {
+        let closed_port = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let mut ssh = ssh_layer("ssh-1", "");
+        ssh.host = "127.0.0.1".to_string();
+        ssh.port = closed_port;
+        ssh.user = "user".to_string();
+        ssh.auth_method = "none".to_string();
+        ssh.connect_timeout_secs = 2;
+        ssh.local_port = Some(local_port);
+        TransportLayerConfig::Ssh(ssh)
     }
 
     fn proxy_layer(id: &str, profile_id: &str) -> ProxyTunnelConfig {
@@ -12617,6 +13507,79 @@ for line in sys.stdin:
         assert_ne!(amqp_override.port, management_override.port);
 
         state.reset_connection_transport_for_config("proxied-rabbitmq-custom-ports", &config).await;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn rabbitmq_amqp_tunnel_binds_the_fixed_ssh_local_port_for_the_primary_connection_only() {
+        let (state, dir) = test_app_state().await;
+        state.set_honor_fixed_ssh_local_ports(true);
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let fixed_port = held.local_addr().unwrap().port();
+        let mut config = mysql_config(None);
+        config.id = "fixed-rabbitmq".to_string();
+        config.db_type = DatabaseType::MessageQueue;
+        config.host = "rabbit.internal".to_string();
+        config.port = 5672;
+        config.external_config = Some(serde_json::json!({
+            "systemKind": "rabbitmq",
+            "adminUrl": "http://management.internal:15672/rmq",
+            "auth": { "kind": "none" },
+            "extra": { "addresses": "rabbit.internal:5672", "virtualHost": "/" }
+        }));
+        config.transport_layers = vec![unreachable_ssh_layer(fixed_port)];
+        let bind_error = format!("Failed to bind requested local port {fixed_port}");
+
+        let primary = state.mq_admin_config_for_connection(&config.id, &config).await.unwrap_err();
+        assert!(primary.contains(&bind_error), "{primary}");
+
+        let probe = state.mq_admin_config_for_connection("fixed-rabbitmq:test", &config).await.unwrap_err();
+        assert!(!probe.contains(&bind_error), "{probe}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "mq-admin")]
+    #[tokio::test]
+    async fn kafka_loopback_bootstrap_over_ssh_keeps_the_bootstrap_port_instead_of_the_fixed_local_port() {
+        let (state, dir) = test_app_state().await;
+        state.set_honor_fixed_ssh_local_ports(true);
+        let bootstrap = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let bootstrap_port = bootstrap.local_addr().unwrap().port();
+        let other = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let other_port = other.local_addr().unwrap().port();
+        let rejected = format!(
+            "Kafka with a single 127.0.0.1 bootstrap server listens on bootstrap port {bootstrap_port}; leave Local Port empty or set it to {bootstrap_port}."
+        );
+
+        for (label, local_port, expect_rejected) in
+            [("same as the bootstrap port", bootstrap_port, false), ("different from it", other_port, true)]
+        {
+            let mut config = mysql_config(None);
+            config.id = "fixed-kafka".to_string();
+            config.db_type = DatabaseType::MessageQueue;
+            config.host = String::new();
+            config.port = 0;
+            config.external_config = Some(serde_json::json!({
+                "systemKind": "kafka",
+                "adminUrl": "",
+                "auth": { "kind": "none" },
+                "extra": { "bootstrapServers": format!("127.0.0.1:{bootstrap_port}") }
+            }));
+            config.transport_layers = vec![unreachable_ssh_layer(local_port)];
+            let bind_error = format!("Failed to bind requested local port {local_port}");
+
+            let endpoint = state.connection_host_port(&config.id, &config).await.unwrap_err();
+            assert_eq!(endpoint == rejected, expect_rejected, "{label}: {endpoint}");
+            assert!(!endpoint.contains(&bind_error), "{label}: {endpoint}");
+
+            if expect_rejected {
+                let admin = state.mq_admin_config_for_connection(&config.id, &config).await.unwrap_err();
+                assert_eq!(admin, rejected, "{label}");
+            }
+        }
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -31,7 +31,7 @@ import { ensureReadOnlyWriteAccess } from "@/lib/database/readOnlyWriteAccess";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import * as api from "@/lib/backend/api";
 import type { TransferColumnNameCase, TransferContent, TransferObjectKind, TransferTableNameCase } from "@/lib/backend/api";
-import { crossFamilyTransferableKinds, isSameTransferFamily, isTransferPairSupported, transferObjectFamily, transferObjectKindsForDatabase } from "@/lib/database/transferObjectKinds";
+import { crossFamilyTransferableKinds, isSameTransferFamily, isTransferPairSupported, transferObjectFamily, transferObjectKindsForDatabase, transferSchemasForDatabase } from "@/lib/database/transferObjectKinds";
 import ObjectSelectionTree from "@/components/transfer/ObjectSelectionTree.vue";
 import TransferTaskTree from "@/components/transfer/TransferTaskTree.vue";
 import DataTransferProgressDialog from "@/components/transfer/DataTransferProgressDialog.vue";
@@ -116,14 +116,16 @@ const selectedTables = computed(() => new Set(selectedObjects.value.TABLE ?? [])
 const selectedTableList = computed(() => [...selectedTables.value]);
 
 const OBJECT_KIND_LABEL_KEY: Record<TransferObjectKind, string> = {
-  TABLE: "objectTypeTable",
-  VIEW: "objectTypeView",
-  MATERIALIZED_VIEW: "objectTypeMaterializedView",
-  PROCEDURE: "objectTypeProcedure",
-  FUNCTION: "objectTypeFunction",
-  TRIGGER: "objectTypeTrigger",
-  SEQUENCE: "objectTypeSequence",
-  EVENT: "objectTypeEvent",
+  TABLE: "transfer.objectTypeTable",
+  VIEW: "transfer.objectTypeView",
+  MATERIALIZED_VIEW: "transfer.objectTypeMaterializedView",
+  PROCEDURE: "transfer.objectTypeProcedure",
+  FUNCTION: "transfer.objectTypeFunction",
+  TRIGGER: "transfer.objectTypeTrigger",
+  SEQUENCE: "transfer.objectTypeSequence",
+  EVENT: "transfer.objectTypeEvent",
+  PACKAGE: "tree.packages",
+  SYNONYM: "tree.synonyms",
 };
 
 const treeSelection = computed<Record<string, string[]>>({
@@ -140,7 +142,7 @@ const treeSelection = computed<Record<string, string[]>>({
 const treeGroups = computed(() =>
   (Object.keys(objectGroups.value) as TransferObjectKind[]).map((kind) => ({
     kind,
-    label: t(`transfer.${OBJECT_KIND_LABEL_KEY[kind]}`),
+    label: t(OBJECT_KIND_LABEL_KEY[kind]),
     items: objectGroups.value[kind] ?? [],
   })),
 );
@@ -154,6 +156,17 @@ const treeDisabledGroups = computed<TransferObjectKind[]>(() => {
   const targetConfig = store.getConfig(targetConnectionId.value);
   const allowed = crossFamilyTransferableKinds(transferDatabaseTypeForConnection(sourceConfig), transferDatabaseTypeForConnection(targetConfig));
   return presentKinds.filter((k) => k !== "TABLE" && !allowed.includes(k));
+});
+
+const objectSelectionSummary = computed(() => {
+  if (transferDatabaseTypeForConnection(store.getConfig(sourceConnectionId.value)) !== "xugu") {
+    return { selected: selectedTables.value.size, total: objectGroups.value.TABLE?.length ?? 0 };
+  }
+  const enabled = treeGroups.value.filter((group) => !treeDisabledGroups.value.includes(group.kind));
+  return {
+    selected: enabled.reduce((count, group) => count + group.items.filter((name) => selectedObjects.value[group.kind]?.has(name)).length, 0),
+    total: enabled.reduce((count, group) => count + group.items.length, 0),
+  };
 });
 
 const treeDisabledHints = computed<Record<string, string>>(() => {
@@ -505,7 +518,7 @@ async function loadSchemas(connectionId: string, database: string, side: "source
     return;
   }
   try {
-    const schemas = await api.listSchemas(connectionId, database);
+    const schemas = transferSchemasForDatabase(transferDatabaseTypeForConnection(store.getConfig(connectionId)), await api.listSchemas(connectionId, database));
     if (isStale()) return;
     const selected = preferredSchema && schemas.includes(preferredSchema) ? preferredSchema : schemas.includes("public") ? "public" : (schemas[0] ?? "");
     if (side === "source") {
@@ -593,6 +606,7 @@ async function loadObjects(isCancelled: () => boolean = () => false) {
     const schema = needsSchema && schemaValue ? schemaValue : database;
     const kinds = transferObjectKindsForDatabase(transferDatabaseTypeForConnection(config));
     const groups: Partial<Record<TransferObjectKind, string[]>> = {};
+    const xuguLoadFailures: string[] = [];
     for (const kind of kinds) {
       try {
         if (kind === "TABLE") {
@@ -602,11 +616,13 @@ async function loadObjects(isCancelled: () => boolean = () => false) {
           const objects = await api.listObjects(connectionId, database, schema, [kind], undefined, undefined, undefined, catalog);
           groups[kind] = objects.map((o) => o.name);
         }
-      } catch {
+      } catch (error) {
         groups[kind] = [];
+        if (transferDatabaseTypeForConnection(config) === "xugu") xuguLoadFailures.push(`${kind}: ${String(error)}`);
       }
     }
     if (isStale()) return;
+    if (xuguLoadFailures.length) toast(xuguLoadFailures.join("\n"), 8000);
     objectGroups.value = groups;
     applyPendingTableSelection();
     applyPendingObjectSelection();
@@ -1553,7 +1569,7 @@ async function saveConfigTask() {
               <div class="flex items-center justify-between">
                 <div class="text-xs font-medium text-muted-foreground uppercase tracking-wider">
                   {{ t("transfer.objects") }}
-                  <span v-if="objectGroups.TABLE?.length" class="text-muted-foreground/60">({{ selectedTables.size }}/{{ objectGroups.TABLE.length }})</span>
+                  <span v-if="objectSelectionSummary.total" class="text-muted-foreground/60">({{ objectSelectionSummary.selected }}/{{ objectSelectionSummary.total }})</span>
                 </div>
               </div>
 

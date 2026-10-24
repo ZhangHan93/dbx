@@ -3491,30 +3491,39 @@ where
         Err(error) if !is_redis_out_of_bounds_error(&error) => Err(error),
         // The server refuses to clamp the window, so the value length
         // decides where a window may end.
-        Err(_) => read_string_preview_by_length(con, key, preview_limit_bytes).await,
+        Err(rejected) => read_string_preview_by_length(con, key, preview_limit_bytes, rejected).await,
     }
 }
 
 /// Read a Redis string in windows that never reach past the value.
 ///
-/// The value length decides where a window may end, so the same rejection
-/// cannot come back — unless the value shrinks between the length read and
-/// the window read, which is retried against the fresh length.
+/// `rejected` is the error the optimistic window produced. The value length
+/// decides where a window may end, so the same rejection cannot come back —
+/// unless the value shrinks between the length read and the window read,
+/// which is retried against the fresh length.
+///
+/// Without a length there is no bounded window to fall back to, and asking
+/// for the rejected window again would only repeat the same failure.
 async fn read_string_preview_by_length<C>(
     con: &mut C,
     key: &[u8],
     preview_limit_bytes: usize,
+    rejected: String,
 ) -> Result<(Vec<u8>, Option<u64>, bool), String>
 where
     C: ConnectionLike + Send + Sync + Unpin,
 {
-    let known_length = redis_string_length(con, key).await;
-    match read_string_windows(con, key, preview_limit_bytes, known_length).await {
+    let Some(known_length) = redis_string_length(con, key).await else {
+        return Err(rejected);
+    };
+    match read_string_windows(con, key, preview_limit_bytes, Some(known_length)).await {
         Ok(result) => Ok(result),
         Err(error) if is_redis_out_of_bounds_error(&error) => {
             // The value shrank between the length read and the window read.
-            let known_length = redis_string_length(con, key).await;
-            read_string_windows(con, key, preview_limit_bytes, known_length).await
+            let Some(fresh_length) = redis_string_length(con, key).await else {
+                return Err(error);
+            };
+            read_string_windows(con, key, preview_limit_bytes, Some(fresh_length)).await
         }
         Err(error) => Err(error),
     }
@@ -8190,6 +8199,37 @@ mod tests {
             vec![("0".to_string(), "65535".to_string()), ("0".to_string(), "2".to_string())]
         );
         assert_eq!(con.command_count("GETRANGE"), 2);
+        assert_eq!(con.command_count("STRLEN"), 1);
+    }
+
+    #[tokio::test]
+    async fn string_value_fails_fast_when_a_strict_server_also_refuses_strlen() {
+        // The bounded fallback needs the value length. Without it the rejected
+        // window cannot be narrowed, so the read fails instead of asking for
+        // the same rejected window again.
+        let out_of_bounds = redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+            "ERR",
+            "0-65536 is out of bounds".to_string(),
+        ));
+        let denied = redis::RedisError::from((
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+            "ERR",
+            "NOPERM this user has no permissions to run the 'strlen' command".to_string(),
+        ));
+        let mut con = FakeRedisConnection::with_results(vec![
+            Ok(bulk("string")),
+            Ok(RedisRawValue::Int(-1)),
+            Err(out_of_bounds),
+            Err(denied),
+        ]);
+
+        let error = super::get_value(&mut con, b"message").await.unwrap_err();
+
+        assert!(error.contains("out of bounds"), "{error}");
+        // One rejected window and one length read; the rejected window is not
+        // requested again.
+        assert_eq!(con.command_count("GETRANGE"), 1);
         assert_eq!(con.command_count("STRLEN"), 1);
     }
 

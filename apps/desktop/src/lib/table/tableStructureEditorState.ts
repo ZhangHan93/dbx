@@ -1297,7 +1297,7 @@ export function sortStructureIndexColumnOptions<T extends { name: string }>(opti
 
 export function createIndexDrafts(indexes: IndexInfo[]): EditableStructureIndex[] {
   return indexes.map((index) => ({
-    id: `existing:${index.name}`,
+    id: index.owner == null ? `existing:${index.name}` : `existing-owned-index:${JSON.stringify([index.owner, index.name])}`,
     name: index.name,
     columns: [...index.columns],
     nameEdited: true,

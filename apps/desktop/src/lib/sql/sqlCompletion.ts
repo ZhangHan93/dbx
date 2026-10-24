@@ -1775,6 +1775,10 @@ export interface SqlCompletionContext {
   followingKeyword?: string;
   contextKind: SqlCompletionContextKind;
   dataTypeContext: boolean;
+  /** The cursor follows a complete FROM/JOIN table reference, where the next word is an alias or a clause keyword. */
+  afterTableReference?: boolean;
+  /** The cursor follows a complete `JOIN … ON` predicate, where a clause keyword is the next expected word. */
+  afterJoinCondition?: boolean;
 }
 
 const SQL_COMPLETION_CLOSING_QUOTES: Readonly<Record<string, SqlCompletionClosingQuote>> = {
@@ -3047,6 +3051,8 @@ export function getSqlCompletionContext(sql: string, cursor: number, options: Sq
     followingKeyword: getFollowingKeywordAfterCursor(sql, cursor, statementSpan.end),
     contextKind,
     dataTypeContext,
+    afterTableReference: !dataTypeContext && !qualifier && !exclusiveTableSuggestions && !suggestColumns && !insertInfo && isAfterSelectBodyExpression(beforeToken, options.databaseType),
+    afterJoinCondition: !dataTypeContext && !qualifier && !exclusiveTableSuggestions && !insertInfo && isAfterJoinOnCondition(beforeToken, options.databaseType),
   };
 }
 
@@ -3717,6 +3723,40 @@ function isAfterSelectBodyExpression(beforeToken: string, databaseType: Database
   const lastKeyword = /\b([A-Za-z_][\w$]*)\s*$/.exec(cleaned)?.[1]?.toLowerCase();
   if (lastKeyword && SELECT_BODY_INCOMPLETE_TAIL_KEYWORDS.has(lastKeyword)) return false;
   return true;
+}
+
+/**
+ * A complete `ON a = b` predicate also ends a condition where a clause keyword can
+ * come next. `isInColumnContext` treats the operators in that predicate as "a column
+ * goes here", which kept `suggestColumns` true and silenced the keyword ranking after
+ * `LEFT JOIN … ON …` (#13283).
+ */
+function isAfterJoinOnCondition(beforeToken: string, databaseType: DatabaseType | undefined): boolean {
+  const cleaned = maskSqlLiteralsAndComments(beforeToken, databaseType).trimEnd();
+  // Only SELECT/WITH statements: in `UPDATE … JOIN … ON …` a top-level ON also
+  // exists, but the boost is not wanted while SET assignments continue.
+  if (!/^\s*(select|with)\b/i.test(cleaned)) return false;
+  const lastOn = lastTopLevelKeywordIndex(cleaned, "on");
+  if (lastOn < 0) return false;
+  // Once a later clause boundary follows the join predicate, the cursor is in
+  // that clause (WHERE column, GROUP BY expression, LIMIT number, UNION branch),
+  // not at a clause-keyword position.
+  const lastClauseBoundary = Math.max(
+    lastTopLevelKeywordIndex(cleaned, "where"),
+    lastTopLevelKeywordIndex(cleaned, "group"),
+    lastTopLevelKeywordIndex(cleaned, "order"),
+    lastTopLevelKeywordIndex(cleaned, "having"),
+    lastTopLevelKeywordIndex(cleaned, "limit"),
+    lastTopLevelKeywordIndex(cleaned, "offset"),
+    lastTopLevelKeywordIndex(cleaned, "union"),
+    lastTopLevelKeywordIndex(cleaned, "intersect"),
+    lastTopLevelKeywordIndex(cleaned, "except"),
+  );
+  if (lastClauseBoundary > lastOn) return false;
+  const lastKeyword = /\b([A-Za-z_][\w$]*)\s*$/.exec(cleaned)?.[1]?.toLowerCase();
+  if (lastKeyword && CONDITION_INCOMPLETE_TAIL_KEYWORDS.has(lastKeyword)) return false;
+  if (lastKeyword && SELECT_BODY_INCOMPLETE_TAIL_KEYWORDS.has(lastKeyword) && !JOIN_MODIFIERS.has(lastKeyword)) return false;
+  return isExpressionTailComplete(cleaned);
 }
 
 const SELECT_BODY_INCOMPLETE_TAIL_KEYWORDS = new Set(["where", "and", "or", "not", "having", "group", "order", "by", "on", "is", "in", "like", "between", ...JOIN_MODIFIERS]);
@@ -6664,6 +6704,13 @@ function buildKeywordItems(prefix: string, context: SqlCompletionContext, databa
   const isDml = context.statementKind === "select" || context.statementKind === "insert" || context.statementKind === "update" || context.statementKind === "delete";
   const showDdl = !isDml || context.suggestTables || context.dataTypeContext;
   const functionSignatures = activeFunctionSignatures(databaseType, driverProfile);
+  // After `FROM t`, a routine name cannot come next, but a clause keyword can.
+  // Without this, initials and fuzzy matches on hundreds of procedures pushed
+  // WHERE out of the list for `wh`, `whe` and `wher` (#13120).
+  // `afterJoinCondition` implies a finished predicate, so `suggestColumns` being
+  // true there only reflects the `=` the predicate already used.
+  const clauseKeywordExpected = !!prefix && !context.suggestTables && (!!context.afterTableReference || !!context.afterJoinCondition);
+  const normalizedPrefix = prefix.toLowerCase();
 
   return activeSqlKeywords(databaseType, driverProfile)
     .filter((keyword) => {
@@ -6680,14 +6727,19 @@ function buildKeywordItems(prefix: string, context: SqlCompletionContext, databa
       const freqBoost = !context.dataTypeContext && HIGH_FREQUENCY_KEYWORDS.has(keyword) ? 100 : 0;
       const typeBoost = context.dataTypeContext && isDataType ? 2500 : 0;
       const followingBoost = context.followingKeyword && isPairPrefixKeywordForFollowing(keyword, context.followingKeyword) ? 1300 : 0;
+      const clauseBoost = clauseKeywordExpected && TABLE_REFERENCE_CLAUSE_KEYWORDS.has(keyword) && keyword.toLowerCase().startsWith(normalizedPrefix) ? TABLE_REFERENCE_CLAUSE_KEYWORD_BOOST : 0;
       return {
         label: applySqlKeywordCase(keyword, keywordCase),
         type: "keyword" as const,
         detail: isDataType ? "data type" : undefined,
-        boost: base + freqBoost + typeBoost + followingBoost,
+        boost: base + freqBoost + typeBoost + followingBoost + clauseBoost,
       };
     });
 }
+
+const TABLE_REFERENCE_CLAUSE_KEYWORDS = new Set(["WHERE", "GROUP", "GROUP BY", "ORDER", "ORDER BY", "HAVING", "UNION", "INTERSECT", "EXCEPT"]);
+// Enough to outrank a routine's initials match plus the procedure type boost.
+const TABLE_REFERENCE_CLAUSE_KEYWORD_BOOST = 3000;
 
 function shouldOfferKeywordPrefixContinuations(context: SqlCompletionContext, pendingJoinKeyword: boolean): boolean {
   return !!context.prefix && !pendingJoinKeyword && !context.qualifier && !context.exclusiveTableSuggestions && !context.exclusiveColumnSuggestions;

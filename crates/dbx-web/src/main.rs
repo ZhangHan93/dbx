@@ -569,6 +569,8 @@ async fn serve() -> Result<(), String> {
         ))
     };
 
+    app_state.set_honor_fixed_ssh_local_ports(true);
+
     // Password hash: env var takes priority, then database
     let password_disabled = std::env::var("DBX_DISABLE_PASSWORD")
         .map(|v| matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
@@ -789,6 +791,7 @@ async fn serve() -> Result<(), String> {
         .route("/schema/mysql/auto-increment", get(routes::schema::get_mysql_table_auto_increment))
         .route("/schema/schemas", get(routes::schema::list_schemas))
         .route("/schema/tables", get(routes::schema::list_tables))
+        .route("/schema/table-comment", get(routes::schema::get_table_comment))
         .route("/schema/objects", get(routes::schema::list_objects))
         .route("/schema/object-statistics", get(routes::schema::list_object_statistics))
         .route("/schema/completion-objects", get(routes::schema::list_completion_objects))
@@ -796,6 +799,13 @@ async fn serve() -> Result<(), String> {
         .route("/schema/object-source", get(routes::schema::get_object_source))
         .route("/schema/event-info", get(routes::schema::get_event_info))
         .route("/schema/custom-type-details", get(routes::schema::get_custom_type_details))
+        .route("/schema/oracle-type-data", post(routes::schema::verify_oracle_type_data))
+        .route("/schema/oracle-type-evolution", post(routes::schema::prepare_oracle_type_evolution))
+        .route(
+            "/schema/oracle-type-management-snapshot",
+            get(routes::schema::get_oracle_type_management_snapshot)
+                .post(routes::schema::read_oracle_type_management_snapshot),
+        )
         .route("/schema/columns", get(routes::schema::list_columns))
         .route("/plugin/table-metadata", post(routes::schema::get_plugin_table_metadata))
         .route("/schema/all-columns", get(routes::schema::get_all_columns))
@@ -813,6 +823,13 @@ async fn serve() -> Result<(), String> {
         .route("/schema/invalid-indexes", get(routes::schema::list_invalid_indexes))
         .route("/schema/subpartitions", get(routes::schema::list_subpartitions))
         .route("/schema/functions", get(routes::schema::list_functions))
+        .route("/schema/diff-routines", get(routes::schema::load_schema_diff_routines))
+        .route("/schema/routine-save", post(routes::schema::prepare_oracle_routine_save))
+        .route("/schema/routine-plan", post(routes::schema::prepare_oracle_routine_plan))
+        .route("/schema/routine-recovery", post(routes::schema::prepare_oracle_routine_recovery))
+        .route("/schema/routine-execute", post(routes::schema::execute_oracle_routine_operation))
+        .route("/schema/routine-operation", get(routes::schema::observe_oracle_routine_operation))
+        .route("/schema/routine-operation-references", post(routes::schema::update_oracle_routine_operation_references))
         .route("/schema/sequences", get(routes::schema::list_sequences))
         .route("/schema/rules", get(routes::schema::list_rules))
         .route("/schema/owners", get(routes::schema::list_owners))
@@ -890,6 +907,7 @@ async fn serve() -> Result<(), String> {
         .route("/query/build-drop-schema-sql", post(routes::query::build_drop_schema_sql))
         .route("/query/build-duplicate-table-structure-sql", post(routes::query::build_duplicate_table_structure_sql))
         .route("/query/build-copy-table-data-sql", post(routes::query::build_copy_table_data_sql))
+        .route("/query/build-oracle-type-management-sql", post(routes::query::build_oracle_type_management_sql))
         .route(
             "/query/build-executable-object-source-statements",
             post(routes::query::build_executable_object_source_statements),

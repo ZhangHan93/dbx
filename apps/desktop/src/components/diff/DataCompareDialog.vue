@@ -1,5 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, ref, shallowRef, watch } from "vue";
+import { DynamicScroller, DynamicScrollerItem } from "vue-virtual-scroller";
+import { createBoundedTextPreview } from "@/lib/common/boundedTextPreview";
+import { countCompareSelection, isCompareRowSelected, setCompareSelection, toggleCompareSelection } from "@/lib/dataGrid/dataCompareSelection";
 import { useI18n } from "vue-i18n";
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -13,7 +16,7 @@ import { useToast } from "@/composables/useToast";
 import { databaseOptionsForConnection, fetchNamespaceOptionsForConnection } from "@/composables/useDatabaseOptions";
 import { isSchemaAware } from "@/lib/database/databaseCapabilities";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { inferCompareKeyColumns, normalizeKeyColumns, sameKeyColumns, type CompareKeyColumnOption, type DataCompareCellValue, type DataCompareSyncPlan } from "@/lib/dataGrid/dataCompare";
+import { inferCompareKeyColumns, normalizeKeyColumns, sameKeyColumns, type CompareKeyColumnOption, type DataCompareCellValue, type DataCompareRow, type DataCompareModifiedRow, type DataCompareSyncPlan } from "@/lib/dataGrid/dataCompare";
 import {
   buildDataCompareSyncPlanTables,
   emptyDataCompareSyncPlan,
@@ -25,8 +28,6 @@ import {
   type DataCompareTableStatus,
   type DataCompareTableTask,
   type DiffKind,
-  type SelectableDataCompareModifiedRow,
-  type SelectableDataCompareRow,
 } from "@/composables/useDataCompareSession";
 import CompareKeyColumnsSelect from "@/components/diff/CompareKeyColumnsSelect.vue";
 import DataCompareConfigSelector from "@/components/diff/DataCompareConfigSelector.vue";
@@ -40,6 +41,10 @@ import { ArrowLeftRight, CheckSquare, ChevronDown, ChevronRight, Copy, GitCompar
 
 const PREVIEW_LIMIT_OPTIONS = [50, 100, 200, 500];
 const SYNC_EXECUTE_BATCH_SIZE = 500;
+const DIFF_ROW_MIN_HEIGHT = 64;
+const DIFF_LIST_MAX_HEIGHT = 288;
+const SQL_PREVIEW_MAX_CHARACTERS = 8192;
+const SQL_PREVIEW_MAX_LINES = 200;
 
 const { t } = useI18n();
 const { toast } = useToast();
@@ -82,8 +87,10 @@ const targetSchemas = ref<string[]>([]);
 const targetTables = ref<string[]>([]);
 
 const detailPreviewLimit = ref(String(PREVIEW_LIMIT_OPTIONS[1]));
-const batchResults = ref<DataCompareTableResult[]>([]);
-const syncPlan = ref<DataCompareSyncPlan>(emptyDataCompareSyncPlan());
+const batchResults = shallowRef<DataCompareTableResult[]>([]);
+const syncPlan = shallowRef<DataCompareSyncPlan>(emptyDataCompareSyncPlan());
+const sqlPreview = computed(() => createBoundedTextPreview(syncPlan.value.syncSql, { maxCharacters: SQL_PREVIEW_MAX_CHARACTERS, maxLines: SQL_PREVIEW_MAX_LINES }));
+const sqlPreviewText = computed(() => (sqlPreview.value.truncated ? `${sqlPreview.value.head}\n…\n${sqlPreview.value.tail}` : sqlPreview.value.head));
 const comparing = ref(false);
 const planningSync = ref(false);
 const compareProgressCurrent = ref(0);
@@ -810,7 +817,7 @@ function hasDiffRows(table: DataCompareTableResult, kind: DiffKind): boolean {
 }
 
 function selectedRows(table: DataCompareTableResult, kind: DiffKind): number {
-  return table.diff[kind].filter((row) => row.selected).length;
+  return countCompareSelection(table.selection[kind], table.diff[kind].length);
 }
 
 function rowsForDisplay(table: DataCompareTableResult, kind: DiffKind) {
@@ -833,37 +840,34 @@ function toggleShowAll(table: DataCompareTableResult, kind: DiffKind) {
 function setDiffSelection(kind: DiffKind, selected: boolean) {
   if (executionLocked.value) return;
   batchResults.value.forEach((table) => {
-    if (!table.syncEligible) return;
-    table.diff[kind].forEach((row) => {
-      row.selected = selected;
-    });
+    if (table.syncEligible) setCompareSelection(table.selection[kind], selected);
   });
   rebuildSyncPlan().catch((e) => toast(String(e), 5000));
 }
 
 function setTableDiffSelection(table: DataCompareTableResult, kind: DiffKind, selected: boolean) {
   if (executionLocked.value || !table.syncEligible) return;
-  table.diff[kind].forEach((row) => {
-    row.selected = selected;
-  });
+  setCompareSelection(table.selection[kind], selected);
   rebuildSyncPlan().catch((e) => toast(String(e), 5000));
 }
 
 function clearAllSelections() {
   if (executionLocked.value) return;
-  (["added", "removed", "modified"] as DiffKind[]).forEach((kind) => {
-    batchResults.value.forEach((table) => {
-      table.diff[kind].forEach((row) => {
-        row.selected = false;
-      });
-    });
+  batchResults.value.forEach((table) => {
+    for (const kind of ["added", "removed", "modified"] as DiffKind[]) setCompareSelection(table.selection[kind], false);
   });
   rebuildSyncPlan().catch((e) => toast(String(e), 5000));
 }
 
-function toggleRowSelection(table: DataCompareTableResult, row: SelectableDataCompareRow | SelectableDataCompareModifiedRow) {
+// Diff arrays retain their order. A missing target can have duplicate match keys,
+// so both virtual items and selection use row positions instead of SQL keys.
+function diffRowKey(_row: DataCompareRow | DataCompareModifiedRow, index: number): number {
+  return index;
+}
+
+function toggleRowSelection(table: DataCompareTableResult, kind: DiffKind, index: number) {
   if (executionLocked.value || !table.syncEligible) return;
-  row.selected = !row.selected;
+  toggleCompareSelection(table.selection[kind], index);
   rebuildSyncPlan().catch((e) => toast(String(e), 5000));
 }
 
@@ -977,7 +981,9 @@ async function executeSql() {
       database,
       sql: syncPlan.value.syncSql,
       source: t("production.sourceDataCompare"),
+      analyzeInBackground: true,
       execute: async () => {
+        if (componentUnmounted || executionInterrupted) return undefined;
         syncErrors.value = [];
         executeTotal.value = statements.length;
         executedCount.value = 0;
@@ -1111,7 +1117,7 @@ function formatRowValues(values: Record<string, DataCompareCellValue>): string {
   );
 }
 
-function formatModifiedSummary(row: SelectableDataCompareModifiedRow): string {
+function formatModifiedSummary(row: DataCompareModifiedRow): string {
   return truncateText(row.changes.map((change) => `${change.column}: ${formatValue(change.target)} -> ${formatValue(change.source)}`).join(", "), 220);
 }
 
@@ -1643,25 +1649,22 @@ onBeforeUnmount(() => {
                       </Button>
                     </div>
 
-                    <div class="max-h-72 overflow-auto divide-y">
-                      <button
-                        v-for="row in rowsForDisplay(item, kind)"
-                        :key="`${item.sourceTable}:${kind}:${row.key}`"
-                        type="button"
-                        class="flex w-full items-start gap-3 px-3 py-2 text-left text-xs hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-60"
-                        :disabled="!item.syncEligible"
-                        @click="toggleRowSelection(item, row)"
-                      >
-                        <CheckSquare v-if="row.selected" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
-                        <Square v-else class="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground/40" />
-                        <div class="min-w-0 flex-1">
-                          <div class="font-mono">{{ formatKeyValues(row.keyValues) }}</div>
-                          <div class="mt-1 text-muted-foreground break-words">
-                            {{ kind === "modified" ? formatModifiedSummary(row as SelectableDataCompareModifiedRow) : formatRowValues((row as SelectableDataCompareRow).values) }}
-                          </div>
-                        </div>
-                      </button>
-                    </div>
+                    <DynamicScroller :items="rowsForDisplay(item, kind)" :min-item-size="DIFF_ROW_MIN_HEIGHT" :key-field="diffRowKey" class="max-h-72 overflow-auto" :style="{ height: `${Math.min(rowsForDisplay(item, kind).length * DIFF_ROW_MIN_HEIGHT, DIFF_LIST_MAX_HEIGHT)}px` }">
+                      <template #default="{ item: row, active, index }">
+                        <DynamicScrollerItem :item="row" :index="index" :active="active" :data-index="index">
+                          <button type="button" class="flex w-full items-start gap-3 px-3 py-2 text-left text-xs hover:bg-muted/40 disabled:cursor-not-allowed disabled:opacity-60" :disabled="!item.syncEligible" @click="toggleRowSelection(item, kind, index)">
+                            <CheckSquare v-if="isCompareRowSelected(item.selection[kind], index)" class="mt-0.5 h-3.5 w-3.5 shrink-0 text-primary" />
+                            <Square v-else class="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground/40" />
+                            <div class="min-w-0 flex-1">
+                              <div class="font-mono">{{ formatKeyValues(row.keyValues) }}</div>
+                              <div class="mt-1 text-muted-foreground break-words">
+                                {{ kind === "modified" ? formatModifiedSummary(row as DataCompareModifiedRow) : formatRowValues((row as DataCompareRow).values) }}
+                              </div>
+                            </div>
+                          </button>
+                        </DynamicScrollerItem>
+                      </template>
+                    </DynamicScroller>
 
                     <div v-if="remainingRows(item, kind) > 0 && !item.showAll[kind]" class="border-t px-3 py-2 text-xs text-muted-foreground">
                       {{ t("dataCompare.remainingRows", { count: remainingRows(item, kind) }) }}
@@ -1675,8 +1678,9 @@ onBeforeUnmount(() => {
               {{ t("dataCompare.planningSync") }}
             </div>
             <div v-else-if="syncPlan.syncSql.trim()" class="space-y-1">
+              <p v-if="sqlPreview.truncated" class="text-xs text-muted-foreground">{{ t("dangerDialog.previewTruncated", { lines: sqlPreview.omittedLines.toLocaleString(), characters: sqlPreview.omittedCharacters.toLocaleString() }) }}</p>
               <Label class="text-xs font-medium">{{ t("diff.generatedSql") }}</Label>
-              <textarea :value="syncPlan.syncSql" readonly class="w-full h-48 rounded-[6px] border bg-muted/20 p-3 font-mono text-xs resize-none focus:outline-none focus:ring-1 focus:ring-ring" />
+              <textarea :value="sqlPreviewText" readonly class="w-full h-48 rounded-[6px] border bg-muted/20 p-3 font-mono text-xs resize-none focus:outline-none focus:ring-1 focus:ring-ring" />
             </div>
             <div v-else-if="differentTableCount === 0 && failedTableCount === 0" class="text-sm text-muted-foreground">
               {{ t("dataCompare.noDifferences") }}

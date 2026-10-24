@@ -7154,6 +7154,7 @@ pub async fn list_indexes(pool: &MySqlPool, database: &str, table: &str) -> Resu
                 let index_position = indexes.len();
                 index_positions.insert(name.clone(), index_position);
                 indexes.push(IndexInfo {
+                    owner: None,
                     key_directions: Vec::new(),
                     visibility: None,
                     key_metadata_complete: false,

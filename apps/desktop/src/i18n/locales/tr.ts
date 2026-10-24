@@ -1,3 +1,4 @@
+import { tableColumnPasteTr as tableColumnPaste } from "./tableColumnPaste";
 import { sidebarMenuTr as sidebarMenu } from "./sidebarMenuMessages";
 import { withEnglishFallback } from "./fallback";
 import docs from "./docs/tr";
@@ -61,6 +62,7 @@ const consul = {
 };
 
 export default withEnglishFallback({
+  tableColumnPaste,
   objectDependencies: {
     dependencies: "Bağımlılıklar",
     dependents: "Bağımlı nesneler",
@@ -502,6 +504,7 @@ export default withEnglishFallback({
     regexSearchTooltip: "Kenar çubuğu adlarını, açıklamaları ve takma adları JavaScript düzenli ifadeleriyle eşleştirin.",
     clearFilter: "Filtreyi temizle",
     locateTargetNotFound: "Öğe kenar çubuğunda bulunamıyor. Silinmiş veya gizlenmiş olabilir.",
+    locateSqlFile: "SQL dosya listesinde bul",
     locateActiveTab: "Kenar çubuğunda bul",
   },
   savedSql: {
@@ -601,6 +604,8 @@ export default withEnglishFallback({
     collapseAll: "Tümünü daralt",
     moreMatches: "+ {count} eşleşme daha",
     collapseMatches: "Daralt",
+    searchContentIncomplete: "Arama sonuçları eksik: {count} dosyanın içeriği yüklenemedi.",
+    matchPreviewLimit: "Önizlemeler, eşleşen {total} satırın ilk {limit} satırıyla sınırlıdır.",
   },
 
   connection: {
@@ -1258,6 +1263,9 @@ export default withEnglishFallback({
     sshKeyPassphrasePlaceholder: "Anahtar şifrelenmemişse boş bırakın",
     sshKeyPathBrowse: "Gözat",
     sshExposeLan: "Tüneli yerel ağa aç",
+    sshLocalPort: "Yerel Port",
+    sshLocalPortPlaceholder: "Otomatik",
+    sshLocalPortHint: "Rastgele boş bir port için boş bırakın. Sabit port, bağlantı açıkken tüneli o yerel portta tutar; böylece diğer araçlar da kullanabilir. Yalnızca son katman için geçerlidir.",
     sshAllowExecChannelProxy: "SSH exec-channel yedeğini (nc) etkinleştir",
     sshProxyCommand: "ProxyCommand",
     sshProxyCommandPlaceholder: "nc %h %p",
@@ -1331,6 +1339,9 @@ export default withEnglishFallback({
     sshWorkerUploadConsentAccept: "Yükle",
     sshWorkerUploadConsentReject: "İptal",
     sshHopInvalidTimeout: "{hop}: SSH zaman aşımı 1 ile 300 saniye arasında olmalıdır",
+    sshHopInvalidLocalPort: "{hop}: Yerel port 1 ile 65535 arasında olmalıdır",
+    sshHopLocalPortNotLast: "{hop}: Yerel port yalnızca son etkin katmana uygulanır",
+    sshHopLocalPortUnsupported: "{hop}: Yerel port bu bağlantı türü için desteklenmiyor",
     connectTimeout: "Bağlantı Zaman Aşımı (saniye)",
     queryTimeout: "Sorgu Zaman Aşımı (saniye)",
     useGlobalQueryTimeout: "Genel",
@@ -1428,6 +1439,7 @@ export default withEnglishFallback({
     cancelConnecting: "Bağlanmayı iptal et",
     connectCancelled: "Bağlantı iptal edildi",
     sshTotpCancelled: "Tek kullanımlık kod girişi iptal edildi",
+    sshLocalPortBindFailed: "{port} yerel portu kullanımda veya kullanılamıyor ({error}). Onu kullanan programı kapatın veya başka bir yerel port seçin.",
   },
   editor: {
     duckdbDraining: "Önceki DuckDB sorgusu hâlâ durduruluyor. Lütfen birazdan tekrar deneyin.",
@@ -1639,6 +1651,7 @@ export default withEnglishFallback({
       searchFailed: "Arama başarısız oldu veya zaman aşımına uğradı. İfadeyi basitleştirip tekrar deneyin.",
       caseSensitive: "Büyük/küçük harfe duyarlı",
       regex: "Düzenli ifade",
+      wholeWord: "Tam kelime",
       collapseReplace: "Değiştirmeyi daralt",
       expandReplace: "Değiştirmeyi genişlet",
       prevMatch: "Önceki (Shift+Enter)",
@@ -6768,6 +6781,25 @@ export default withEnglishFallback({
     completedWithErrors: "Çalıştırma tamamlandı: {succeeded} başarılı, {failed} başarısız",
   },
   sqlFileTree: {
+    searchIncompleteHelp: "Bu aramanın eksik olmasının nedenleri:",
+    searchSkippedTooLarge: "32 MiB üzeri: {count} dosya atlandı.",
+    searchSkippedUnreadable: "Okunamadı (silinmiş olabilir veya erişim izni yok): {count} dosya veya klasör.",
+    searchSkippedInvalidEncoding: "Dosya kodlaması tanınmadı: {count} dosya.",
+    searchSkippedOutsideRoot: "Gerçek yol seçilen kök klasörün dışında: {count} dosya.",
+    searchSkippedNotRegularFile: "Normal dosya değil (örneğin sembolik bağlantıyla değiştirilmiş): {count} öğe.",
+    searchSkippedOther: "Diğer nedenlerle atlandı: {count} öğe.",
+    searchPreviewLimits: "Önizlemeler kısaltıldı: dosya başına en fazla {perFile}, arama başına {total} satır. Eşleşen dosyaların aranması ve satırların sayılması devam eder.",
+    searchMode: "Arama kapsamı",
+    searchByName: "Dosya",
+    searchByContent: "İçerik",
+    searchContentPlaceholder: "Dosya içeriklerinde ara...",
+    searchPlaceholder: "Dosya adlarında ara...",
+    searching: "Dosya içerikleri aranıyor...",
+    searchIncomplete: "Arama eksik: {skipped} dosya veya klasör atlandı; eşleşen parçacıklar kısaltılmış olabilir.",
+    searchFailed: "İçerik araması başarısız: {message}",
+    sortManual: "Elle sıralama",
+    sortManualHint: "Sıralamayı değiştirmek için aynı klasördeki dosyaları sürükleyin. Arama sırasında sürükleme devre dışıdır.",
+    sortSaveFailed: "Dosya sıralama tercihi kaydedilemedi.",
     folderNameInvalid: "Yol yerine tek bir klasör adı girin.",
     folderNameExcluded: "Bu klasör adı SQL dosya tarayıcısından hariç tutulur.",
     folderDepthExceeded: "Maksimum klasör derinliğine ulaşıldı.",
@@ -8985,8 +9017,20 @@ export default withEnglishFallback({
     runDirectoryPattern: "Çalıştırma dizini şablonu",
     runDirectoryPatternHint: "Hedef dizin altındaki göreli yol. {'{'}schedule{'}'}, {'{'}date{'}'}, {'{'}timestamp{'}'} ve {'{'}runId{'}'} kullanın. Varsayılan şablon daha iyi yalıtım için {'{'}runId{'}'} içerir. Örnek: {'{'}schedule{'}'}/{'{'}date{'}'}/{'{'}timestamp{'}'}-{'{'}runId{'}'}",
     runDirectoryPatternInvalid: ". veya .. bölümleri içermeyen göreli bir yol kullanın.",
-    compression: "Sıkıştırma",
+    backupFormat: "Yedek biçimi",
     compressionGzip: "Gzip (.sql.gz)",
+    formatSql: "SQL (.sql)",
+    formatNb3: "Navicat yedeği (.nb3)",
+    formatNb3Hint: "MySQL ve PostgreSQL için Navicat yedek biçimi. DBX bunu herhangi bir SQL yedeği gibi geri yükler.",
+    restoreFromFile: "Dosyadan geri yükle",
+    restoreFromFileHint: "Herhangi bir konumdaki .sql, .sql.gz veya .nb3 yedek dosyasını geri yükleyin",
+    importBackup: "Yedeği içe aktar",
+    importBackupHint: "DBX dışında oluşturulan yedek dosyalarını (ör. Navicat .nb3 arşivleri) yedek geçmişine ekleyin",
+    importedTrigger: "İçe aktarıldı",
+    externalFile: "Harici dosya",
+    backupsImported: "Geçmişe {count} yedek eklendi",
+    deleteImportedConfirm: "İçe aktarılan {count} yedek geçmişten kaldırılsın mı? Dosyalar diskte kalır.",
+    importedFilesKept: "İçe aktarılan yedekler yalnızca geçmişten kaldırılır; dosyalar diskte kalır.",
     searchConnections: "Bağlantılarda ara…",
     noMatchingConnections: "Eşleşen bağlantı yok",
     connectionsSelected: "{count} bağlantı seçildi",

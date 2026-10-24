@@ -15,6 +15,8 @@ pub enum DatabaseObjectType {
     Procedure,
     Function,
     Event,
+    Type,
+    TypeBody,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +95,45 @@ pub struct DropObjectSqlOptions {
     pub signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identifier_quote: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OracleTypeGrantSqlOptions {
+    pub database_type: DatabaseType,
+    pub owner: String,
+    pub type_name: String,
+    pub grantee: String,
+    pub privilege: String,
+    #[serde(default)]
+    pub grantable: bool,
+}
+
+pub fn build_oracle_type_grant_sql(options: OracleTypeGrantSqlOptions) -> Result<String, String> {
+    if !matches!(options.database_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Dameng) {
+        return Err("TYPE EXECUTE grants are supported only for Oracle-family databases.".to_string());
+    }
+    if options.owner.trim().is_empty() || options.type_name.trim().is_empty() || options.grantee.trim().is_empty() {
+        return Err("TYPE owner, name, and grantee are required.".to_string());
+    }
+    let privilege = options.privilege.to_ascii_uppercase();
+    if !matches!(privilege.as_str(), "EXECUTE" | "DEBUG" | "UNDER")
+        || (options.database_type == DatabaseType::Dameng && privilege != "EXECUTE")
+    {
+        return Err("Unsupported direct TYPE privilege for this database.".into());
+    }
+    let object = format!(
+        "{}.{}",
+        quote_table_identifier(Some(options.database_type), &options.owner),
+        quote_table_identifier(Some(options.database_type), &options.type_name),
+    );
+    let grantee = if options.grantee == "PUBLIC" {
+        "PUBLIC".into()
+    } else {
+        quote_table_identifier(Some(options.database_type), &options.grantee)
+    };
+    let option = if options.grantable { " WITH GRANT OPTION" } else { "" };
+    Ok(format!("GRANT {privilege} ON {object} TO {grantee}{option};"))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -449,15 +490,22 @@ pub fn build_create_user_sql(username: &str, password: &str, tablespace: &str) -
 }
 
 pub fn build_drop_object_sql(options: DropObjectSqlOptions) -> String {
-    let signature = if matches!(options.database_type, Some(DatabaseType::Postgres))
+    let signature = if matches!(options.database_type, Some(DatabaseType::Postgres | DatabaseType::Kingbase))
         && matches!(options.object_type, DatabaseObjectType::Function | DatabaseObjectType::Procedure)
     {
         options.signature.as_deref().map(|value| format!("({value})")).unwrap_or_default()
     } else {
         String::new()
     };
+    let restrict = if options.database_type == Some(DatabaseType::Dameng)
+        && matches!(options.object_type, DatabaseObjectType::Type | DatabaseObjectType::TypeBody)
+    {
+        " RESTRICT"
+    } else {
+        ""
+    };
     format!(
-        "DROP {} {}{};",
+        "DROP {} {}{}{};",
         object_type_keyword(options.object_type),
         qualified_name_with_quote(
             options.database_type,
@@ -465,7 +513,8 @@ pub fn build_drop_object_sql(options: DropObjectSqlOptions) -> String {
             &options.name,
             options.identifier_quote.as_deref(),
         ),
-        signature
+        signature,
+        restrict
     )
 }
 
@@ -1316,6 +1365,8 @@ fn object_type_keyword(object_type: DatabaseObjectType) -> &'static str {
         DatabaseObjectType::Procedure => "PROCEDURE",
         DatabaseObjectType::Function => "FUNCTION",
         DatabaseObjectType::Event => "EVENT",
+        DatabaseObjectType::Type => "TYPE",
+        DatabaseObjectType::TypeBody => "TYPE BODY",
     }
 }
 
@@ -2242,6 +2293,27 @@ mod tests {
     }
 
     #[test]
+    fn kingbase_drop_object_sql_preserves_routine_signature() {
+        for (object_type, keyword) in
+            [(DatabaseObjectType::Procedure, "PROCEDURE"), (DatabaseObjectType::Function, "FUNCTION")]
+        {
+            for signature in ["", "v integer", "v INOUT integer"] {
+                assert_eq!(
+                    build_drop_object_sql(DropObjectSqlOptions {
+                        database_type: Some(DatabaseType::Kingbase),
+                        object_type,
+                        schema: Some("app".to_string()),
+                        name: "run".to_string(),
+                        signature: Some(signature.to_string()),
+                        identifier_quote: None,
+                    }),
+                    format!("DROP {keyword} \"app\".\"run\"({signature});")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn builds_drop_object_database_and_schema_sql() {
         assert_eq!(
             build_drop_object_sql(DropObjectSqlOptions {
@@ -2265,6 +2337,24 @@ mod tests {
             }),
             "DROP FUNCTION \"public\".\"calc\"(integer, integer);"
         );
+        for (database_type, object_type, expected) in [
+            (DatabaseType::Oracle, DatabaseObjectType::Type, "DROP TYPE \"APP\".\"Mixed Type\";"),
+            (DatabaseType::OceanbaseOracle, DatabaseObjectType::TypeBody, "DROP TYPE BODY \"APP\".\"Mixed Type\";"),
+            (DatabaseType::Dameng, DatabaseObjectType::Type, "DROP TYPE \"APP\".\"Mixed Type\" RESTRICT;"),
+            (DatabaseType::Dameng, DatabaseObjectType::TypeBody, "DROP TYPE BODY \"APP\".\"Mixed Type\" RESTRICT;"),
+        ] {
+            assert_eq!(
+                build_drop_object_sql(DropObjectSqlOptions {
+                    database_type: Some(database_type),
+                    object_type,
+                    schema: Some("APP".to_string()),
+                    name: "Mixed Type".to_string(),
+                    signature: None,
+                    identifier_quote: None,
+                }),
+                expected,
+            );
+        }
         assert_eq!(
             build_drop_database_sql(DatabaseNameSqlOptions {
                 database_type: Some(DatabaseType::Mysql),
@@ -2352,6 +2442,61 @@ mod tests {
             }),
             "DROP USER \"ana\"\"lytics\" CASCADE;"
         );
+    }
+
+    #[test]
+    fn builds_type_execute_grants_with_database_native_identifier_quotes() {
+        for database_type in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle, DatabaseType::Dameng] {
+            assert_eq!(
+                build_oracle_type_grant_sql(OracleTypeGrantSqlOptions {
+                    database_type,
+                    owner: "APP".into(),
+                    type_name: "Mixed Type".into(),
+                    grantee: "MIG_OTHER".into(),
+                    privilege: "EXECUTE".into(),
+                    grantable: true,
+                })
+                .unwrap(),
+                "GRANT EXECUTE ON \"APP\".\"Mixed Type\" TO \"MIG_OTHER\" WITH GRANT OPTION;"
+            );
+        }
+        assert!(build_oracle_type_grant_sql(OracleTypeGrantSqlOptions {
+            database_type: DatabaseType::Mysql,
+            owner: "APP".into(),
+            type_name: "T".into(),
+            grantee: "U".into(),
+            privilege: "EXECUTE".into(),
+            grantable: false,
+        })
+        .is_err());
+        for privilege in ["DEBUG", "UNDER"] {
+            let input = OracleTypeGrantSqlOptions {
+                database_type: DatabaseType::Oracle,
+                owner: "APP".into(),
+                type_name: "T".into(),
+                grantee: "PUBLIC".into(),
+                privilege: privilege.into(),
+                grantable: false,
+            };
+            assert_eq!(
+                build_oracle_type_grant_sql(input.clone()).unwrap(),
+                format!("GRANT {privilege} ON \"APP\".\"T\" TO PUBLIC;")
+            );
+            assert!(build_oracle_type_grant_sql(OracleTypeGrantSqlOptions {
+                database_type: DatabaseType::Dameng,
+                ..input
+            })
+            .is_err());
+        }
+        assert!(build_oracle_type_grant_sql(OracleTypeGrantSqlOptions {
+            database_type: DatabaseType::Oracle,
+            owner: "APP".into(),
+            type_name: "T".into(),
+            grantee: "USER".into(),
+            privilege: "EXECUTE; DROP USER X".into(),
+            grantable: false
+        })
+        .is_err());
     }
 
     #[test]

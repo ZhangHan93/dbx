@@ -28,6 +28,11 @@ const connectionStore = {
     node.isExpanded = true;
   }),
   loadTables: vi.fn(async () => undefined),
+  loadCustomTypeChildren: vi.fn(async (node: TreeNode) => {
+    node.hasMembers = true;
+    node.children = [{ id: `${node.id}:attribute`, label: "STREET", type: "type-member", connectionId: node.connectionId, database: node.database }];
+    node.isExpanded = true;
+  }),
   loadXuguTablespaces: vi.fn(async (node: TreeNode) => {
     node.isExpanded = true;
   }),
@@ -99,9 +104,62 @@ afterEach(() => {
   connectionStore.getConfig.mockReturnValue({ db_type: "mysql", name: "connection" });
   connectionStore.getEtcdAccessCapabilities.mockReturnValue({ admin: true, writable: true, writePermissions: null });
   connectionStore.loadTables.mockResolvedValue(undefined);
+  connectionStore.loadCustomTypeChildren.mockClear();
 });
 
 describe("SidebarTreeRuntimeHost expansion", () => {
+  it.each(["oracle", "oceanbase-oracle", "dameng"] as const)("lazy-loads unknown TYPE members for %s on row activation", async (dbType) => {
+    const typeNode: TreeNode = { id: `${dbType}:demo:APP:TYPE_OBJ`, label: "TYPE_OBJ", type: "type", connectionId: dbType, database: "demo", schema: "APP", objectName: "TYPE_OBJ", hasMembers: undefined };
+    connectionStore.getConfig.mockReturnValue({ db_type: dbType });
+    const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
+    const app = createApp(defineComponent({ setup: () => () => h(SidebarTreeRuntimeHost, { ref: host, node: typeNode, depth: 0 }) }));
+    mountedApps.push(app);
+    const container = document.createElement("div");
+    document.body.append(container);
+    app.use(i18n);
+    app.mount(container);
+    host.value!.handleRowClick(typeNode, 1);
+    await vi.waitFor(() => expect(connectionStore.loadCustomTypeChildren).toHaveBeenCalledWith(typeNode));
+    expect(typeNode.children?.[0]?.label).toBe("STREET");
+    expect(queryStore.createTab).not.toHaveBeenCalled();
+  });
+
+  it("retries expansion for Oracle TYPE nodes with partial children and unknown member state", async () => {
+    const typeNode: TreeNode = {
+      id: "oracle:XE:APP:TYPE_OBJ",
+      label: "TYPE_OBJ",
+      type: "type",
+      connectionId: "oracle",
+      database: "XE",
+      schema: "APP",
+      hasMembers: undefined,
+      children: [{ id: "oracle:XE:APP:TYPE_OBJ:attribute", label: "STREET", type: "type-member", connectionId: "oracle", database: "XE" }],
+    };
+    connectionStore.getConfig.mockReturnValue({ db_type: "oracle" });
+    connectionStore.loadCustomTypeChildren.mockImplementation(async (node: TreeNode) => {
+      node.hasMembers = undefined;
+      node.children = [{ id: `${node.id}:attribute`, label: "STREET", type: "type-member", connectionId: node.connectionId, database: node.database }];
+      node.isExpanded = true;
+    });
+    const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
+    const app = createApp(defineComponent({ setup: () => () => h(SidebarTreeRuntimeHost, { ref: host, node: typeNode, depth: 0 }) }));
+    mountedApps.push(app);
+    const container = document.createElement("div");
+    document.body.append(container);
+    app.use(i18n);
+    app.mount(container);
+
+    host.value!.toggleNode(typeNode);
+    await vi.waitFor(() => expect(connectionStore.loadCustomTypeChildren).toHaveBeenCalledTimes(1));
+    expect(typeNode.isExpanded).toBe(true);
+    expect(typeNode.children?.map((child) => child.label)).toEqual(["STREET"]);
+    host.value!.toggleNode(typeNode);
+    expect(typeNode.isExpanded).toBe(false);
+    host.value!.toggleNode(typeNode);
+    await vi.waitFor(() => expect(connectionStore.loadCustomTypeChildren).toHaveBeenCalledTimes(2));
+    expect(typeNode.isExpanded).toBe(true);
+  });
+
   it.each(["single", "double"] as const)("focuses object search when %s-click activation opens a database", async (activation) => {
     const database: TreeNode = {
       id: "mysql:dbx_test",

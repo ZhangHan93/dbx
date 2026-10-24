@@ -1,6 +1,7 @@
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import { assessProductionSql, productionContextForDatabase, productionDatabases } from "@/lib/database/productionSafety";
 import { ensureReadOnlyWriteAccess } from "@/lib/database/readOnlyWriteAccess";
+import { assessProductionSqlInBackground } from "./productionSafetyWorker";
 import type { ConnectionConfig } from "@/types/database";
 
 export interface ProductionSqlExecutionGuardOptions<T> {
@@ -9,13 +10,16 @@ export interface ProductionSqlExecutionGuardOptions<T> {
   sql: string;
   source?: string;
   execute: () => Promise<T>;
+  /** Offload large generated scripts while preserving the same safety assessment. */
+  analyzeInBackground?: boolean;
 }
 
 export async function executeWithProductionSqlGuard<T>(options: ProductionSqlExecutionGuardOptions<T>): Promise<T | undefined> {
-  if (!(await ensureReadOnlyWriteAccess({ connection: options.connection, sql: options.sql, source: options.source }))) {
+  const backgroundAssessment = options.analyzeInBackground && options.sql.length > 64 * 1024 ? await assessProductionSqlInBackground({ sql: options.sql, connection: options.connection, database: options.database }) : undefined;
+  if (!(await ensureReadOnlyWriteAccess({ connection: options.connection, sql: options.sql, source: options.source, treatAsMutation: backgroundAssessment?.isMutation }))) {
     return undefined;
   }
-  const assessment = assessProductionSql(options.sql, options.connection, options.database);
+  const assessment = backgroundAssessment ?? assessProductionSql(options.sql, options.connection, options.database);
   if (assessment.active && assessment.isMutation) {
     // Centralize production write confirmation so secondary tool surfaces cannot
     // bypass the same explicit review step used by the SQL editor.

@@ -81,7 +81,11 @@ import CustomTypeInfoPanel from "@/components/objects/CustomTypeInfoPanel.vue";
 import TablePartitionsPanel from "@/components/structure/TablePartitionsPanel.vue";
 import XlsxHeaderDialog from "@/components/export/XlsxHeaderDialog.vue";
 import * as api from "@/lib/backend/api";
-import type { ColumnInfo, ConnectionConfig, ConstraintInfo, ForeignKeyInfo, IndexInfo, ObjectBrowserViewMode, ObjectBrowserViewport, ObjectInfo, ObjectSourceKind, ObjectStatistics, PgTablePartitioning, TableInfoTab, TreeNode, TriggerInfo } from "@/types/database";
+import ObjectDependenciesPanel from "@/components/objects/ObjectDependenciesPanel.vue";
+import { objectDependencyTarget, type ObjectDependencyTarget, type ObjectDetailsSection } from "@/lib/database/objectDependencyDetails";
+import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
+import type { QueryTab } from "@/types/database";
+import type { ColumnInfo, ConnectionConfig, ConstraintInfo, ForeignKeyInfo, IndexInfo, ObjectBrowserViewMode, ObjectBrowserViewport, ObjectInfo, ObjectSourceKind, ObjectStatistics, PgTablePartitioning, SchemaIndexIdentity, TableInfoTab, TreeNode, TriggerInfo } from "@/types/database";
 import { sortTablesByFkDependency, type TableWithFk } from "@/lib/table/tableDependencySort";
 import { isSchemaAware, supportsTableVacuum, supportsTransfer } from "@/lib/database/databaseCapabilities";
 import { supportsAiAssistantContext, supportsDataDictionary, supportsSchemaDiagram, supportsTableImport, supportsTableStructureEditing, supportsTableTruncate } from "@/lib/database/databaseFeatureSupport";
@@ -107,7 +111,7 @@ import type { DuplicateTableStructurePlan } from "@/lib/database/dbAdminSql";
 import { executeOceanbaseTableClone, executeOceanbaseTableCloneData, oceanbaseCloneDataPreparationError, OceanbaseTableCloneError, type OceanbaseTableClone } from "@/lib/database/oceanbaseTableClone";
 import { useOceanbaseCloneDialog } from "@/composables/useOceanbaseCloneDialog";
 import { useToast } from "@/composables/useToast";
-import { buildExecutableObjectSourceStatements, buildRoutineRenameObjectSourceStatements, executeObjectSourceSave, formatObjectSourceSaveError, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
+import { buildExecutableObjectSourceStatements, buildRoutineRenameObjectSourceStatements, prepareObjectSourceSave, objectSourceSaveSuccessMessage, formatObjectSourceSaveError, supportsSourceBackedRoutineRename } from "@/lib/table/objectSourceEditor";
 import { assertSourceIdentity, beginSourceSave, captureSourceIdentity, freezeSourceIdentities, renewSourceIdentity, type SourceIdentitySnapshot } from "@/lib/table/objectSourceIdentity";
 import { buildRenameObjectSql, supportsObjectRename } from "@/lib/table/objectRenameSql";
 import { prepareOracleViewRename, executeOracleViewRename, OracleViewRenameFailure, type OracleViewRenamePlan } from "@/lib/table/oracleViewRename";
@@ -186,7 +190,10 @@ import {
 } from "@/lib/table/objectBrowserRows";
 import { isSourceOnlyObjectBrowserRow, resolveRowClickAction, shouldDeferSingleClick, singleClickRowAction, type ObjectBrowserRowAction } from "@/lib/table/objectBrowserRowAction";
 import { objectBrowserTableSelectionAnchor, objectBrowserTableSelectionRange } from "@/lib/table/objectBrowserSelection";
-import { customTypeCapabilities, supportsTypeObjectSource, type SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
+import { customTypeCapabilities, isOracleFamilyTypeSource, sidebarObjectKindsForDatabase, supportsOracleFamilyTypeManagement, supportsSchemaIndexManagement, supportsTypeObjectSource, type SidebarObjectKind } from "@/lib/database/databaseObjectCapabilities";
+import { requestOracleTypeManagement } from "@/lib/table/oracleTypeManagementRequest";
+import { schemaIndexIdentity, schemaIndexIsSameOwner } from "@/lib/table/schemaIndexNavigation";
+import { connectionConfigFingerprint } from "@/lib/connection/connectionDatabaseInfo";
 import { filterObjectBrowserTableColumns } from "@/lib/table/objectBrowserTableInfo";
 import { visibleMongoCollections } from "@/lib/sidebar/mongoCollectionMutation";
 import { createSidePanelRequestGuard } from "@/lib/table/sidePanelRequestGuard";
@@ -220,10 +227,14 @@ const props = defineProps<{
   initialEventOpenRequestId?: number;
   /** 显式"新建事件"请求号：每次菜单点击递增，用于打开/重新进入 CREATE 编辑器 */
   initialEventCreateRequestId?: number;
-  initialObjectFilter?: "tables" | "events";
+  initialObjectFilter?: "tables" | "events" | "indexes";
+  initialIndexCreateRequestId?: number;
+  initialViewTarget?: SchemaIndexIdentity;
+  initialViewRequestId?: number;
   selectedObjectFilter?: ObjectFilter;
   initialSearchQuery?: string;
   viewport?: ObjectBrowserViewport;
+  propertyRequest?: QueryTab["objectPropertiesRequest"];
 }>();
 
 const emit = defineEmits<{
@@ -233,7 +244,10 @@ const emit = defineEmits<{
   viewportChange: [viewport: ObjectBrowserViewport];
   searchChange: [query: string];
   filterChange: [filter: ObjectFilter];
+  indexRequestConsumed: [kind: "create" | "view"];
   addToAi: [tables: Array<{ name: string; schema?: string }>];
+  openDependencyObject: [context: ObjectDependencyTarget, target: SqlObjectNavigationTarget];
+  propertyRequestConsumed: [requestId: string];
 }>();
 
 const { t } = useI18n();
@@ -260,7 +274,7 @@ let objectBrowserUnmounted = false;
 const rows = ref<ObjectBrowserRow[]>([]);
 const rootRef = ref<HTMLElement>();
 const search = ref(props.initialSearchQuery ?? "");
-const objectFilter = ref<ObjectFilter>(props.connection.db_type === "oceanbase-oracle" ? (props.selectedObjectFilter ?? props.initialObjectFilter ?? "tables") : "all");
+const objectFilter = ref<ObjectFilter>(props.selectedObjectFilter === "indexes" || props.initialObjectFilter === "indexes" ? "indexes" : props.connection.db_type === "oceanbase-oracle" ? (props.selectedObjectFilter ?? props.initialObjectFilter ?? "tables") : "all");
 const userHasSelectedFilter = ref(false);
 const sortKey = ref<ObjectBrowserSortKey>("name");
 const sortDirection = ref<ObjectBrowserSortDirection>("asc");
@@ -269,6 +283,7 @@ const loadingObjects = ref(false);
 const loadingMoreObjects = ref(false);
 const hasMoreObjects = ref(false);
 let objectPageOffset = 0;
+let indexNextPageAnchor: string | undefined;
 let objectSearchTimer: ReturnType<typeof setTimeout> | undefined;
 const refreshingObjects = ref(false);
 const scaffoldRefreshError = ref("");
@@ -288,6 +303,7 @@ const openedInitialEvent = ref("");
 const isEventEditor = computed(() => sidePanelMode.value === "event-editor");
 const isSidePanelOpen = computed(() => !!sidePanelRow.value || isEventEditor.value);
 const sidePanelMode = ref<"table-info" | "source" | "type-info" | "event-editor">("source");
+const isSchemaIndexInfo = computed(() => sidePanelMode.value === "table-info" && sidePanelRow.value?.type === "INDEX");
 const eventEditorKey = computed(() =>
   eventEditorInstanceKey({
     createRequestId: props.initialEventCreateRequestId,
@@ -311,6 +327,7 @@ const tableDdlLoaded = ref(false);
 const tableIndexes = ref<IndexInfo[]>([]);
 const tableIndexesLoading = ref(false);
 const tableIndexesLoaded = ref(false);
+const tableIndexesError = ref("");
 const tableForeignKeys = ref<ForeignKeyInfo[]>([]);
 const tableForeignKeysLoading = ref(false);
 const tableForeignKeysLoaded = ref(false);
@@ -355,10 +372,28 @@ let sidePanelResizeStartWidth = 0;
 const isResizingSidePanel = ref(false);
 const sidePanelGuard = createSidePanelRequestGuard();
 const sidePanelRef = ref<InstanceType<typeof CustomTypeInfoPanel> | null>(null);
-const tableMetadataCapabilities = computed<TableMetadataCapabilities>(() => getTableMetadataCapabilities(effectiveDatabaseType.value));
+const tableMetadataCapabilities = computed<TableMetadataCapabilities>(() => getTableMetadataCapabilities(effectiveDatabaseType.value, { connectionType: props.connection.db_type, exactIdentity: sidePanelRow.value?.type === "INDEX" }));
 const effectiveDatabaseType = computed(() => effectiveDatabaseTypeForConnection(props.connection) ?? props.connection.db_type);
+const sourceSection = ref<ObjectDetailsSection>("source");
+const tableRelationsSection = ref<ObjectDetailsSection>("dependencies");
+const propertyFocus = ref<NonNullable<QueryTab["objectPropertiesRequest"]>["focusObject"]>();
+const dependencyTarget = computed(() => {
+  const row = sidePanelRow.value;
+  if (row && sidePanelMode.value === "table-info" && propertyFocus.value)
+    return objectDependencyTarget({ connectionId: props.connection.id, database: props.database, catalog: props.catalog, schema: propertyFocus.value.owner, name: propertyFocus.value.name, objectType: propertyFocus.value.type }, effectiveDatabaseType.value);
+  return row ? objectDependencyTarget({ connectionId: props.connection.id, database: props.database, catalog: props.catalog, schema: row.schema || selectedSchema.value || props.database, name: row.name, objectType: row.type }, effectiveDatabaseType.value) : undefined;
+});
+function viewRelationSql(context: ObjectDependencyTarget, sql: string) {
+  queryStore.createTab(context.connectionId, context.database, t("objectDependencies.viewSql"), "query", context.schema, sql, context.catalog, { forceNew: true });
+}
+function openRelationObject(context: ObjectDependencyTarget, target: SqlObjectNavigationTarget) {
+  if (sidePanelMode.value === "source" && sourceEditing.value && sourceDraft.value !== sourceEditableText.value && !window.confirm(t("objectDependencies.navigateDiscardConfirm"))) return;
+  emit("openDependencyObject", context, target);
+}
 const oracleInvalidObjectsSupported = computed(() => effectiveDatabaseType.value === "oracle" || effectiveDatabaseType.value === "oceanbase-oracle");
-const usesServerObjectPaging = computed(() => props.connection.db_type === "oceanbase-oracle");
+const supportsSchemaIndexes = computed(() => supportsSchemaIndexManagement(effectiveDatabaseType.value));
+const exactIndexList = computed(() => supportsSchemaIndexes.value && objectFilter.value === "indexes");
+const usesServerObjectPaging = computed(() => props.connection.db_type === "oceanbase-oracle" || exactIndexList.value);
 const objectPageSize = computed(() => Math.max(1, Math.min(10_000, Math.floor(settingsStore.desktopSettings?.sidebar_table_page_size || 500))));
 const isGaussdbM = computed(() => effectiveDatabaseType.value === "gaussdb" && props.connection.driver_profile?.toLowerCase() === "gaussdb-m");
 
@@ -526,6 +561,7 @@ const objectCounts = computed(() => countObjectBrowserRowsByFilter(rows.value));
 // Count direct search matches once; partition parents rendered only for context must not inflate badges.
 const objectSearchSummary = computed(() => summarizeObjectBrowserSearch(rows.value, search.value));
 const canOpenStructureEditor = computed(() => supportsTableStructureEditing(tableStructureDatabaseType.value));
+const canCreateSchemaIndex = computed(() => supportsSchemaIndexes.value && !connectionIsEffectivelyReadOnly(props.connection));
 const canOpenDiagram = computed(() => !!props.database && supportsSchemaDiagram(effectiveDatabaseType.value));
 const canOpenDataDictionary = computed(() => !!props.database && supportsDataDictionary(effectiveDatabaseType.value));
 const canOpenTableImport = computed(() => !!props.database && supportsTableImport(effectiveDatabaseType.value));
@@ -536,7 +572,7 @@ const sourceDialect = computed(() => codeMirrorSqlDialect(effectiveDatabaseType.
 const sourceFormatDialect = computed<SqlFormatDialect>(() => sqlFormatDialectForDbType(effectiveDatabaseType.value));
 const objectFilters = computed<ObjectFilter[]>(() =>
   usesServerObjectPaging.value
-    ? ["all", "tables", "views", "procedures", "functions", "sequences", "packages", "types"]
+    ? ["all", "tables", "views", "procedures", "functions", "sequences", ...(supportsSchemaIndexes.value ? ["indexes" as const] : []), "packages", "types"]
     : (
         [
           ["all", objectCounts.value.all],
@@ -548,20 +584,21 @@ const objectFilters = computed<ObjectFilter[]>(() =>
           ["triggers", objectCounts.value.triggers],
           ["events", objectCounts.value.events],
           ["sequences", objectCounts.value.sequences],
+          ["indexes", objectCounts.value.indexes],
           ["packages", objectCounts.value.packages],
           ["types", objectCounts.value.types],
         ] as Array<[ObjectFilter, number]>
       )
-        .filter(([filter, count]) => filter === "all" || count > 0)
+        .filter(([filter, count]) => filter === "all" || count > 0 || (filter === "indexes" && supportsSchemaIndexes.value))
         .map(([filter]) => filter),
 );
-const showObjectFilter = computed(() => objectFilters.value.length > 2);
+const showObjectFilter = computed(() => objectFilters.value.length > 2 || (supportsSchemaIndexes.value && objectFilters.value.includes("indexes")));
 // A scope that holds a single object kind makes "全部 14" and "表 14" the same number, so the
 // strip is dropped as redundant — which used to drop the only object count the toolbar could
 // show at all (t8y2/dbx#11624, the common MySQL "tables only" database). Keep that one kind's
 // count visible on its own instead; it stays a value, not a filter control, because with a
 // single kind there is no 全部 chip left for the user to reset the selection back to.
-const singleKindFilter = computed<ObjectFilter | null>(() => (objectFilters.value.length === 2 ? (objectFilters.value.find((filter) => filter !== "all") ?? null) : null));
+const singleKindFilter = computed<ObjectFilter | null>(() => (!showObjectFilter.value && objectFilters.value.length === 2 ? (objectFilters.value.find((filter) => filter !== "all") ?? null) : null));
 // Measured condensation for the header row: tier 1 moves the sort/view/checkbox
 // controls into the overflow menu, tier 2 additionally moves the object type
 // filter there and drops the database chip. See useToolbarOverflow for the
@@ -896,6 +933,7 @@ const selectedTableRows = computed(() => {
   return selectableRows.value.filter((row) => ids.has(row.id));
 });
 const selectedTableCount = computed(() => selectedTableRows.value.length);
+const hasSelectedSchemaIndexes = computed(() => selectedTableRows.value.some((row) => row.type === "INDEX"));
 const hasSelectedTablesOnly = computed(() => selectedTableRows.value.length > 0 && selectedTableRows.value.every((row) => row.type === "TABLE"));
 const batchDropConfirmTitle = computed(() => (hasSelectedTablesOnly.value ? t("objects.confirmBatchDropTitle") : t("contextMenu.confirmBatchDropTitle")));
 const batchDropConfirmMessage = computed(() => (hasSelectedTablesOnly.value ? t("objects.confirmBatchDropMessage", { count: selectedTableCount.value }) : t("contextMenu.confirmBatchDropMessage", { count: selectedTableCount.value })));
@@ -913,6 +951,7 @@ const allVisibleTablesSelected = computed(() => visibleSelectableRows.value.leng
 const batchDropProgressPercent = computed(() => (batchDropProgress.value.total > 0 ? Math.round((batchDropProgress.value.completed / batchDropProgress.value.total) * 100) : 0));
 
 function iconFor(row: ObjectBrowserRow) {
+  if (row.type === "INDEX") return KeyRound;
   if (row.type === "VIEW" || row.type === "MATERIALIZED_VIEW") return Eye;
   if (row.type === "PROCEDURE") return ScrollText;
   if (row.type === "FUNCTION") return Braces;
@@ -925,6 +964,7 @@ function iconFor(row: ObjectBrowserRow) {
 }
 
 function typeLabel(row: ObjectBrowserRow) {
+  if (row.type === "INDEX") return t("grid.tableInfoIndexes");
   if (isMongodb.value) {
     if (row.collectionKind === "view" || row.type === "VIEW") return t("objects.view");
     if (row.collectionKind === "timeseries") return t("objects.timeseries");
@@ -1044,6 +1084,7 @@ function rowMatchesFilter(row: ObjectBrowserRow, filter: ObjectFilter) {
   if (filter === "triggers") return row.type === "TRIGGER";
   if (filter === "events") return row.type === "EVENT";
   if (filter === "sequences") return row.type === "SEQUENCE";
+  if (filter === "indexes") return row.type === "INDEX";
   if (filter === "packages") return row.type === "PACKAGE" || row.type === "PACKAGE_BODY";
   if (filter === "types") return row.type === "TYPE" || row.type === "TYPE_BODY";
   return true;
@@ -1151,6 +1192,7 @@ function togglePartitionParent(row: ObjectBrowserRow) {
 }
 
 function canRename(row: ObjectBrowserRow) {
+  if (row.type === "INDEX") return false;
   return (
     supportsObjectRename(effectiveDatabaseType.value, row.type) ||
     ((effectiveDatabaseType.value === "oracle" || effectiveDatabaseType.value === "oceanbase-oracle") && (row.type === "PROCEDURE" || row.type === "FUNCTION")) ||
@@ -1168,6 +1210,12 @@ let singleClickTimer: ReturnType<typeof setTimeout> | null = null;
 
 function executeRowAction(row: ObjectBrowserRow, action: ObjectBrowserRowAction) {
   switch (action) {
+    case "index-info":
+      void openTableInfo(row, "indexes");
+      break;
+    case "index-editor":
+      openSchemaIndexEditor(row);
+      break;
     case "table-info":
       void openTableInfo(row);
       break;
@@ -1269,7 +1317,8 @@ const tableInfoTabs = computed<TableInfoTabItem[]>(() => {
   if (tableMetadataCapabilities.value.partitions && tableIsPartitioned.value) {
     tabs.push({ id: "partitions", label: t("structureEditor.partitions"), icon: Network, count: tablePartitions.value?.partitions.length });
   }
-  return tabs;
+  if (dependencyTarget.value) tabs.push({ id: "relations", label: t("objectRelations.title"), icon: Network });
+  return sidePanelRow.value?.type === "INDEX" ? tabs.filter((tab) => ["info", "ddl", "columns", "indexes", "relations"].includes(tab.id)) : tabs;
 });
 
 const tableInfoTabListStyle = computed(() => ({
@@ -1337,9 +1386,12 @@ function onTableInfoColumnsKeydown(event: KeyboardEvent) {
 }
 const tableOverviewRows = computed(() => {
   const stats = tableOverviewStats.value;
+  const source = sidePanelRow.value;
+  const index = source?.type === "INDEX" ? schemaIndexIdentity(source) : null;
   const rows = [
-    { label: t("common.table"), value: sidePanelRow.value?.name ?? "" },
-    { label: t("common.schema"), value: sidePanelRow.value?.schema || selectedSchema.value || props.database },
+    ...(index ? [{ label: t("grid.tableInfoIndexes"), value: `${index.schema}.${index.name}` }] : []),
+    { label: t("common.table"), value: index ? `${index.parentSchema}.${index.parentName}` : (source?.name ?? "") },
+    { label: t("common.schema"), value: index?.parentSchema ?? (source?.schema || selectedSchema.value || props.database) },
     { label: t("common.database"), value: props.database },
     ...(sidePanelRow.value?.valid != null ? [{ label: t("objects.validity"), value: t(sidePanelRow.value.valid ? "objects.validStatus" : "objects.invalidStatus") }] : []),
     { label: t("structureEditor.comment"), value: tableOverviewComment.value ?? "" },
@@ -1367,6 +1419,16 @@ const filteredTableIndexes = computed(() => {
   const q = tableInfoSearchQuery.value.toLowerCase();
   return tableIndexes.value.filter((i) => i.name.toLowerCase().includes(q) || i.columns.some((c) => c.toLowerCase().includes(q)));
 });
+
+function schemaIndexOwner(index: IndexInfo): string | undefined {
+  return typeof index.owner === "string" ? index.owner : undefined;
+}
+
+function isInitialSchemaIndex(index: IndexInfo): boolean {
+  const source = sidePanelRow.value;
+  if (source?.type !== "INDEX" || !source.schema || schemaIndexOwner(index) !== source.schema || index.name !== source.name) return false;
+  return tableIndexes.value.filter((item) => schemaIndexOwner(item) === source.schema && item.name === source.name).length === 1;
+}
 
 const filteredTableForeignKeys = computed(() => {
   if (!tableInfoSearchQuery.value) return tableForeignKeys.value;
@@ -1398,7 +1460,11 @@ const filteredTableDdlContent = computed(() => {
   });
 });
 
-async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
+async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab, focusObject?: NonNullable<QueryTab["objectPropertiesRequest"]>["focusObject"]) {
+  if (row.type === "INDEX" && (!supportsSchemaIndexes.value || !schemaIndexIdentity(row))) {
+    toast(t("schemaIndex.parentUnavailable"), 4000);
+    return;
+  }
   selectedTableInfoColumns.value = [];
   selectedRowId.value = row.id;
   // Toggle off if clicking the same table
@@ -1411,6 +1477,7 @@ async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
   }
   sidePanelRow.value = row;
   sidePanelMode.value = "table-info";
+  propertyFocus.value = focusObject;
   sourceRow.value = null;
   const epoch = sidePanelGuard.start();
   // Reset state
@@ -1420,6 +1487,7 @@ async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
   tableOverviewLoaded.value = false;
   rawTableDdlContent.value = "";
   tableIndexes.value = [];
+  tableIndexesError.value = "";
   tableForeignKeys.value = [];
   tableTriggers.value = [];
   tableConstraints.value = [];
@@ -1436,10 +1504,11 @@ async function openTableInfo(row: ObjectBrowserRow, initialTab?: TableInfoTab) {
   tableTriggersLoaded.value = false;
   tableConstraintsLoaded.value = false;
   tableInfoSearchQuery.value = "";
+  tableRelationsSection.value = focusObject ? "ownership" : "dependencies";
   // Determine initial tab: explicit request > previously activated. Resolve the
   // partition status first so a persisted `partitions` tab is not rejected (and
   // overwritten) before the probe lands.
-  await probeTablePartitionStatus();
+  if (initialTab !== "relations") await probeTablePartitionStatus();
   if (sidePanelGuard.isStale(epoch)) return;
   const firstTab = initialTab ?? tableInfoTab.value;
   await selectTableInfoTab(firstTab);
@@ -1449,7 +1518,7 @@ async function selectTableInfoTab(tab: TableInfoTab) {
   const epoch = sidePanelGuard.capture();
   // The panel can be re-selected (or restored) without `openTableInfo`, so make
   // sure the partition status has been probed before the tab list is consulted.
-  if (!tablePartitionStatusResolved.value) await probeTablePartitionStatus();
+  if (tab !== "relations" && !tablePartitionStatusResolved.value) await probeTablePartitionStatus();
   if (sidePanelGuard.isStale(epoch)) return;
   const nextTab = tableInfoTabs.value.some((item) => item.id === tab) ? tab : tableInfoTabs.value[0]?.id;
   if (!nextTab) return;
@@ -1470,16 +1539,20 @@ async function fetchTableOverview(force = false) {
   const row = sidePanelRow.value;
   if (!row || (!force && tableOverviewLoaded.value)) return;
   const epoch = sidePanelGuard.capture();
-  const schema = row.schema || selectedSchema.value || props.database;
+  const request = tableMetadataRequest(row);
+  const schema = request.schema;
   tableOverviewLoading.value = true;
   try {
     const [statistics, comment] = await sidePanelGuard.wait(
       epoch,
-      Promise.all([api.listObjectStatistics(props.connection.id, props.database, schema).catch(() => [] as ObjectStatistics[]), api.getTableComment(props.connection.id, props.database, schema, row.name, props.catalog).catch(() => null)]),
+      Promise.all([
+        request.exactIdentity ? Promise.resolve([] as ObjectStatistics[]) : api.listObjectStatistics(props.connection.id, props.database, schema).catch(() => [] as ObjectStatistics[]),
+        api.getTableComment(props.connection.id, props.database, schema, request.tableName, props.catalog, ...(request.exactIdentity ? ([true] as const) : [])).catch(() => null),
+      ]),
       metadataLoadBudgetMs(props.connection.query_timeout_secs),
     );
     if (sidePanelGuard.isStale(epoch)) return;
-    tableOverviewStats.value = findTableStatistics(statistics, row.name, schema) ?? null;
+    tableOverviewStats.value = findTableStatistics(statistics, request.tableName, schema) ?? null;
     tableOverviewComment.value = comment;
     tableOverviewLoaded.value = true;
   } catch (error) {
@@ -1490,14 +1563,17 @@ async function fetchTableOverview(force = false) {
 }
 
 function tableMetadataRequest(row: ObjectBrowserRow): ObjectDdlRequest {
+  const index = row.type === "INDEX" ? schemaIndexIdentity(row) : null;
+  if (row.type === "INDEX" && !index) throw new Error("Index parent identity is unavailable");
   return {
     connectionId: props.connection.id,
     queryTimeoutSecs: props.connection.query_timeout_secs,
     database: props.database || "",
-    schema: row.schema || selectedSchema.value || props.database,
-    tableName: row.name,
-    objectType: tableDdlObjectType(row.type),
+    schema: index ? index.parentSchema : row.schema || selectedSchema.value || props.database,
+    tableName: index ? index.parentName : row.name,
+    objectType: index ? undefined : tableDdlObjectType(row.type),
     catalog: props.catalog,
+    ...(index ? { exactIdentity: true } : {}),
   };
 }
 
@@ -1535,7 +1611,13 @@ async function fetchTableColumns(force = false) {
     const request = tableMetadataRequest(row);
     const { value: columns } = await sidePanelGuard.wait(
       epoch,
-      loadObjectMetadataFacet(request, "columns", () => api.getColumns(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog), { force }),
+      loadObjectMetadataFacet(
+        request,
+        "columns",
+        () =>
+          request.exactIdentity ? api.getColumns(request.connectionId, request.database, request.schema, request.tableName, request.catalog, undefined, undefined, true) : api.getColumns(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog),
+        { force },
+      ),
       metadataLoadBudgetMs(props.connection.query_timeout_secs),
     );
     if (sidePanelGuard.isStale(epoch)) return;
@@ -1558,12 +1640,13 @@ async function fetchTableIndexes(force = false) {
   if (!row || (tableIndexesLoaded.value && !force)) return;
   const epoch = sidePanelGuard.capture();
   tableIndexesLoading.value = true;
+  tableIndexesError.value = "";
   let loadedSuccessfully = false;
   try {
     const request = tableMetadataRequest(row);
     const { value: indexes } = await sidePanelGuard.wait(
       epoch,
-      loadObjectMetadataFacet(request, "indexes", () => api.listIndexes(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog), { force }),
+      loadObjectMetadataFacet(request, "indexes", () => api.listIndexes(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog, ...(request.exactIdentity ? ([true] as const) : [])), { force }),
       metadataLoadBudgetMs(props.connection.query_timeout_secs),
     );
     if (sidePanelGuard.isStale(epoch)) return;
@@ -1572,7 +1655,7 @@ async function fetchTableIndexes(force = false) {
   } catch (error) {
     if (sidePanelGuard.isStale(epoch)) return;
     tableIndexes.value = [];
-    toast(translateBackendError(t, error), 5000);
+    tableIndexesError.value = translateBackendError(t, error);
   } finally {
     if (sidePanelGuard.isFresh(epoch)) {
       tableIndexesLoaded.value = loadedSuccessfully;
@@ -1591,7 +1674,7 @@ async function fetchTableForeignKeys(force = false) {
     const request = tableMetadataRequest(row);
     const { value: fks } = await sidePanelGuard.wait(
       epoch,
-      loadObjectMetadataFacet(request, "foreign-keys", () => api.listForeignKeys(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog), { force }),
+      loadObjectMetadataFacet(request, "foreign-keys", () => api.listForeignKeys(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog, ...(request.exactIdentity ? ([true] as const) : [])), { force }),
       metadataLoadBudgetMs(props.connection.query_timeout_secs),
     );
     if (sidePanelGuard.isStale(epoch)) return;
@@ -1619,7 +1702,7 @@ async function fetchTableTriggers(force = false) {
     const request = tableMetadataRequest(row);
     const { value: triggers } = await sidePanelGuard.wait(
       epoch,
-      loadObjectMetadataFacet(request, "triggers", () => api.listTriggers(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog), { force }),
+      loadObjectMetadataFacet(request, "triggers", () => api.listTriggers(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog, ...(request.exactIdentity ? ([true] as const) : [])), { force }),
       metadataLoadBudgetMs(props.connection.query_timeout_secs),
     );
     if (sidePanelGuard.isStale(epoch)) return;
@@ -1639,7 +1722,7 @@ async function fetchTableTriggers(force = false) {
 
 async function probeTablePartitionStatus() {
   const row = sidePanelRow.value;
-  if (!row || !tableMetadataCapabilities.value.partitions) {
+  if (!row || row.type === "INDEX" || !tableMetadataCapabilities.value.partitions) {
     tableIsPartitioned.value = false;
     tablePartitionStatusResolved.value = true;
     return;
@@ -1695,7 +1778,7 @@ async function fetchTableConstraints(force = false) {
     const request = tableMetadataRequest(row);
     const { value: constraints } = await sidePanelGuard.wait(
       epoch,
-      loadObjectMetadataFacet(request, "constraints", () => api.listConstraints(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog), { force }),
+      loadObjectMetadataFacet(request, "constraints", () => api.listConstraints(request.connectionId, request.database, request.schema || request.database, request.tableName, request.catalog, ...(request.exactIdentity ? ([true] as const) : [])), { force }),
       metadataLoadBudgetMs(props.connection.query_timeout_secs),
     );
     if (sidePanelGuard.isStale(epoch)) return;
@@ -1716,6 +1799,10 @@ async function fetchTableConstraints(force = false) {
 async function refreshActiveTableInfo() {
   if (sidePanelMode.value === "source") {
     await refreshActiveSource();
+    return;
+  }
+  if (sidePanelMode.value === "type-info") {
+    await sidePanelRef.value?.refresh();
     return;
   }
   if (sidePanelMode.value !== "table-info" || !sidePanelRow.value) return;
@@ -1865,7 +1952,7 @@ const canOpenTableStructureEditor = computed(() => sidePanelRow.value?.type === 
 function openTableStructureEditor() {
   const row = sidePanelRow.value;
   if (!row || row.type !== "TABLE" || !canOpenTableStructureEditor.value) return;
-  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name, tableInfoTab.value, undefined, props.catalog);
+  queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name, tableInfoTab.value === "relations" ? "columns" : tableInfoTab.value, undefined, props.catalog);
 }
 
 /**
@@ -1918,7 +2005,7 @@ async function openInvalidObjectSource(object: { owner: string; name: string; ty
     props.database === database &&
     props.catalog === catalog &&
     (selectedSchema.value || props.database) === schema;
-  if (objectType === "TYPE" || objectType === "TYPE_BODY" || objectType === "TRIGGER") {
+  if (objectType === "TRIGGER") {
     try {
       const source = await api.getObjectSource(connection.id, database, object.owner, object.name, objectType);
       if (!isCurrentRequest()) return;
@@ -1976,6 +2063,7 @@ async function openInvalidObjectSource(object: { owner: string; name: string; ty
 let sourceIdentity: SourceIdentitySnapshot | undefined;
 
 async function loadSourcePanel(row: ObjectBrowserRow, options?: { preserveEditing?: boolean }) {
+  sourceSection.value = "source";
   selectedRowId.value = row.id;
   // Starting a different object must invalidate slower source requests before
   // any state is reset, otherwise an old response can populate the new row.
@@ -2005,7 +2093,7 @@ async function loadSourcePanel(row: ObjectBrowserRow, options?: { preserveEditin
   try {
     const result = await sidePanelGuard.wait(epoch, api.getObjectSource(connectionId, database, schema, row.name, row.type as ObjectSourceKind, row.signature ?? undefined), metadataLoadBudgetMs(props.connection.query_timeout_secs));
     if (sidePanelGuard.isStale(epoch)) return;
-    sourceCanEdit.value = result.editable !== false && !["TRIGGER", "TYPE", "TYPE_BODY"].includes(row.type) && (row.type !== "SEQUENCE" || effectiveDatabaseType.value === "oceanbase-oracle");
+    sourceCanEdit.value = result.editable !== false && (!["TRIGGER", "TYPE", "TYPE_BODY"].includes(row.type) || isOracleFamilyTypeSource(effectiveDatabaseType.value, row.type)) && (row.type !== "SEQUENCE" || effectiveDatabaseType.value === "oceanbase-oracle");
     const editable = sourceCanEdit.value
       ? await sidePanelGuard.wait(
           epoch,
@@ -2027,7 +2115,7 @@ async function loadSourcePanel(row: ObjectBrowserRow, options?: { preserveEditin
     sourceContent.value = row.type === "SEQUENCE" ? result.source : editable;
     sourceDraft.value = editable;
     // Fresh open always enters edit when allowed; refresh preserves prior edit mode.
-    const enterEditing = sourceCanEdit.value && row.type !== "SEQUENCE" && (options?.preserveEditing ? preserveEditing : true);
+    const enterEditing = sourceCanEdit.value && row.type !== "SEQUENCE" && (options?.preserveEditing ? preserveEditing : !isOracleFamilyTypeSource(effectiveDatabaseType.value, row.type));
     sourceEditing.value = enterEditing;
     if (!sourceCanEdit.value && row.type !== "SEQUENCE") {
       toast(t("objects.sourceReadOnly"), 3000);
@@ -2045,6 +2133,19 @@ async function refreshActiveSource() {
   if (!row || sidePanelMode.value !== "source") return;
   if (sourceEditing.value && !window.confirm(t("objects.refreshDiscardConfirm"))) return;
   await loadSourcePanel(row, { preserveEditing: true });
+}
+
+async function openRequestedProperties() {
+  const request = props.propertyRequest;
+  if (!request || request.connectionId !== props.connection.id || request.database !== props.database || (request.catalog || "") !== (props.catalog || "") || request.schema !== (props.schema || props.database)) return;
+  if (sourceEditing.value && sourceDraft.value !== sourceEditableText.value && !window.confirm(t("objectDependencies.navigateDiscardConfirm"))) {
+    emit("propertyRequestConsumed", request.requestId);
+    return;
+  }
+  const row: ObjectBrowserRow = { id: JSON.stringify([request.objectType, request.schema, request.name]), name: request.name, displayName: request.name, schema: request.schema, type: request.objectType };
+  await openTableInfo(row, request.initialTab, request.focusObject);
+  if (props.propertyRequest?.requestId !== request.requestId) return;
+  emit("propertyRequestConsumed", request.requestId);
 }
 
 function openEventEditor(row: ObjectBrowserRow) {
@@ -2116,11 +2217,54 @@ async function executeProcedureSql(sql: string) {
 }
 
 function requestDrop(row: ObjectBrowserRow) {
+  if (selectedTableCount.value > 1 && selectedTableIds.value.has(row.id) && selectedTableRows.value.some((item) => item.type === "INDEX")) {
+    toast(t("schemaIndex.editIndividually"), 4000);
+    return;
+  }
+  if (row.type === "INDEX") {
+    openSchemaIndexEditor(row, "delete");
+    return;
+  }
+  if (isOracleFamilyTypeSource(effectiveDatabaseType.value, row.type)) {
+    void manageTypeDrop(row);
+    return;
+  }
   dropTarget.value = row;
   dropPreviewSql.value = "";
   dropTableCascade.value = false;
   showDropConfirm.value = true;
   void refreshDropPreviewSql();
+}
+
+async function manageTypeDrop(row: ObjectBrowserRow): Promise<boolean> {
+  const connectionId = props.connection.id;
+  const database = props.database;
+  const owner = row.schema || selectedSchema.value || database;
+  const selectedOwner = selectedSchema.value;
+  const databaseType = effectiveDatabaseType.value as "oracle" | "oceanbase-oracle" | "dameng";
+  try {
+    const outcome = await requestOracleTypeManagement({
+      target: { connectionId, database, owner, name: row.name, databaseType },
+      operation: row.type === "TYPE_BODY" ? "delete-body" : "delete-spec",
+      isCurrent: () => props.connection.id === connectionId && props.database === database && selectedSchema.value === selectedOwner && effectiveDatabaseType.value === databaseType,
+    });
+    if (!outcome.complete) return false;
+    if (props.connection.id === connectionId && props.database === database && selectedSchema.value === selectedOwner) {
+      const removed = rows.value.filter((item) => (item.schema || selectedOwner || database) === owner && item.name === row.name && (item.type === row.type || (row.type === "TYPE" && item.type === "TYPE_BODY")));
+      removePinnedObjectBrowserRows(removed);
+      rows.value = rows.value.filter((item) => !removed.includes(item));
+      if (removed.some((item) => item.id === sourceRow.value?.id)) closeSource();
+      try {
+        await reload();
+      } catch (error) {
+        toast(t("objects.typeManagementRefreshFailed", { message: String(error) }), 5000);
+      }
+    }
+    return true;
+  } catch (error) {
+    toast(t("contextMenu.tableOperationFailed", { message: String(error) }), 5000);
+    return false;
+  }
 }
 
 function requestRename(row: ObjectBrowserRow) {
@@ -2312,7 +2456,7 @@ async function refreshRenamePreviewSql() {
   const requestId = ++renamePreviewRequestId;
   const row = renameTarget.value;
   const newName = renameInput.value.trim();
-  if (!showRenameDialog.value || !row || !newName || newName === row.name) {
+  if (!showRenameDialog.value || !row || row.type === "INDEX" || !newName || newName === row.name) {
     renamePreviewSqlText.value = "";
     viewRenamePlan.value = undefined;
     routineRenamePlan.value = undefined;
@@ -2479,7 +2623,7 @@ watch([showRenameDialog, renameTarget, renameInput, selectedSchema, () => props.
 async function confirmRename() {
   const row = renameTarget.value;
   let newName = renameInput.value.trim();
-  if (!row || !newName || newName === row.name) return;
+  if (!row || row.type === "INDEX" || !newName || newName === row.name) return;
   renameError.value = "";
   const oldPinnedNode = pinnedTreeNodeForObjectBrowserRow(row);
   const oldLegacyPinnedNodes = legacyPinnedTreeNodesForObjectBrowserRow(row);
@@ -2619,6 +2763,12 @@ async function confirmRename() {
 async function confirmDrop() {
   if (!dropTarget.value) return;
   const row = dropTarget.value;
+  if (row.type === "INDEX") return;
+  if (isOracleFamilyTypeSource(effectiveDatabaseType.value, row.type)) {
+    await manageTypeDrop(row);
+    dropTarget.value = null;
+    return;
+  }
   let executedSql = "";
   const start = Date.now();
   let successRecorded = false;
@@ -2667,6 +2817,9 @@ async function confirmDrop() {
 }
 
 async function buildDropSqlForRow(row: ObjectBrowserRow, options?: { cascade?: boolean }): Promise<string> {
+  if (row.type === "INDEX") throw new Error(t("schemaIndex.editIndividually"));
+  if (isOracleFamilyTypeSource(effectiveDatabaseType.value, row.type)) throw new Error(t("objects.typeManagementUseSave"));
+  if (row.type === "TYPE" || row.type === "TYPE_BODY") throw new Error(t("objects.sourceReadOnly"));
   if (row.type === "TABLE") {
     return buildDropTableSql(tableAdminSqlOptions(row, { cascade: options?.cascade && supportsDropTableCascade(effectiveDatabaseType.value) }));
   }
@@ -2675,6 +2828,7 @@ async function buildDropSqlForRow(row: ObjectBrowserRow, options?: { cascade?: b
     objectType: row.type,
     schema: row.schema || selectedSchema.value,
     name: row.name,
+    signature: row.signature,
     identifierQuote: connectionStore.connectionIdentifierQuote?.(props.connection.id),
   });
 }
@@ -2758,6 +2912,108 @@ function openStructureEditor(row: ObjectBrowserRow) {
   if (row.type !== "TABLE") return;
   queryStore.openTableStructure(props.connection.id, props.database, row.schema || selectedSchema.value, row.name, undefined, undefined, props.catalog);
 }
+
+function openSchemaIndexEditor(row: ObjectBrowserRow, action?: "delete") {
+  if (row.type !== "INDEX" || !supportsSchemaIndexes.value) return;
+  const target = schemaIndexIdentity(row);
+  if (!target) return;
+  if (!schemaIndexIsSameOwner(target) || connectionIsEffectivelyReadOnly(props.connection)) {
+    if (!action) void openTableInfo(row, "indexes");
+    return;
+  }
+  queryStore.openTableStructure(props.connection.id, props.database, target.parentSchema, target.parentName, "indexes", { kind: "index", name: target.name, owner: target.schema, ...(action ? { action } : {}) }, props.catalog, "table", true);
+}
+
+const showIndexParentPicker = ref(false);
+const indexParentTables = ref<string[]>([]);
+const indexParentTable = ref("");
+const indexParentLoading = ref(false);
+const indexParentError = ref("");
+const indexParentGuard = createSidePanelRequestGuard();
+let loadedIndexParentScope = "";
+function indexParentSchema() {
+  return selectedSchema.value ?? props.schema ?? objectListSchemaForConnection(props.connection, selectedSchema.value) ?? props.database;
+}
+function indexParentScope() {
+  return JSON.stringify([props.connection.id, props.database, props.catalog, indexParentSchema(), connectionConfigFingerprint(props.connection)]);
+}
+async function loadIndexParentTables() {
+  if (!showIndexParentPicker.value || !canCreateSchemaIndex.value) return;
+  const epoch = indexParentGuard.start();
+  const scope = indexParentScope();
+  const schema = indexParentSchema();
+  loadedIndexParentScope = "";
+  indexParentLoading.value = true;
+  indexParentError.value = "";
+  indexParentTables.value = [];
+  indexParentTable.value = "";
+  try {
+    const tables = await indexParentGuard.wait(epoch, api.listTables(props.connection.id, props.database, schema, undefined, undefined, undefined, ["TABLE"], props.catalog, undefined, true), metadataLoadBudgetMs(props.connection.query_timeout_secs));
+    if (indexParentGuard.isStale(epoch) || indexParentScope() !== scope) return;
+    indexParentTables.value = tables.filter((table) => table.table_type.toUpperCase() === "TABLE").map((table) => table.name);
+    loadedIndexParentScope = scope;
+  } catch (error) {
+    if (indexParentGuard.isFresh(epoch) && indexParentScope() === scope) indexParentError.value = translateBackendError(t, error);
+  } finally {
+    if (indexParentGuard.isFresh(epoch)) indexParentLoading.value = false;
+  }
+}
+function createSchemaIndex() {
+  if (!canCreateSchemaIndex.value) return;
+  showIndexParentPicker.value = true;
+  void loadIndexParentTables();
+}
+function confirmIndexParent() {
+  if (!showIndexParentPicker.value || !canCreateSchemaIndex.value || indexParentLoading.value || loadedIndexParentScope !== indexParentScope() || !indexParentTables.value.includes(indexParentTable.value)) return;
+  queryStore.openTableStructure(props.connection.id, props.database, indexParentSchema(), indexParentTable.value, "indexes", { kind: "index", name: "", action: "create" }, props.catalog, "table", true);
+  showIndexParentPicker.value = false;
+}
+watch(showIndexParentPicker, (open) => {
+  if (open) return;
+  indexParentGuard.bump();
+  indexParentLoading.value = false;
+  loadedIndexParentScope = "";
+});
+watch(
+  () => [props.connection.id, props.database, selectedSchema.value, props.catalog, connectionConfigFingerprint(props.connection)],
+  () => {
+    showIndexParentPicker.value = false;
+    indexParentGuard.bump();
+  },
+);
+let consumedIndexCreateRequest = "";
+watch(
+  () => props.initialIndexCreateRequestId,
+  () => {
+    if (props.initialIndexCreateRequestId === undefined) return;
+    const key = JSON.stringify([props.connection.id, props.database, props.schema, props.initialIndexCreateRequestId]);
+    if (consumedIndexCreateRequest === key) return;
+    consumedIndexCreateRequest = key;
+    const scope = indexParentScope();
+    emit("indexRequestConsumed", "create");
+    void nextTick(() => {
+      if (indexParentScope() === scope) createSchemaIndex();
+    });
+  },
+  { immediate: true },
+);
+let consumedIndexViewRequest = "";
+watch(
+  () => [props.initialViewRequestId, props.initialViewTarget],
+  () => {
+    const target = props.initialViewTarget && schemaIndexIdentity(props.initialViewTarget);
+    if (!target || props.initialViewRequestId === undefined || !supportsSchemaIndexes.value) return;
+    const key = JSON.stringify([props.connection.id, props.database, target, props.initialViewRequestId]);
+    if (consumedIndexViewRequest === key) return;
+    consumedIndexViewRequest = key;
+    const scope = indexParentScope();
+    emit("indexRequestConsumed", "view");
+    void nextTick(() => {
+      if (indexParentScope() === scope) void openTableInfo({ ...target, id: `index:${JSON.stringify(target)}`, type: "INDEX", displayName: target.name }, "indexes");
+    });
+  },
+  { immediate: true, flush: "post" },
+);
 
 function droppedTableObjectTypeForRow(row: ObjectBrowserRow): "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | null {
   if (row.type === "TABLE") return "TABLE";
@@ -2853,6 +3109,7 @@ function clearTableSelection() {
 }
 
 function openBatchDatabaseExport() {
+  if (hasSelectedSchemaIndexes.value) return;
   const selectedTables = selectedTableRows.value.map((row) => row.name);
   if (selectedTables.length === 0) return;
   connectionStore.databaseExportSource = {
@@ -2893,6 +3150,22 @@ async function refreshBatchDropPreviewSql() {
 
 function requestBatchDropTables() {
   if (selectedTableCount.value === 0) return;
+  if (selectedTableRows.value.some((row) => row.type === "INDEX")) {
+    toast(t("schemaIndex.editIndividually"), 4000);
+    return;
+  }
+  const selected = [...selectedTableRows.value];
+  const managed = selected.filter((row) => isOracleFamilyTypeSource(effectiveDatabaseType.value, row.type));
+  if (managed.length) {
+    void (async () => {
+      const unique = managed.filter((row) => row.type !== "TYPE_BODY" || !managed.some((other) => other.type === "TYPE" && other.name === row.name && other.schema === row.schema));
+      for (const row of unique) if (!(await manageTypeDrop(row))) return;
+      const remaining = selected.filter((row) => !managed.includes(row));
+      selectedTableIds.value = new Set(remaining.map((row) => row.id));
+      if (remaining.length) requestBatchDropTables();
+    })();
+    return;
+  }
   batchDropCascade.value = false;
   batchDropProgress.value = { completed: 0, total: 0 };
   batchDropPreviewSql.value = "";
@@ -2902,6 +3175,7 @@ function requestBatchDropTables() {
 
 async function confirmBatchDropTables() {
   if (batchDropExecuting.value) return;
+  if (selectedTableRows.value.some((row) => row.type === "INDEX")) return;
   batchDropExecuting.value = true;
   let batchSql = "";
   let batchDropRecorded = false;
@@ -3471,6 +3745,7 @@ function objectBrowserTableNamesCopyText(rows: readonly ObjectBrowserRow[]): str
 }
 
 async function copySelectedTablesToClipboard() {
+  if (hasSelectedSchemaIndexes.value) return;
   const selectedRows = selectedTableRows.value;
   if (selectedRows.length === 0) return;
   connectionStore.treeClipboard = {
@@ -3586,6 +3861,20 @@ function openPasteTableDialog() {
 
 function onObjectBrowserKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return;
+  const selectedIndex = rows.value.find((row) => row.id === selectedRowId.value && row.type === "INDEX");
+  const target = event.target;
+  if (event.key === "Delete" && target instanceof Element && !target.closest("input, textarea, select, [contenteditable='true']") && selectedTableCount.value > 1 && selectedTableRows.value.some((row) => row.type === "INDEX")) {
+    event.preventDefault();
+    event.stopPropagation();
+    toast(t("schemaIndex.editIndividually"), 4000);
+    return;
+  }
+  if (selectedIndex && target instanceof Element && !target.closest("input, textarea, select, [contenteditable='true']") && (event.key === "Delete" || event.key === "F2")) {
+    event.preventDefault();
+    event.stopPropagation();
+    openSchemaIndexEditor(selectedIndex, event.key === "Delete" ? "delete" : undefined);
+    return;
+  }
   if (!supportsBatchTableActions.value) return;
   if (eventTargetAllowsAppClipboardShortcut(event, "c")) {
     if (selectedTableCount.value === 0) return;
@@ -4013,10 +4302,27 @@ async function saveSource() {
   const databaseType = effectiveDatabaseType.value;
   sourceSaving.value = true;
   sourceSaveError.value = "";
+  let save: Awaited<ReturnType<typeof prepareObjectSourceSave>> | undefined;
   try {
     if (!sourceIdentity) return;
     const identity = sourceIdentity;
     assertSourceIdentity(identity);
+    if (isOracleFamilyTypeSource(databaseType, row.type)) {
+      const source = sourceDraft.value;
+      const result = await requestOracleTypeManagement({
+        target: { connectionId, database, owner: schema, name: row.name, databaseType: databaseType as "oracle" | "oceanbase-oracle" | "dameng" },
+        operation: row.type === "TYPE_BODY" ? "save-body" : "save-spec",
+        source,
+        baseSource: sourceEditableText.value,
+        isCurrent: () => sidePanelGuard.isFresh(epoch) && sourceRow.value === row && sourceDraft.value === source,
+      });
+      if (!result.complete || sidePanelGuard.isStale(epoch)) return;
+      toast(t("objects.sourceSaved"));
+      sourceEditing.value = false;
+      sourceDraft.value = "";
+      await loadSourcePanel(row);
+      return;
+    }
     const statements = await buildExecutableObjectSourceStatements({
       databaseType,
       objectType: row.type as ObjectSourceKind,
@@ -4024,31 +4330,32 @@ async function saveSource() {
       name: row.name,
       source: sourceDraft.value,
     });
+    save = await prepareObjectSourceSave(connectionId, database, databaseType, statements, schema, { objectType: row.type as ObjectSourceKind, name: row.name });
+    const preparedSave = save;
     const execute = async () => {
-      if (sidePanelGuard.isStale(epoch) || sourceRow.value !== row) return false;
+      if (sidePanelGuard.isStale(epoch) || sourceRow.value !== row) return;
       const release = beginSourceSave(identity);
       try {
-        await executeObjectSourceSave(connectionId, database, databaseType, statements, schema);
-        return true;
+        return { operation: await preparedSave() };
       } finally {
         release();
       }
     };
     const executableSql = statements.filter((sql) => sql.trim()).join(";\n");
+    let result;
     if (executableSql.trim()) {
-      const saved = await executeWithProductionSqlGuard({
+      result = await executeWithProductionSqlGuard({
         connection,
         database,
         sql: executableSql,
         source: t("production.sourceObjectSource"),
         execute,
       });
-      if (!saved || sidePanelGuard.isStale(epoch)) return;
     } else {
-      if (!(await execute())) return;
-      if (sidePanelGuard.isStale(epoch)) return;
+      result = await execute();
     }
-    toast(t("objects.sourceSaved"));
+    if (!result || sidePanelGuard.isStale(epoch)) return;
+    toast(objectSourceSaveSuccessMessage(t("objects.sourceSaved"), result.operation), result.operation?.readback?.compilerMessages.length ? 6000 : 2000);
     sourceEditing.value = false;
     sourceDraft.value = "";
     await openSource(row);
@@ -4056,6 +4363,7 @@ async function saveSource() {
     if (sidePanelGuard.isStale(epoch)) return;
     sourceSaveError.value = formatObjectSourceSaveError(e, databaseType, row.type as ObjectSourceKind, t("objects.postgresViewColumnChangeHint"));
   } finally {
+    await save?.dispose?.();
     if (sidePanelGuard.isFresh(epoch)) sourceSaving.value = false;
   }
 }
@@ -4095,13 +4403,14 @@ function objectBrowserRowsCacheScope(schema: string): ObjectBrowserRowsCacheScop
     database: props.database,
     schema,
     catalog: props.catalog,
+    ...(supportsSchemaIndexes.value ? { exactIdentity: true } : {}),
   };
 }
 
 function applyObjectBrowserRows(nextRows: ObjectBrowserRow[]) {
   rows.value = nextRows;
-  const availableTableIds = new Set(rows.value.filter((row) => row.type === "TABLE").map((row) => row.id));
-  setSelectedTableIds(new Set([...selectedTableIds.value].filter((id) => availableTableIds.has(id))));
+  const availableIds = new Set(selectableRows.value.map((row) => row.id));
+  setSelectedTableIds(new Set([...selectedTableIds.value].filter((id) => availableIds.has(id))));
   expandedPartitionParentIds.value = new Set([...expandedPartitionParentIds.value].filter((id) => rows.value.some((row) => row.id === id && row.partitionCount)));
 }
 
@@ -4157,7 +4466,7 @@ watch([() => props.initialEventName, () => props.initialEventOpenRequestId, () =
 // 达梦；oracle/oceanbase-oracle 维持空 schema 由后端解析当前 schema。
 async function loadObjects(options?: { allowCached?: boolean; preserveExistingRows?: boolean }) {
   clearTimeout(objectSearchTimer);
-  if (usesServerObjectPaging.value) return loadObjectPage(false);
+  if (usesServerObjectPaging.value) return loadObjectPage(false, options);
   error.value = "";
   // A new load supersedes any in-flight one, so reset the transient refresh flags
   // on entry. A superseded request's finally() can no longer run (the guard's
@@ -4235,14 +4544,22 @@ async function loadObjects(options?: { allowCached?: boolean; preserveExistingRo
   }
 }
 
-async function loadObjectPage(append: boolean) {
-  if (append && (loadingObjects.value || loadingMoreObjects.value || !hasMoreObjects.value)) return;
-  const schema = needsSchema.value ? objectListSchemaForConnection(props.connection, selectedSchema.value) : props.database;
+function exactIndexPageAnchor(object: ObjectInfo | undefined): string | undefined {
+  return object ? JSON.stringify([object.schema, object.name, object.parent_schema, object.parent_name]) : undefined;
+}
+
+async function loadObjectPage(append: boolean, options?: { preserveExistingRows?: boolean }) {
+  if (append && (loadingObjects.value || refreshingObjects.value || loadingMoreObjects.value || !hasMoreObjects.value)) return;
+  const schema = exactIndexList.value ? indexParentSchema() : needsSchema.value ? objectListSchemaForConnection(props.connection, selectedSchema.value) : props.database;
   const request = objectBrowserRowsLoadGuard.start(objectBrowserRowsCacheScope(schema));
   const offset = append ? objectPageOffset : 0;
   const pageSize = objectPageSize.value;
   const filter = search.value.trim();
   const typeFilter = objectFilter.value;
+  const exactIdentity = exactIndexList.value;
+  const keepExisting = exactIdentity && !append && options?.preserveExistingRows === true && rows.value.length > 0;
+  const expectedAnchor = append ? indexNextPageAnchor : undefined;
+  const queryTypes = supportsSchemaIndexes.value && typeFilter === "all" ? sidebarObjectKindsForDatabase(effectiveDatabaseType.value).filter((type) => type !== "INDEX") : undefined;
   const objectTypes: Partial<Record<ObjectFilter, (SidebarObjectKind | "EVENT")[]>> = {
     tables: ["TABLE"],
     views: ["VIEW"],
@@ -4252,52 +4569,79 @@ async function loadObjectPage(append: boolean) {
     triggers: ["TRIGGER"],
     events: ["EVENT"],
     sequences: ["SEQUENCE"],
+    indexes: ["INDEX"],
     packages: ["PACKAGE", "PACKAGE_BODY"],
     types: ["TYPE", "TYPE_BODY"],
   };
   const isCurrent = () => objectBrowserRowsLoadGuard.isCurrent(request) && search.value.trim() === filter && objectFilter.value === typeFilter;
   error.value = "";
   scaffoldRefreshError.value = "";
-  loadingObjects.value = !append;
+  loadingObjects.value = !append && !keepExisting;
+  refreshingObjects.value = keepExisting;
   loadingMoreObjects.value = append;
-  if (!append) {
+  if (!append && !keepExisting) {
     rows.value = [];
     hasMoreObjects.value = false;
     objectPageOffset = 0;
+    indexNextPageAnchor = undefined;
   }
   try {
     if (parseSlashDelimitedRegexQuery(filter)) {
       error.value = t("objects.pagedRegexUnsupported");
       return;
     }
-    const objects = await objectBrowserRowsLoadGuard.wait(
-      request.epoch,
-      api.listObjects(request.scope.connectionId, request.scope.database, request.scope.schema, objectTypes[typeFilter], filter || undefined, pageSize + 1, offset, request.scope.catalog),
-      metadataLoadBudgetMs(props.connection.query_timeout_secs),
-    );
+    const fetchPage = (pageOffset: number, size: number) =>
+      objectBrowserRowsLoadGuard.wait(
+        request.epoch,
+        exactIdentity
+          ? api.listObjects(request.scope.connectionId, request.scope.database, request.scope.schema, objectTypes[typeFilter], filter || undefined, size + 1, pageOffset, request.scope.catalog, undefined, undefined, true)
+          : api.listObjects(request.scope.connectionId, request.scope.database, request.scope.schema, queryTypes ?? objectTypes[typeFilter], filter || undefined, size + 1, pageOffset, request.scope.catalog),
+        metadataLoadBudgetMs(props.connection.query_timeout_secs),
+      );
+    let objects = await fetchPage(offset, pageSize);
     if (!isCurrent()) return;
-    const page = objects.slice(0, pageSize);
-    const pageRows = buildObjectBrowserRows({ objects: page, database: request.scope.database, fallbackSchema: request.scope.schema, rowSchema: connectionObjectTreeNodeSchema(props.connection, props.database, selectedSchema.value) });
-    applyObjectBrowserRows(append ? [...rows.value, ...pageRows] : pageRows);
-    objectPageOffset = offset + page.length;
-    hasMoreObjects.value = objects.length > pageSize;
+    let pageOffset = offset;
+    let size = pageSize;
+    // Match the sidebar's peek-row contract: a moved offset replaces the whole
+    // displayed window instead of appending an overlapping or incomplete page.
+    if (exactIdentity && append && expectedAnchor && exactIndexPageAnchor(objects[0]) !== expectedAnchor) {
+      pageOffset = 0;
+      size = offset + pageSize;
+      objects = await fetchPage(pageOffset, size);
+      if (!isCurrent()) return;
+    }
+    const page = objects.slice(0, size);
+    const pageRows = buildObjectBrowserRows({
+      objects: page.filter((object) => !supportsSchemaIndexes.value || typeFilter !== "all" || object.object_type !== "INDEX"),
+      database: request.scope.database,
+      fallbackSchema: request.scope.schema,
+      rowSchema: connectionObjectTreeNodeSchema(props.connection, props.database, selectedSchema.value),
+    });
+    applyObjectBrowserRows(append && pageOffset > 0 ? [...rows.value, ...pageRows] : pageRows);
+    objectPageOffset = pageOffset + page.length;
+    hasMoreObjects.value = objects.length > size;
+    indexNextPageAnchor = exactIdentity && hasMoreObjects.value ? exactIndexPageAnchor(objects[size]) : undefined;
   } catch (e: unknown) {
     if (!isCurrent()) return;
-    if (append) scaffoldRefreshError.value = translateBackendError(t, e);
+    if (append || keepExisting) scaffoldRefreshError.value = translateBackendError(t, e);
     else error.value = translateBackendError(t, e);
   } finally {
     if (isCurrent()) {
       loadingObjects.value = false;
       loadingMoreObjects.value = false;
+      refreshingObjects.value = false;
       if (!append) finishObjectBrowserRowsLoad();
     }
   }
 }
 
 async function loadSqlObjectBrowserRows(request: ObjectBrowserRowsLoadHandle) {
-  const objects: ObjectInfo[] = await api.listObjects(request.scope.connectionId, request.scope.database, request.scope.schema, undefined, undefined, undefined, undefined, request.scope.catalog);
+  // Schema indexes use their dedicated exact, server-paged filter. Mixing an
+  // unbounded exact subset into the legacy all view defeats both contracts.
+  const types = supportsSchemaIndexes.value ? sidebarObjectKindsForDatabase(effectiveDatabaseType.value).filter((type) => type !== "INDEX") : undefined;
+  const objects = await api.listObjects(request.scope.connectionId, request.scope.database, request.scope.schema, types, undefined, undefined, undefined, request.scope.catalog);
   return buildObjectBrowserRows({
-    objects: objects.filter((object) => object.object_type !== "INDEX"),
+    objects: objects.filter((object) => !supportsSchemaIndexes.value || object.object_type !== "INDEX"),
     database: request.scope.database,
     fallbackSchema: request.scope.schema,
     rowSchema: connectionObjectTreeNodeSchema(props.connection, props.database, selectedSchema.value),
@@ -4403,6 +4747,7 @@ function filterCount(filter: ObjectFilter) {
 }
 
 function filterLabel(filter: ObjectFilter) {
+  if (filter === "indexes") return usesServerObjectPaging.value ? t("tree.indexes") : `${t("tree.indexes")} ${filterCount(filter)}`;
   const key =
     filter === "tables"
       ? isMongodb.value
@@ -4432,11 +4777,19 @@ function filterLabel(filter: ObjectFilter) {
 
 function selectObjectFilter(filter: ObjectFilter) {
   if (filter === objectFilter.value) return;
+  const wasPaged = usesServerObjectPaging.value;
   userHasSelectedFilter.value = true;
   objectFilter.value = filter;
   emit("filterChange", filter);
-  if (usesServerObjectPaging.value) void loadObjects();
+  if (wasPaged || usesServerObjectPaging.value) void loadObjects();
 }
+
+watch(
+  () => props.selectedObjectFilter ?? props.initialObjectFilter,
+  (filter) => {
+    if (filter && (filter === "indexes" || objectFilter.value === "indexes")) selectObjectFilter(filter);
+  },
+);
 
 function getSearchInput(): HTMLInputElement | null {
   return rootRef.value?.querySelector<HTMLInputElement>("[data-object-search-input]") ?? null;
@@ -4477,6 +4830,7 @@ function matchesRefreshScope(scope: { schema?: string; catalog?: string }): bool
 defineExpose({ focusSearch, refresh, matchesRefreshScope });
 
 onBeforeUnmount(() => {
+  indexParentGuard.bump();
   objectBrowserUnmounted = true;
   invalidObjectsDialogGeneration++;
   invalidObjectSourceRequestGeneration++;
@@ -4535,6 +4889,7 @@ watch(
 );
 
 // ---- CustomContextMenu helpers ----
+watch(() => props.propertyRequest?.requestId, openRequestedProperties, { immediate: true, flush: "post" });
 
 function exportDataSubmenu(item: ObjectBrowserRow): ContextMenuItem {
   const formats: ContextMenuItem[] = [
@@ -4768,12 +5123,16 @@ function getPackageMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 function getTypeMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   const items: ContextMenuItem[] = [];
   const capabilities = customTypeCapabilities(effectiveDatabaseType.value);
-  // Verified PG-family types open the read-only details panel; Xugu keeps its
-  // “view source” entry for TYPE/TYPE_BODY rows.
+  // Oracle-family types expose source alongside read-only TYPE details; Xugu
+  // keeps its source entry for TYPE/TYPE_BODY rows.
   if (supportsTypeObjectSource(effectiveDatabaseType.value)) {
     items.push({ label: t("contextMenu.viewSource"), action: () => openSource(item), icon: Code2 });
   }
-  if (capabilities.details) {
+  if (supportsOracleFamilyTypeManagement(effectiveDatabaseType.value)) {
+    items.push({ label: t("contextMenu.editObject"), action: () => openSourceTab(item), icon: PencilLine });
+    items.push({ label: t("contextMenu.dropObject"), action: () => requestDrop(item), icon: Trash2, variant: "destructive" });
+  }
+  if (capabilities.details && item.type === "TYPE") {
     items.push({ label: t("contextMenu.viewDetails"), action: () => void openTypeInfo(item), icon: Info });
     if (capabilities.ddl) {
       items.push({ label: t("contextMenu.viewDdl"), action: () => openTypeDdl(item), icon: FileCode });
@@ -4788,6 +5147,28 @@ function getTypeMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 }
 
 function getObjectBrowserActionMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
+  if (item.type === "INDEX") {
+    const target = schemaIndexIdentity(item);
+    const writable = supportsSchemaIndexes.value && schemaIndexIsSameOwner(target) && !connectionIsEffectivelyReadOnly(props.connection);
+    const multiple = selectedTableCount.value > 1 && selectedTableIds.value.has(item.id);
+    return [
+      ...(target ? [{ label: t("contextMenu.viewDetails"), action: () => void openTableInfo(item, "indexes"), icon: Info }] : [{ label: t("schemaIndex.parentUnavailable"), disabled: true }]),
+      ...(writable
+        ? [
+            { label: t("contextMenu.editStructure"), action: () => openSchemaIndexEditor(item), icon: PencilRuler },
+            { label: t(multiple ? "schemaIndex.editIndividually" : "contextMenu.dropIndex"), action: () => (multiple ? toast(t("schemaIndex.editIndividually"), 4000) : openSchemaIndexEditor(item, "delete")), icon: Trash2, variant: "destructive" as const },
+          ]
+        : []),
+      { label: t("contextMenu.copyName"), action: () => copyName(item), icon: Copy },
+      {
+        label: t("grid.refresh"),
+        action: () => {
+          refresh();
+        },
+        icon: RefreshCw,
+      },
+    ];
+  }
   if (isMongodb.value) {
     return [
       { label: t("contextMenu.viewData"), action: () => openViewData(item), icon: Table2 },
@@ -4847,6 +5228,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     <SidebarMenuPreferencesDialog v-if="sidebarMenuPreferences" v-model:open="sidebarMenuPreferencesOpen" :scope="sidebarMenuPreferences.scope" :items="sidebarMenuPreferences.items" />
     <div v-if="!isEventEditor" ref="toolbarRef" class="flex h-10 shrink-0 items-center gap-2 overflow-hidden border-b px-3">
       <Button v-if="effectiveDatabaseType === 'firebird'" variant="outline" size="sm" @click="firebirdManagerOpen = true">{{ t("tree.firebirdObjectManager") }}</Button>
+      <Button v-if="canCreateSchemaIndex" data-create-schema-index variant="outline" size="sm" class="h-7 shrink-0 gap-1 px-2 text-xs" @click="createSchemaIndex"> <CopyPlus class="h-3.5 w-3.5" />{{ t("structureEditor.addIndex") }} </Button>
       <Button v-if="oracleInvalidObjectsSupported" variant="ghost" size="sm" class="h-7 gap-1.5 px-2 text-xs" @click="setOracleInvalidObjectsOpen(true)">{{ t("processList.oracleInvalidObjects.title") }}</Button>
       <div class="flex min-w-12 items-center gap-2">
         <span class="inline-flex max-w-[14rem] min-w-0 items-center rounded border border-border bg-muted/50 px-2 py-0.5 text-xs font-medium truncate" :title="selectedSchema || props.database">
@@ -5007,11 +5389,11 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       <div class="min-w-0 flex-1 truncate text-muted-foreground">
         {{ t("objects.selectedTables", { count: selectedTableCount }) }}
       </div>
-      <Button v-if="supportsBatchTableActions" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openBatchDatabaseExport">
+      <Button v-if="supportsBatchTableActions && !hasSelectedSchemaIndexes" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="openBatchDatabaseExport">
         <Upload class="mr-1.5 h-3.5 w-3.5" />
         {{ t("objects.exportSelected") }}
       </Button>
-      <Button v-if="supportsBatchTableActions" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="copySelectedTablesToClipboard">
+      <Button v-if="supportsBatchTableActions && !hasSelectedSchemaIndexes" variant="ghost" size="sm" class="h-7 px-2 text-xs" @click="copySelectedTablesToClipboard">
         <Clipboard class="mr-1.5 h-3.5 w-3.5" />
         {{ t("objects.copyTableSelected") }}
       </Button>
@@ -5037,14 +5419,14 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
       <RefreshCw class="h-3 w-3 shrink-0" />
       <span class="min-w-0 truncate">{{ scaffoldRefreshError }}</span>
     </div>
-    <div v-if="loadingObjects" class="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
+    <div v-if="loadingObjects && !isSchemaIndexInfo" class="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
       <Loader2 class="h-4 w-4 animate-spin" />
       {{ t("objects.loading") }}
     </div>
-    <div v-else-if="error" class="flex flex-1 items-center justify-center px-6 text-center text-sm text-destructive">
+    <div v-else-if="error && !isSchemaIndexInfo" class="flex flex-1 items-center justify-center px-6 text-center text-sm text-destructive">
       {{ error }}
     </div>
-    <div v-else-if="filteredRows.length === 0 && !isEventEditor" class="flex flex-1 items-center justify-center text-sm text-muted-foreground">
+    <div v-else-if="filteredRows.length === 0 && !isEventEditor && !isSchemaIndexInfo" class="flex flex-1 items-center justify-center text-sm text-muted-foreground">
       {{ t("objects.empty") }}
     </div>
     <div v-else class="flex min-h-0 min-w-0 flex-1" :class="{ 'event-editor-layout': isEventEditor }">
@@ -5371,7 +5753,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               <span class="block truncate">{{ tab.label }}</span>
             </button>
           </div>
-          <div class="flex items-center gap-1 px-2 py-1.5 border-b shrink-0 bg-background">
+          <div v-if="tableInfoTab !== 'relations'" class="flex items-center gap-1 px-2 py-1.5 border-b shrink-0 bg-background">
             <div class="relative min-w-0 flex-1">
               <Search class="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground" />
               <input v-model="tableInfoSearchQuery" data-table-info-search :placeholder="t('grid.tableInfoSearch')" class="w-full h-7 pl-7 pr-6 text-xs bg-muted/50 rounded border border-border focus:outline-none focus:border-primary/50" @keydown.escape="tableInfoSearchQuery = ''" />
@@ -5386,7 +5768,9 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
           <div v-if="tableInfoTab === 'ddl' && effectiveDatabaseType === 'oceanbase-oracle'" class="border-b px-3 py-2">
             <DdlStorageToggle :database-type="effectiveDatabaseType" :disabled="tableDdlLoading" />
           </div>
-          <div v-if="tableInfoTab === 'info'" class="flex-1 min-h-0 overflow-auto">
+          <p v-if="propertyFocus && (tableInfoTab === 'indexes' || tableInfoTab === 'relations')" class="break-all border-b px-3 py-2 font-mono text-sm text-muted-foreground">{{ propertyFocus.owner }}.{{ propertyFocus.name }}</p>
+          <ObjectDependenciesPanel v-if="tableInfoTab === 'relations'" :target="dependencyTarget" v-model:section="tableRelationsSection" :include-source="false" @view-sql="viewRelationSql" @open-object="openRelationObject" />
+          <div v-else-if="tableInfoTab === 'info'" class="flex-1 min-h-0 overflow-auto">
             <div v-if="tableOverviewLoading" class="h-full flex items-center justify-center">
               <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
             </div>
@@ -5447,9 +5831,11 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             </table>
           </div>
           <div v-else-if="tableInfoTab === 'indexes'" class="flex-1 min-h-0 overflow-auto">
+            <p v-if="sidePanelRow?.type === 'INDEX' && tableIndexesLoaded && !tableIndexesError && !tableIndexes.some(isInitialSchemaIndex)" class="border-b px-3 py-2 text-xs text-muted-foreground" data-schema-index-focus-unavailable>{{ t("schemaIndex.focusUnavailable") }}</p>
             <div v-if="tableIndexesLoading" class="h-full flex items-center justify-center">
               <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
             </div>
+            <div v-else-if="tableIndexesError" class="p-3 text-xs text-destructive">{{ tableIndexesError }}</div>
             <div v-else-if="tableInfoSearchQuery && filteredTableIndexes.length === 0" class="p-6 text-center text-xs text-muted-foreground">
               {{ t("grid.tableInfoNoResults") }}
             </div>
@@ -5457,7 +5843,13 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               {{ t("grid.tableInfoEmpty") }}
             </div>
             <div v-else class="divide-y">
-              <div v-for="index in filteredTableIndexes" :key="index.name" class="p-3 text-xs">
+              <div
+                v-for="(index, ordinal) in filteredTableIndexes"
+                :key="JSON.stringify([schemaIndexOwner(index), index.name, ordinal])"
+                class="p-3 text-xs"
+                :class="{ 'bg-primary/10 ring-1 ring-inset ring-primary/40': isInitialSchemaIndex(index) }"
+                :data-schema-index-match="isInitialSchemaIndex(index) || undefined"
+              >
                 <div class="flex items-start gap-2">
                   <div class="min-w-0 flex-1">
                     <div class="font-medium truncate">{{ index.name }}</div>
@@ -5552,7 +5944,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
         </template>
         <!-- Type info mode (read-only user-defined type details) -->
         <template v-else-if="sidePanelMode === 'type-info'">
-          <CustomTypeInfoPanel ref="sidePanelRef" :connection="props.connection" :database="props.database" :schema="sidePanelRow?.schema || selectedSchema || props.database" :name="sidePanelRow?.name || ''" :catalog="props.catalog" @close="closeSidePanel" />
+          <CustomTypeInfoPanel ref="sidePanelRef" :connection="props.connection" :database="props.database" :database-type="effectiveDatabaseType" :schema="sidePanelRow?.schema || selectedSchema || props.database" :name="sidePanelRow?.name || ''" :catalog="props.catalog" @close="closeSidePanel" />
         </template>
         <template v-else-if="sidePanelMode === 'event-editor'">
           <MySqlEventEditor :key="eventEditorKey" :connection="props.connection" :database="props.database" :schema="sidePanelRow?.schema || selectedSchema || props.database" :name="sidePanelRow?.name" :read-only="props.initialEventReadOnly" @saved="onEventSaved" @close="closeSidePanel" />
@@ -5565,35 +5957,56 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             <span v-if="sourceRow?.valid != null" class="shrink-0 rounded border px-1 py-px text-[10px] font-medium" :class="sourceRow.valid ? 'border-emerald-500/30 text-emerald-600' : 'border-destructive/30 text-destructive'">
               {{ t(sourceRow.valid ? "objects.validStatus" : "objects.invalidStatus") }}
             </span>
-            <Button v-if="sourceEditing" variant="ghost" size="sm" class="h-6 px-2 text-xs" :disabled="sourceSaving || !sourceDraft.trim()" @click="saveSource">
-              <Loader2 v-if="sourceSaving" class="mr-1 h-3 w-3 animate-spin" />
-              {{ t("objects.saveSource") }}
-            </Button>
-            <Button v-if="sourceEditing" variant="ghost" size="sm" class="h-6 px-2 text-xs" :disabled="sourceSaving" @click="cancelEditSource">
-              {{ t("objects.cancelEdit") }}
-            </Button>
-            <Button v-if="!sourceEditing" variant="ghost" size="icon" class="h-5 w-5" :disabled="!sourceContent" @click="copySource">
-              <Copy class="h-3 w-3" />
-            </Button>
-            <Button v-if="!sourceEditing && sourceCanEdit" variant="ghost" size="icon" class="h-5 w-5" :disabled="!sourceContent" @click="editSource">
-              <PencilLine class="h-3 w-3" />
-            </Button>
-            <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="sourceLoading || sourceSaving" :title="t('structureEditor.refresh')" :aria-label="t('structureEditor.refresh')" @click="refreshActiveSource">
-              <RefreshCw class="h-3 w-3" :class="{ 'animate-spin': sourceLoading }" />
-            </Button>
+            <template v-if="sourceSection === 'source'">
+              <Button v-if="sourceEditing" variant="ghost" size="sm" class="h-6 px-2 text-xs" :disabled="sourceSaving || !sourceDraft.trim()" @click="saveSource">
+                <Loader2 v-if="sourceSaving" class="mr-1 h-3 w-3 animate-spin" />
+                {{ t("objects.saveSource") }}
+              </Button>
+              <Button v-if="sourceEditing" variant="ghost" size="sm" class="h-6 px-2 text-xs" :disabled="sourceSaving" @click="cancelEditSource">
+                {{ t("objects.cancelEdit") }}
+              </Button>
+              <Button v-if="!sourceEditing" variant="ghost" size="icon" class="h-5 w-5" :disabled="!sourceContent" @click="copySource">
+                <Copy class="h-3 w-3" />
+              </Button>
+              <Button v-if="!sourceEditing && sourceCanEdit" variant="ghost" size="icon" class="h-5 w-5" :disabled="!sourceContent" @click="editSource">
+                <PencilLine class="h-3 w-3" />
+              </Button>
+              <Button variant="ghost" size="icon" class="h-5 w-5" :disabled="sourceLoading || sourceSaving" :title="t('structureEditor.refresh')" :aria-label="t('structureEditor.refresh')" @click="refreshActiveSource">
+                <RefreshCw class="h-3 w-3" :class="{ 'animate-spin': sourceLoading }" />
+              </Button>
+            </template>
             <Button variant="ghost" size="icon" class="h-5 w-5" @click="closeSource">
               <X class="h-3 w-3" />
             </Button>
           </div>
-          <div v-if="sourceLoading" class="flex flex-1 items-center justify-center">
-            <Loader2 class="h-4 w-4 animate-spin text-muted-foreground" />
-          </div>
-          <div v-else-if="sourceError" class="flex flex-1 items-center justify-center px-4 text-sm text-destructive">
-            {{ sourceError }}
-          </div>
-          <div v-else-if="sourceEditing" class="flex min-h-0 flex-1 flex-col" data-object-source-editor>
+          <ObjectDependenciesPanel :target="dependencyTarget" v-model:section="sourceSection" @view-sql="viewRelationSql" @open-object="openRelationObject">
+            <div v-if="sourceLoading" class="flex flex-1 items-center justify-center">
+              <Loader2 class="h-4 w-4 animate-spin text-muted-foreground" />
+            </div>
+            <div v-else-if="sourceError" class="flex flex-1 items-center justify-center px-4 text-sm text-destructive">
+              {{ sourceError }}
+            </div>
+            <div v-else-if="sourceEditing" class="flex min-h-0 flex-1 flex-col" data-object-source-editor>
+              <QueryEditor
+                v-model="sourceDraft"
+                class="min-h-0 flex-1"
+                :connection-id="props.connection.id"
+                :database="props.database"
+                :schema="selectedSchema"
+                :database-type="props.connection.db_type"
+                :dialect="sourceDialect"
+                :format-dialect="sourceFormatDialect"
+                force-word-wrap
+                @save="sourceSection === 'source' && saveSource()"
+              />
+              <div v-if="sourceSaveError" class="shrink-0 whitespace-pre-wrap break-words border-t px-3 py-2 text-xs text-destructive">
+                {{ sourceSaveError }}
+              </div>
+            </div>
             <QueryEditor
-              v-model="sourceDraft"
+              v-else
+              :key="`source-preview-${sourceRow?.id}`"
+              :model-value="sourceContent"
               class="min-h-0 flex-1"
               :connection-id="props.connection.id"
               :database="props.database"
@@ -5602,27 +6015,10 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               :dialect="sourceDialect"
               :format-dialect="sourceFormatDialect"
               force-word-wrap
-              @save="saveSource"
+              read-only
+              data-object-source-preview
             />
-            <div v-if="sourceSaveError" class="shrink-0 whitespace-pre-wrap break-words border-t px-3 py-2 text-xs text-destructive">
-              {{ sourceSaveError }}
-            </div>
-          </div>
-          <QueryEditor
-            v-else
-            :key="`source-preview-${sourceRow?.id}`"
-            :model-value="sourceContent"
-            class="min-h-0 flex-1"
-            :connection-id="props.connection.id"
-            :database="props.database"
-            :schema="selectedSchema"
-            :database-type="props.connection.db_type"
-            :dialect="sourceDialect"
-            :format-dialect="sourceFormatDialect"
-            force-word-wrap
-            read-only
-            data-object-source-preview
-          />
+          </ObjectDependenciesPanel>
         </template>
       </div>
     </div>
@@ -5707,6 +6103,34 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
     @reload="validatePackageSaveAsDrafts"
     @confirm="confirmPackageSaveAs"
   />
+  <Dialog v-model:open="showIndexParentPicker">
+    <DialogContent data-schema-index-parent-picker class="sm:max-w-[420px]">
+      <DialogHeader
+        ><DialogTitle>{{ t("structureEditor.addIndex") }}</DialogTitle></DialogHeader
+      >
+      <label class="grid gap-2 text-sm">
+        {{ t("structureEditor.tableName") }}
+        <SearchableSelect
+          data-index-parent-table
+          v-model="indexParentTable"
+          :options="indexParentTables"
+          :loading="indexParentLoading"
+          :disabled="indexParentLoading"
+          :placeholder="t('dataCompare.selectTable')"
+          :search-placeholder="t('dataCompare.searchTable')"
+          :empty-text="t('grid.noSearchResults')"
+        />
+      </label>
+      <div v-if="indexParentError" role="alert" class="flex items-center gap-2 text-sm text-destructive">
+        <span class="min-w-0 flex-1 break-words">{{ indexParentError }}</span>
+        <Button variant="outline" size="sm" @click="loadIndexParentTables">{{ t("common.retry") }}</Button>
+      </div>
+      <DialogFooter>
+        <Button variant="outline" @click="showIndexParentPicker = false">{{ t("common.cancel") }}</Button>
+        <Button data-confirm-index-parent :disabled="indexParentLoading || !indexParentTables.includes(indexParentTable) || !!indexParentError" @click="confirmIndexParent">{{ t("common.confirm") }}</Button>
+      </DialogFooter>
+    </DialogContent>
+  </Dialog>
   <Dialog v-model:open="showRenameDialog">
     <DialogContent
       :class="(effectiveDatabaseType === 'oracle' || effectiveDatabaseType === 'oceanbase-oracle') && (renameTarget?.type === 'VIEW' || renameTarget?.type === 'PROCEDURE' || renameTarget?.type === 'FUNCTION' || renameTarget?.type === 'TABLE') ? 'sm:max-w-[min(90vw,900px)]' : 'sm:max-w-[420px]'"

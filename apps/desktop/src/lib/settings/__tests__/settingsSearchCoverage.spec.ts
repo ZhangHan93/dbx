@@ -141,7 +141,7 @@ function inspectSettingsTemplates(entry: string): Map<string, Set<string>> {
       if (excludedComponents[component]) continue;
       const importPath = imports.get(component)!;
       const target = importPath.startsWith("@/") ? resolve(src, importPath.slice(2)) : resolve(dirname(file), importPath);
-      if (/\/components\/(ui|icons)\//.test(target)) continue;
+      if (/\/components\/(ui|icons)\//.test(target.replaceAll("\\", "/"))) continue;
       visit(target);
     }
   }

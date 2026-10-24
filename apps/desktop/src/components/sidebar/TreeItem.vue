@@ -56,8 +56,20 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import LightTooltip from "@/components/ui/LightTooltip.vue";
-import type { ColumnInfo, CustomTypeTreeMemberMeta, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
-import { alignedCommentLeadingWidth, canTreeNodePin, canTreeNodeShowExpander, isSidebarCommentSupportedType, sidebarTreeNodeComment, trailingCommentAvailableWidth, trailingCommentGapPx, treeItemPaddingLeft, treeLabelWidthClass, usesFullWidthTreeLabel } from "@/lib/sidebar/sidebarTreeItemLayout";
+import type { ColumnInfo, DatabaseType, TreeNode, TriggerInfo } from "@/types/database";
+import {
+  alignedCommentLeadingWidth,
+  canTreeNodePin,
+  canTreeNodeShowExpander,
+  isSidebarCommentSupportedType,
+  sidebarTreeNodeComment,
+  trailingCommentAvailableWidth,
+  trailingCommentGapPx,
+  sidebarRightCommentMaxWidthPx,
+  treeItemPaddingLeft,
+  treeLabelWidthClass,
+  usesFullWidthTreeLabel,
+} from "@/lib/sidebar/sidebarTreeItemLayout";
 import {
   clearActiveTableReferencePayload,
   createColumnReferencePayload,
@@ -100,14 +112,14 @@ import { ensureSqlExtension, stripSqlExtension } from "@/lib/savedSql/savedSqlFi
 import { savedSqlErrorMessage } from "@/lib/savedSql/savedSqlErrors";
 import { useSavedSqlStore } from "@/stores/savedSqlStore";
 import { elasticsearchIndexAliasLabel } from "@/lib/sidebar/elasticsearchIndexActions";
-import { isXuguPublicSynonymTreeNode, isXuguSchedulerJobTreeNode, xuguSchemaDisplayName } from "@/lib/sidebar/xuguPublicSynonyms";
+import { isXuguPublicSynonymTreeNode, isXuguSchedulerJobTreeNode } from "@/lib/sidebar/xuguPublicSynonyms";
 import { xuguDatafileDetailRows, xuguTablespaceDetailRows } from "@/lib/sidebar/xuguTablespaces";
 // --- Drag and Drop ---
 import { useDragSort } from "@/composables/useDragSort";
 import { sidebarTreeRuntimeKey } from "@/lib/sidebar/sidebarTreeRuntime";
 import { treeNodePinKey } from "@/lib/app/pinnedItems";
-import { isTreeGroupNodeType } from "@/lib/sidebar/treeNodeGroup";
-import { customTypeCapabilities } from "@/lib/database/databaseObjectCapabilities";
+import { customTypeCapabilities, supportsOracleTypeAttributeExpansion } from "@/lib/database/databaseObjectCapabilities";
+import { sidebarTreeDisplayLabel, sidebarTreeSecondaryValue } from "@/lib/sidebar/sidebarTreeLabel";
 import { shouldActivateTreeNodeOnSingleClick } from "@/lib/sidebar/treeNodeClick";
 
 const { t } = useI18n();
@@ -448,37 +460,12 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
   }
 }
 
-function isGroupLabel(node: TreeNode): boolean {
-  return isTreeGroupNodeType(node.type);
-}
-
 function displayLabel(node: TreeNode): string {
-  // Synthetic Xugu scopes are persisted with their reserved protocol value.
-  // Resolve them at render time as well, so an already-cached tree never
-  // exposes that implementation detail after the feature is introduced.
-  if (node.type === "schema" && node.connectionId) {
-    const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId));
-    if (databaseType === "xugu") return xuguSchemaDisplayName(node.schema ?? node.label);
-  }
-  if (node.type === "load-more") return t(node.label);
-  if (node.type === "object-browser") return t(node.label, { count: node.objectCount ?? 0 });
-  // Use the canonical key for persisted trees created before this label was
-  // internationalized; those nodes may still contain the old Chinese text.
-  if (node.type === "nacos-access-control") return t("nacos.accessControlSidebarLabel");
-  if (node.type === "user-admin" || node.type === "xugu-user-admin" || node.type === "dameng-users" || node.type === "dameng-roles" || node.type === "dameng-job-admin" || node.type === "meilisearch-system") return t(node.label);
-  if (node.type === "oracle-db-links" || node.type === "linked-server-root") return t(node.label);
-  if (node.type === "saved-sql-root") return t(node.label);
-  if (node.type === "mqtt-topic" && node.id.endsWith(":mqtt-topic:__console__")) return t(node.label);
-  if (node.label === "tree.defaultDatabase") return t(node.label);
-  return isGroupLabel(node) ? t(node.label) : node.label;
+  return sidebarTreeDisplayLabel(node, t, node.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) : undefined);
 }
 
 function treeNodeSecondaryValue(node: TreeNode): string | undefined {
-  if (node.type === "type" && node.customTypeKind) return t(`customType.kinds.${node.customTypeKind}`);
-  if (node.type === "type-member") return (node.meta as CustomTypeTreeMemberMeta | undefined)?.displayValue;
-  if (node.type === "datafile") return node.xuguDatafilePath;
-  if (node.type === "elasticsearch-index") return elasticsearchIndexAliasLabel(node);
-  return undefined;
+  return sidebarTreeSecondaryValue(node, t, node.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) : undefined);
 }
 
 function visibleLabel(node: TreeNode): string {
@@ -785,7 +772,7 @@ const canExpand = computed(() => {
   // loadable members; types without members (enum/domain/range/base) do not
   // expand even if the catalog row lists child metadata.
   if (activeNode.value.type === "type" && customTypeCapabilities(currentDatabaseType()).details) {
-    return activeNode.value.hasMembers === true;
+    return activeNode.value.hasMembers === true || (activeNode.value.hasMembers === undefined && supportsOracleTypeAttributeExpansion(currentDatabaseType()));
   }
   return canTreeNodeShowExpander({
     type: activeNode.value.type,
@@ -837,7 +824,7 @@ function measureTrailingCommentLayout() {
     trailingCommentMaxWidth.value = 0;
     return;
   }
-  trailingCommentMaxWidth.value = trailingCommentAvailableWidth(container.clientWidth, leading.scrollWidth);
+  trailingCommentMaxWidth.value = settingsStore.editorSettings.sidebarAllowHorizontalScroll ? sidebarRightCommentMaxWidthPx : trailingCommentAvailableWidth(container.clientWidth, leading.scrollWidth);
 }
 
 function scheduleTrailingCommentMeasure() {
@@ -882,7 +869,7 @@ function formattedObjectStorage(): string {
 const alignedCommentLabelWidth = computed(() => (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-aligned" && activeNode.value.type !== "connection" ? props.commentLabelWidth : undefined));
 
 function alignedCommentLeadingStyle(): { width: string } | { maxWidth: string } | undefined {
-  if (settingsStore.editorSettings.sidebarObjectInfoMode === "comment-and-size" && trailingComment.value) {
+  if (!settingsStore.editorSettings.sidebarAllowHorizontalScroll && settingsStore.editorSettings.sidebarObjectInfoMode === "comment-and-size" && trailingComment.value) {
     // Reserve the inline comment's margin so a long name cannot push into the size column.
     return { maxWidth: "max(0px, calc(100% - 1rem))" };
   }
@@ -898,7 +885,7 @@ const usesFullWidthLabel = computed(() => usesFullWidthTreeLabel(activeNode.valu
 
 const isCompactSidebar = computed(() => settingsStore.editorSettings.sidebarDensity === "compact");
 
-const rowWidthClass = computed(() => (usesFullWidthLabel.value ? "w-max min-w-full" : "w-full min-w-0"));
+const rowWidthClass = computed(() => (usesFullWidthLabel.value ? "w-max min-w-full" : "w-full min-w-0 tree-row-viewport"));
 
 const labelWidthClass = computed(() => {
   // aligned 模式靠 leading 块固定宽度对齐 comment 列，label 需 flex-1 撑满 leading 块；
@@ -908,7 +895,7 @@ const labelWidthClass = computed(() => {
   return treeLabelWidthClass({ fullWidth: usesFullWidthLabel.value, hasTrailingComment: hasTrailingMetadata(), hasInlineAction: isPinned.value, alignLeading });
 });
 
-watch(() => [isRightAlignedComment(), visibleLabel(activeNode.value), trailingComment.value, trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
+watch(() => [settingsStore.editorSettings.sidebarAllowHorizontalScroll, isRightAlignedComment(), visibleLabel(activeNode.value), trailingComment.value, trailingCommentLayoutRef.value, trailingCommentLeadingRef.value], refreshTrailingCommentMeasurement, { flush: "post", immediate: true });
 
 const paddingLeft = computed(() => treeItemPaddingLeft(props.depth, settingsStore.editorSettings.sidebarIndent));
 
@@ -1566,44 +1553,36 @@ function onKeydown(event: KeyboardEvent) {
 </script>
 
 <template>
-  <div
-    v-if="node.type === 'table-search-control'"
-    data-sidebar-table-search-control
-    class="tree-table-search-control flex items-center gap-1.5 pr-2"
-    :class="isCompactSidebar ? 'h-6 py-0' : 'h-7 py-0.5'"
-    :style="tableSearchStyle"
-    @click.stop
-    @dblclick.stop
-    @mousedown.stop
-    @keydown="onTableSearchControlKeydown"
-  >
-    <div class="relative min-w-0 flex-1">
-      <Search class="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
-      <Input
-        :model-value="tableSearchValue"
-        autocapitalize="off"
-        autocorrect="off"
-        spellcheck="false"
-        class="w-full rounded border pl-7 pr-6 text-xs shadow-none focus-visible:ring-1"
-        :class="isCompactSidebar ? 'h-5' : 'h-6'"
-        :style="{ backgroundColor: 'var(--tree-table-search-input-bg)', borderColor: 'var(--tree-table-search-border)' }"
-        :placeholder="t(node.label)"
-        :aria-label="t(node.label)"
-        :data-sidebar-table-search-parent-id="tableSearchParentId"
-        @update:model-value="updateTableSearchQuery"
-      />
-      <button v-if="tableSearchValue" type="button" class="absolute right-1.5 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="t('sidebar.clearTableSearch')" @click.stop="clearTableSearchQuery">
-        <X class="h-3 w-3" />
-      </button>
+  <div v-if="node.type === 'table-search-control'" data-sidebar-table-search-control class="tree-table-search-control pr-2" :class="isCompactSidebar ? 'h-6 py-0' : 'h-7 py-0.5'" :style="tableSearchStyle" @click.stop @dblclick.stop @mousedown.stop @keydown="onTableSearchControlKeydown">
+    <div class="tree-table-search-control__content flex w-full min-w-0 items-center gap-1.5">
+      <div class="relative min-w-0 flex-1">
+        <Search class="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-muted-foreground" />
+        <Input
+          :model-value="tableSearchValue"
+          autocapitalize="off"
+          autocorrect="off"
+          spellcheck="false"
+          class="w-full rounded border pl-7 pr-6 text-xs shadow-none focus-visible:ring-1"
+          :class="isCompactSidebar ? 'h-5' : 'h-6'"
+          :style="{ backgroundColor: 'var(--tree-table-search-input-bg)', borderColor: 'var(--tree-table-search-border)' }"
+          :placeholder="t(node.label)"
+          :aria-label="t(node.label)"
+          :data-sidebar-table-search-parent-id="tableSearchParentId"
+          @update:model-value="updateTableSearchQuery"
+        />
+        <button v-if="tableSearchValue" type="button" class="absolute right-1.5 top-1/2 flex h-4 w-4 -translate-y-1/2 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="t('sidebar.clearTableSearch')" @click.stop="clearTableSearchQuery">
+          <X class="h-3 w-3" />
+        </button>
+      </div>
+      <LightTooltip :text="t('sidebar.localTableSearchTooltip')" side="top" :delay="300">
+        <Switch size="sm" :model-value="settingsStore.editorSettings.sidebarTableSearchLocal" :aria-label="t('sidebar.localTableSearch')" @update:model-value="updateTableSearchLocal(Boolean($event))" />
+      </LightTooltip>
+      <LightTooltip v-if="settingsStore.editorSettings.sidebarTableSearchLocal" :text="t('sidebar.refreshLocalTableSearchIndex')" side="top" :delay="300">
+        <button type="button" class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="t('sidebar.refreshLocalTableSearchIndex')" @click.stop="refreshTableSearchIndex">
+          <RefreshCw class="h-3 w-3" />
+        </button>
+      </LightTooltip>
     </div>
-    <LightTooltip :text="t('sidebar.localTableSearchTooltip')" side="top" :delay="300">
-      <Switch size="sm" :model-value="settingsStore.editorSettings.sidebarTableSearchLocal" :aria-label="t('sidebar.localTableSearch')" @update:model-value="updateTableSearchLocal(Boolean($event))" />
-    </LightTooltip>
-    <LightTooltip v-if="settingsStore.editorSettings.sidebarTableSearchLocal" :text="t('sidebar.refreshLocalTableSearchIndex')" side="top" :delay="300">
-      <button type="button" class="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground" :aria-label="t('sidebar.refreshLocalTableSearchIndex')" @click.stop="refreshTableSearchIndex">
-        <RefreshCw class="h-3 w-3" />
-      </button>
-    </LightTooltip>
   </div>
 
   <div v-else @contextmenu="onTreeItemContextMenu">
@@ -1669,8 +1648,15 @@ function onKeydown(event: KeyboardEvent) {
             <Ban class="h-2.5 w-2.5 stroke-[3]" aria-hidden="true" />
           </span>
         </span>
-        <div ref="trailingCommentLayoutRef" :class="[hasTrailingMetadata() ? 'flex flex-1 min-w-0 items-center' : 'contents', { 'overflow-hidden': settingsStore.editorSettings.sidebarObjectInfoMode === 'comment-and-size' }]">
-          <div ref="trailingCommentLeadingRef" :class="trailingComment ? 'flex max-w-full min-w-0 shrink-0 items-center gap-2' : formattedObjectStorage() ? 'flex min-w-0 flex-1 items-center gap-2' : 'contents'" :style="alignedCommentLeadingStyle()">
+        <div
+          ref="trailingCommentLayoutRef"
+          :class="[hasTrailingMetadata() ? (usesFullWidthLabel ? 'flex min-w-max flex-1 items-center' : 'flex flex-1 min-w-0 items-center') : 'contents', { 'overflow-hidden': !usesFullWidthLabel && settingsStore.editorSettings.sidebarObjectInfoMode === 'comment-and-size' }]"
+        >
+          <div
+            ref="trailingCommentLeadingRef"
+            :class="trailingComment ? (usesFullWidthLabel ? 'flex min-w-0 shrink-0 items-center gap-2' : 'flex max-w-full min-w-0 shrink-0 items-center gap-2') : formattedObjectStorage() ? 'flex min-w-0 flex-1 items-center gap-2' : 'contents'"
+            :style="alignedCommentLeadingStyle()"
+          >
             <input
               v-if="isRenamingGroup || isRenamingSavedSql || isRenamingConnection"
               ref="renameInputRef"
@@ -1706,7 +1692,7 @@ function onKeydown(event: KeyboardEvent) {
             <button v-if="node.type === 'oracle-db-links'" class="ml-auto rounded p-0.5 text-muted-foreground hover:bg-muted" :aria-label="t('databaseLinks.manage')" :title="t('databaseLinks.manage')" @click.stop="showDatabaseLinks = true" @dblclick.stop>
               <TableProperties class="h-3.5 w-3.5" />
             </button>
-            <span v-if="treeNodeSecondaryValue(node)" class="flex min-w-0 max-w-[55%] shrink items-center gap-1 text-xs text-muted-foreground" :title="node.type === 'elasticsearch-index' ? undefined : treeNodeSecondaryValue(node)">
+            <span v-if="treeNodeSecondaryValue(node)" class="flex min-w-0 items-center gap-1 text-xs text-muted-foreground" :class="usesFullWidthLabel ? 'shrink-0' : 'max-w-[55%] shrink'" :title="node.type === 'elasticsearch-index' ? undefined : treeNodeSecondaryValue(node)">
               <Link2 v-if="node.type === 'elasticsearch-index'" class="h-3 w-3 shrink-0 text-sky-400" />
               <span class="min-w-0 truncate">{{ treeNodeSecondaryValue(node) }}</span>
             </span>
@@ -1736,6 +1722,7 @@ function onKeydown(event: KeyboardEvent) {
                   node.type === 'group-udf-functions' ||
                   node.type === 'group-columns' ||
                   node.type === 'group-indexes' ||
+                  node.type === 'group-database-indexes' ||
                   node.type === 'group-fkeys' ||
                   node.type === 'group-triggers' ||
                   node.type === 'group-events' ||
@@ -1762,7 +1749,7 @@ function onKeydown(event: KeyboardEvent) {
               {{ t("editor.defaultSchema") }}
             </Badge>
           </div>
-          <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-4 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont }">{{ trailingComment }}</span>
+          <span v-if="trailingComment && !isRightAlignedComment()" class="sidebar-object-comment ml-4 min-w-0 flex-1 truncate text-left" :class="{ 'sidebar-object-comment--windows': useWindowsSidebarCommentFont, 'sidebar-object-comment--horizontal': usesFullWidthLabel }">{{ trailingComment }}</span>
           <span v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0" class="min-w-0 flex-1" aria-hidden="true" />
           <span
             v-if="isRightAlignedComment() && trailingCommentMaxWidth > 0"
@@ -1851,6 +1838,14 @@ function onKeydown(event: KeyboardEvent) {
   width: max-content;
   max-width: 100%;
   flex-shrink: 999;
+}
+
+.sidebar-object-comment--horizontal {
+  flex: 0 0 auto;
+  min-width: max-content;
+  max-width: none;
+  overflow: visible;
+  white-space: nowrap;
 }
 
 .sidebar-object-comment--windows {

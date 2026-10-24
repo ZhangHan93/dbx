@@ -41,6 +41,7 @@ import {
   ChevronsUpDown,
   Clock3,
   Copy,
+  Crosshair,
   Database,
   FoldHorizontal,
   ListFilter,
@@ -118,6 +119,7 @@ import {
   tabIconClass,
   tabTooltipLines,
 } from "@/lib/tabs/tabPresentation";
+import { queryTabExternalFilePath } from "@/lib/sql/sqlFileOpen";
 import { activeTabSidebarTarget } from "@/lib/sidebar/sidebarActiveTabTarget";
 import "./appTabBar.css";
 import type { QueryTab } from "@/types/database";
@@ -142,6 +144,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   "activate-tab": [tabId: string];
   "locate-tab": [tab: QueryTab];
+  "locate-sql-file": [tab: QueryTab];
   "toggle-zen-mode": [];
   "start-resize": [event: PointerEvent];
   "toggle-collapse": [];
@@ -1687,6 +1690,12 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
       visible: !!activeTabSidebarTarget(tab),
       onLocate: () => emit("locate-tab", tab),
     }),
+    {
+      label: t("sidebar.locateSqlFile"),
+      icon: Crosshair,
+      visible: !!queryTabExternalFilePath(tab),
+      action: () => emit("locate-sql-file", tab),
+    },
     { label: "", separator: true },
     createPinTabMenuItem({
       label: tab.pinned ? t("contextMenu.unpinTab") : t("contextMenu.pinTab"),
@@ -2350,10 +2359,10 @@ watch([() => props.specialPageTabs?.settingsActive, () => props.specialPageTabs?
                         <TooltipContent v-if="isConnectionlessPluginTab(entry.tab)" :side="tabTooltipSide" data-plugin-title-tooltip>
                           {{ tabTitleText(entry.tab) }}
                         </TooltipContent>
-                        <TooltipContent v-else :side="tabTooltipSide" class="grid grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2 text-xs">
+                        <TooltipContent v-else :side="tabTooltipSide" surface="popover" class="grid w-max min-w-40 max-w-[min(28rem,calc(100vw-24px))] grid-cols-[auto_minmax(0,1fr)] items-start gap-x-2 gap-y-1 p-2 text-xs leading-5">
                           <template v-for="line in tabTooltipLines(entry.tab, t)" :key="line.label">
-                            <span class="whitespace-nowrap font-medium opacity-70">{{ line.label }}</span>
-                            <span class="min-w-0 break-all">{{ line.value }}</span>
+                            <span class="whitespace-nowrap text-muted-foreground">{{ line.label }}</span>
+                            <span class="min-w-0 whitespace-pre-wrap break-all font-mono text-foreground/90">{{ line.value }}</span>
                           </template>
                         </TooltipContent>
                       </Tooltip>

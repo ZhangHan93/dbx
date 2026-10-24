@@ -40,6 +40,15 @@ const translate = (key: string) => translations[key] ?? key;
 const allCategories = new Set(Object.keys(categoryLabels) as SettingsCategory[]);
 
 describe("settings search", () => {
+  it.each([
+    ["connection.httpTunnelProtocol", "Tunnel wire protocol", "wire protocol"],
+    ["connection.httpTunnelProtocolDbx", "DBX tunnel protocol", "dbx tunnel"],
+    ["connection.httpTunnelProtocolNavicat", "Navicat tunnel protocol", "navicat tunnel"],
+  ])("finds %s under the existing tunnel management entry", (translationKey, label, query) => {
+    const entries = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { isWeb: true, visibleCategories: new Set<SettingsCategory>(["tunnels"]) }, (key) => (key === translationKey ? label : key), categoryLabels);
+    expect(searchSettings(entries, query, "en")).toEqual(expect.arrayContaining([expect.objectContaining({ id: "tunnels", category: "tunnels", targetId: "tunnels" })]));
+  });
+
   it("finds connection tab colors by their Chinese label", () => {
     const entries = resolveSettingsSearchEntries(SETTINGS_SEARCH_DEFINITIONS, { isWeb: false, visibleCategories: allCategories }, (key) => (key === "settings.colorizeConnectionTabs" ? "按连接颜色区分标签页" : key), categoryLabels);
     expect(searchSettings(entries, "连接颜色", "zh-CN")).toEqual(expect.arrayContaining([expect.objectContaining({ id: "appearance-connection-tab-colors", category: "appearance", targetId: "appearance" })]));

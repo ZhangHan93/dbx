@@ -544,6 +544,7 @@ fn clickhouse_index_from_skipping_row(row: &[serde_json::Value]) -> IndexInfo {
     let index_type = row.get(2).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let granularity = json_value_as_u64(row.get(3));
     IndexInfo {
+        owner: None,
         name: row.first().and_then(|v| v.as_str()).unwrap_or("").to_string(),
         columns: split_clickhouse_expression_list(row.get(1).and_then(|v| v.as_str()).unwrap_or("")),
         is_unique: false,
@@ -808,6 +809,7 @@ pub async fn list_indexes(client: &ChClient, database: &str, table: &str) -> Res
         .filter(|value| !value.trim().is_empty())
     {
         indexes.push(IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,

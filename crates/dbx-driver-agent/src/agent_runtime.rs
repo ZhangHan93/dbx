@@ -128,15 +128,20 @@ pub async fn spawn_shared_connection_client(
             break (runtime_cell, runtime);
         }
     };
-    if let Err(err) = runtime
+    let connect_result = match runtime
         .call_typed::<serde_json::Value>(AgentMethod::OpenSession.as_str(), session_params, Some(connect_timeout), None)
         .await
     {
-        let open_error = shared_connection_open_error(err, runtime.clone());
-        forget_unused_runtime_after_failed_open(manager, &runtime_key, &runtime_cell, &runtime).await;
-        return Err(open_error);
-    }
-    Ok(AgentDriverClient::shared_session(runtime, agent_session_id))
+        Ok(result) => result,
+        Err(err) => {
+            let open_error = shared_connection_open_error(err, runtime.clone());
+            forget_unused_runtime_after_failed_open(manager, &runtime_key, &runtime_cell, &runtime).await;
+            return Err(open_error);
+        }
+    };
+    let mut client = AgentDriverClient::shared_session(runtime, agent_session_id);
+    client.apply_connect_result(&connect_result);
+    Ok(client)
 }
 
 fn shared_connection_open_error(

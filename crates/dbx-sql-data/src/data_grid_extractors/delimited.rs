@@ -60,10 +60,9 @@ pub(super) fn write_dsv(
                         options.array_format,
                     );
                     text = replace_line_feeds(text, &options.line_feed_escape_string);
-                    if options.escape_formulas
-                        && starts_formula(&text)
-                        && !(numeric_type && text.parse::<f64>().is_ok())
-                    {
+                    let is_numeric =
+                        value.is_number() || (numeric_type && text.parse::<f64>().is_ok()) || is_numeric_string;
+                    if options.escape_formulas && starts_formula(&text) && !is_numeric {
                         text.insert(0, '\'');
                     }
                     DsvCell::Text(Cow::Owned(text), numeric_type, is_numeric_string)

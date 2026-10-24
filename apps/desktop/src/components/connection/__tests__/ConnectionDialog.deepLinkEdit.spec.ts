@@ -1,14 +1,15 @@
 // @vitest-environment happy-dom
 
 import { createApp, defineComponent, h, nextTick, reactive, type App } from "vue";
+import { createPinia, setActivePinia } from "pinia";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import type { ConnectionConfig } from "@/types/database";
-import { parseConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
+import { parseConnectionDeepLink, parseConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
 
 const visibleTab = vi.hoisted(() => ({ value: "connection" }));
 
-const { store, settings, backend } = vi.hoisted(() => ({
+const { store, settings, backend, actualStoreHolder } = vi.hoisted(() => ({
   store: {
     connectionGroupOptions: [],
     newConnectionGroupId: null,
@@ -26,9 +27,11 @@ const { store, settings, backend } = vi.hoisted(() => ({
     applyGlobalTimeouts: vi.fn((config) => config),
     getConfig: vi.fn(),
   },
+  actualStoreHolder: { value: null as unknown },
   settings: {
-    editorSettings: { sidebarShowConnectionNotes: false, globalConnectTimeoutSecs: 10, globalQueryTimeoutSecs: 0 },
+    editorSettings: { sidebarShowConnectionNotes: false, globalConnectTimeoutSecs: 10, globalQueryTimeoutSecs: 0, connectTimeoutInheritConnectionIds: [], queryTimeoutInheritConnectionIds: [] },
     rememberedDatabaseForConnection: vi.fn(() => ""),
+    initEditorSettings: vi.fn().mockResolvedValue(undefined),
     persistEditorSettings: vi.fn(),
     updateEditorSettings: vi.fn(),
     updateEditorSettingsAndPersist: vi.fn(),
@@ -36,6 +39,8 @@ const { store, settings, backend } = vi.hoisted(() => ({
   backend: {
     connectDb: vi.fn(),
     disconnectDb: vi.fn(),
+    redisListDatabases: vi.fn(),
+    listSchemas: vi.fn(),
     testConnectionWithInfo: vi.fn(),
     listDatabases: vi.fn(),
     listPlugins: vi.fn(),
@@ -43,12 +48,23 @@ const { store, settings, backend } = vi.hoisted(() => ({
     listJdbcMavenBundles: vi.fn(),
     listJdbcLocalBundles: vi.fn(),
     listSshConfigHosts: vi.fn(),
+    listInstalledAgents: vi.fn(),
     listInstalledAgentsLocal: vi.fn(),
     listenAgentInstallProgress: vi.fn(),
+    loadConnections: vi.fn().mockResolvedValue([]),
+    saveConnections: vi.fn().mockResolvedValue(undefined),
+    loadEditorSettings: vi.fn().mockResolvedValue(null),
+    loadPinnedTreeNodeIds: vi.fn().mockResolvedValue([]),
+    loadTableVGroups: vi.fn().mockResolvedValue({}),
+    saveTableVGroups: vi.fn().mockResolvedValue(undefined),
+    loadSidebarLayout: vi.fn().mockResolvedValue({ groups: [], order: [] }),
+    saveSidebarLayout: vi.fn().mockResolvedValue(undefined),
+    loadTunnelProfiles: vi.fn().mockResolvedValue([]),
+    saveEditorSettings: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
-vi.mock("@/stores/connectionStore", () => ({ useConnectionStore: () => store, CONNECTION_ATTEMPT_CANCELLED_MESSAGE: "cancelled" }));
+vi.mock("@/stores/connectionStore", () => ({ useConnectionStore: () => actualStoreHolder.value ?? store, CONNECTION_ATTEMPT_CANCELLED_MESSAGE: "cancelled" }));
 vi.mock("@/stores/settingsStore", async (original) => ({ ...(await original<typeof import("@/stores/settingsStore")>()), useSettingsStore: () => settings }));
 vi.mock("@/stores/tunnelProfileStore", () => ({ useTunnelProfileStore: () => ({ profiles: [], profileById: () => undefined, init: vi.fn() }) }));
 vi.mock("@/lib/backend/api", async (original) => ({ ...(await original<typeof import("@/lib/backend/api")>()), ...backend }));
@@ -193,8 +209,31 @@ async function mountDialog(config: ConnectionConfig, url: string, initiallyOpen 
   return props;
 }
 
+async function mountNewDialog(url?: string) {
+  const props = reactive({ open: true, prefillConfig: url ? parseConnectionDeepLink(url) : null });
+  const container = document.createElement("div");
+  document.body.append(container);
+  const app = createApp(
+    defineComponent({
+      setup: () => () =>
+        h(ConnectionDialog, {
+          ...props,
+          "onUpdate:open": (value: boolean) => {
+            props.open = value;
+          },
+        }),
+    }),
+  );
+  app.use(i18n);
+  mountedApps.push(app);
+  app.mount(container);
+  await settle();
+  return props;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  actualStoreHolder.value = null;
   visibleTab.value = "connection";
   i18n.global.locale.value = "en";
   for (const fn of Object.values(backend)) fn.mockResolvedValue([]);
@@ -206,9 +245,52 @@ beforeEach(() => {
 afterEach(() => {
   for (const app of mountedApps.splice(0)) app.unmount();
   document.body.innerHTML = "";
+  (actualStoreHolder.value as { $dispose?: () => void } | null)?.$dispose?.();
+  actualStoreHolder.value = null;
 });
 
 describe("ConnectionDialog deep-link edit confirmation", () => {
+  it("preserves a protected generic JDBC target when only its name changes", async () => {
+    const saved = savedConnection({
+      db_type: "jdbc",
+      driver_profile: "jdbc",
+      driver_label: "JDBC",
+      host: "db.example.test",
+      port: 2881,
+      username: "saved-user",
+      password: "__DBX_SAVED_CREDENTIAL__:synthetic-password",
+      connection_string: "__DBX_SAVED_CREDENTIAL__:synthetic-url",
+      jdbc_driver_class: "example.Driver",
+      jdbc_driver_paths: ["driver.jar"],
+      jdbc_dialect: "oceanbase-oracle",
+      production_badge_scope: undefined,
+    });
+    await mountDialog(saved, "");
+    const name = [...document.querySelectorAll<HTMLInputElement>("input")].find((input) => input.value === saved.name);
+    expect(name).toBeTruthy();
+    name!.value = "Renamed JDBC";
+    name!.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle();
+    const save = [...document.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Save");
+    save!.click();
+    await settle();
+    expect(store.updateConnection).toHaveBeenCalledTimes(1);
+    const submitted = store.updateConnection.mock.calls[0][0];
+    expect(submitted.name).toBe("Renamed JDBC");
+    expect(submitted.production_badge_scope).toBeUndefined();
+    expect(submitted).toMatchObject({
+      db_type: saved.db_type,
+      driver_profile: saved.driver_profile,
+      host: saved.host,
+      port: saved.port,
+      username: saved.username,
+      password: saved.password,
+      connection_string: saved.connection_string,
+      jdbc_driver_class: saved.jdbc_driver_class,
+      jdbc_driver_paths: saved.jdbc_driver_paths,
+    });
+  });
+
   it("shows the global Redis preview limit in advanced settings and persists it", async () => {
     visibleTab.value = "advanced";
     settings.editorSettings.redisValuePreviewLimitKiB = 64;
@@ -309,6 +391,222 @@ describe("ConnectionDialog deep-link edit confirmation", () => {
     );
     expect(store.addConnection).not.toHaveBeenCalled();
     expect(store.connect).not.toHaveBeenCalled();
+  });
+
+  it("preserves a protected generic JDBC target when only its name changes", async () => {
+    const saved = savedConnection({
+      db_type: "jdbc",
+      driver_profile: "jdbc",
+      driver_label: "JDBC",
+      host: "db.example.test",
+      port: 2881,
+      username: "saved-user",
+      password: "__DBX_SAVED_CREDENTIAL__:synthetic-password",
+      connection_string: "__DBX_SAVED_CREDENTIAL__:synthetic-url",
+      jdbc_driver_class: "example.Driver",
+      jdbc_driver_paths: ["driver.jar"],
+      jdbc_dialect: "oceanbase-oracle",
+      production_badge_scope: undefined,
+    });
+    await mountDialog(saved, "");
+    const name = [...document.querySelectorAll<HTMLInputElement>("input")].find((input) => input.value === saved.name);
+    expect(name).toBeTruthy();
+    name!.value = "Renamed JDBC";
+    name!.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle();
+    const save = [...document.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Save");
+    save!.click();
+    await settle();
+
+    expect(store.updateConnection).toHaveBeenCalledTimes(1);
+    const submitted = store.updateConnection.mock.calls[0][0];
+    expect(submitted.name).toBe("Renamed JDBC");
+    expect(submitted.production_badge_scope).toBeUndefined();
+    expect(submitted).toMatchObject({
+      db_type: saved.db_type,
+      driver_profile: saved.driver_profile,
+      host: saved.host,
+      port: saved.port,
+      username: saved.username,
+      password: saved.password,
+      connection_string: saved.connection_string,
+      jdbc_driver_class: saved.jdbc_driver_class,
+      jdbc_driver_paths: saved.jdbc_driver_paths,
+    });
+  });
+
+  it.each([true, false] as const)("preserves protected target settings through real Store load and Dialog save (%s DB links)", async (showDatabaseLinks) => {
+    setActivePinia(createPinia());
+    const saved = savedConnection({
+      id: "loaded-protected-jdbc",
+      db_type: "jdbc",
+      driver_profile: "jdbc",
+      driver_label: undefined,
+      host: "db.example.test",
+      port: 2881,
+      username: "saved-user",
+      password: "__DBX_SAVED_CREDENTIAL__:synthetic-password",
+      connection_string: "__DBX_SAVED_CREDENTIAL__:synthetic-url",
+      jdbc_driver_class: "example.Driver",
+      jdbc_driver_paths: ["driver.jar"],
+      url_params: undefined,
+      show_database_links: showDatabaseLinks,
+      production_badge_scope: undefined,
+    });
+    const untouched = savedConnection({
+      id: "untouched-protected-jdbc",
+      name: "Untouched JDBC",
+      db_type: "jdbc",
+      driver_profile: "jdbc",
+      driver_label: undefined,
+      host: "schema.example.test",
+      port: 2882,
+      username: "schema-user",
+      password: "__DBX_SAVED_CREDENTIAL__:synthetic-schema-password",
+      connection_string: "__DBX_SAVED_CREDENTIAL__:synthetic-schema-url",
+      jdbc_driver_class: "example.SchemaDriver",
+      jdbc_driver_paths: ["schema-driver.jar"],
+      url_params: undefined,
+      show_database_links: undefined,
+    });
+    vi.mocked(backend.loadConnections).mockResolvedValue([saved, untouched]);
+    vi.mocked(backend.loadSidebarLayout).mockResolvedValue({ groups: [], order: [] });
+    const { useConnectionStore } = await vi.importActual<typeof import("@/stores/connectionStore")>("@/stores/connectionStore");
+    const actualStore = useConnectionStore();
+    actualStoreHolder.value = actualStore;
+    await actualStore.initFromDisk();
+    const loaded = actualStore.getConfig(saved.id)!;
+    expect(loaded.production_badge_scope).toBeUndefined();
+    expect(loaded.driver_label).toBe("jdbc");
+    expect(loaded.url_params).toBe("");
+    expect(loaded.show_database_links).toBe(showDatabaseLinks);
+    expect(actualStore.getConfig(untouched.id)?.show_database_links).toBeUndefined();
+
+    await mountDialog(loaded, "");
+    const name = [...document.querySelectorAll<HTMLInputElement>("input")].find((input) => input.value === loaded.name);
+    expect(name).toBeTruthy();
+    name!.value = "Renamed JDBC";
+    name!.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle();
+    const save = [...document.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Save");
+    save!.click();
+    await settle();
+
+    expect(backend.saveConnections).toHaveBeenCalledOnce();
+    const persisted = vi.mocked(backend.saveConnections).mock.calls[0][0][0];
+    const persistedUntouched = vi.mocked(backend.saveConnections).mock.calls[0][0].find((config) => config.id === untouched.id)!;
+    expect(persisted.name).toBe("Renamed JDBC");
+    expect(persisted.production_badge_scope).toBeUndefined();
+    expect(persisted.host).toBe("db.example.test");
+    expect(persisted.port).toBe(2881);
+    expect(persisted.connection_string).toBe(saved.connection_string);
+    expect(persisted.password).toBe(saved.password);
+    expect(persisted.show_database_links).toBe(showDatabaseLinks);
+    expect(persistedUntouched).toMatchObject({
+      id: untouched.id,
+      db_type: untouched.db_type,
+      driver_profile: untouched.driver_profile,
+      host: untouched.host,
+      port: untouched.port,
+      username: untouched.username,
+      password: untouched.password,
+      connection_string: untouched.connection_string,
+      jdbc_driver_class: untouched.jdbc_driver_class,
+      jdbc_driver_paths: untouched.jdbc_driver_paths,
+    });
+    expect(persistedUntouched.show_database_links).toBeUndefined();
+  });
+
+  it("keeps an explicitly selected badge scope on an unchanged generic JDBC target", async () => {
+    visibleTab.value = "advanced";
+    const saved = savedConnection({
+      db_type: "jdbc",
+      driver_profile: "jdbc",
+      driver_label: "JDBC",
+      host: "db.example.test",
+      port: 2881,
+      connection_string: "__DBX_SAVED_CREDENTIAL__:synthetic-url",
+      jdbc_driver_class: "example.Driver",
+      jdbc_driver_paths: ["driver.jar"],
+      production_badge_scope: undefined,
+    });
+    await mountDialog(saved, "");
+    const trigger = document.querySelector<HTMLButtonElement>("#production-badge-scope");
+    expect(trigger?.textContent).toContain("Database / schema (default)");
+    trigger!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await settle();
+    const option = [...document.querySelectorAll<HTMLElement>('[role="option"]')].find((element) => element.textContent?.trim() === "Table / object");
+    expect(option).toBeTruthy();
+    option!.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await settle();
+    const save = [...document.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Save");
+    save!.click();
+    await settle();
+
+    expect(store.updateConnection).toHaveBeenCalledWith(expect.objectContaining({ production_badge_scope: "table", host: "db.example.test", port: 2881 }));
+  });
+
+  it("keeps the existing generic JDBC normalization when its URL is replaced", async () => {
+    const saved = savedConnection({
+      db_type: "jdbc",
+      driver_profile: "jdbc",
+      driver_label: "JDBC",
+      host: "db.example.test",
+      port: 2881,
+      connection_string: "__DBX_SAVED_CREDENTIAL__:synthetic-url",
+      jdbc_driver_class: "example.Driver",
+      jdbc_driver_paths: ["driver.jar"],
+    });
+    await mountDialog(saved, "");
+    const url = [...document.querySelectorAll<HTMLInputElement>("input")].find((input) => input.value === saved.connection_string);
+    expect(url).toBeTruthy();
+    url!.value = "jdbc:example://new.example.test:9999/db";
+    url!.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle();
+    const save = [...document.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Save");
+    save!.click();
+    await settle();
+
+    expect(store.updateConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        connection_string: "jdbc:example://new.example.test:9999/db",
+        host: "",
+        port: 0,
+      }),
+    );
+  });
+
+  it("keeps the generic JDBC new-connection endpoint normalization", async () => {
+    await mountNewDialog();
+    const jdbcCategory = [...document.querySelectorAll<HTMLButtonElement>("button")].find((button) => button.textContent?.trim() === "JDBC connection");
+    expect(jdbcCategory).toBeTruthy();
+    jdbcCategory!.click();
+    await settle();
+    const jdbcOption = document.querySelector<HTMLButtonElement>('[title="JDBC"]');
+    expect(jdbcOption).toBeTruthy();
+    jdbcOption!.click();
+    await settle();
+    jdbcOption!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }));
+    await settle();
+    const url = [...document.querySelectorAll<HTMLInputElement>("input")].find((input) => input.placeholder.startsWith("jdbc:"));
+    expect(url).toBeTruthy();
+    url!.value = "jdbc:example://host/db";
+    url!.dispatchEvent(new Event("input", { bubbles: true }));
+    await settle();
+    const save = [...document.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Save");
+    expect(save).toBeTruthy();
+    save!.click();
+    await settle();
+
+    expect(store.addConnection).toHaveBeenCalledWith(
+      expect.objectContaining({
+        db_type: "jdbc",
+        connection_string: "jdbc:example://host/db",
+        host: "",
+        port: 0,
+      }),
+      null,
+    );
   });
 
   it("applies explicit empty passwords and false TLS values without create defaults", async () => {

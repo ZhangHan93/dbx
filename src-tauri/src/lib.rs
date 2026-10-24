@@ -2126,6 +2126,7 @@ pub fn run() {
             dbx_core::db::sqlite_worker::enable_sqlite_ssh_runtime(env!("CARGO_PKG_VERSION"));
             state.set_duckdb_worker_process_isolation_enabled(desktop_settings.duckdb_worker_process_isolation);
             state.set_duckdb_worker_max_processes(desktop_settings.duckdb_worker_max_processes);
+            state.set_honor_fixed_ssh_local_ports(true);
             let oidc_app_handle = app.handle().clone();
             state.set_mongo_oidc_browser_opener(Arc::new(move |url| {
                 oidc_app_handle
@@ -2631,6 +2632,7 @@ pub fn run() {
             commands::external_sql::write_external_sql_file,
             commands::external_sql::save_external_sql_file,
             commands::list_sql_files::list_sql_files_in_folder,
+            commands::list_sql_files::search_sql_file_contents,
             commands::list_sql_files::create_sql_file_in_folder,
             commands::list_sql_files::rename_sql_file_in_folder,
             commands::list_sql_files::delete_sql_file_in_folder,

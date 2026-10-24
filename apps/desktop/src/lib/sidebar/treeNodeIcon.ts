@@ -62,6 +62,7 @@ export function getTreeNodeIconInfo(node: TreeNode): TreeNodeIconInfo | null {
     case "group-columns":
       return { icon: ListTree, colorClass: "text-green-400" };
     case "group-indexes":
+    case "group-database-indexes":
     case "index":
       return { icon: Key, colorClass: "text-amber-500" };
     case "group-fkeys":

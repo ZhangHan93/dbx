@@ -93,24 +93,27 @@ pub async fn list_tables(pool: &mysql_async::Pool, schema: &str) -> Result<Vec<T
 
 fn list_objects_sql(schema: &str) -> String {
     format!(
-        "SELECT TABLE_NAME AS OBJECT_NAME, 'TABLE' AS OBJECT_TYPE, OWNER AS OBJECT_SCHEMA, 0 AS SORT_ORDER \
+        "SELECT TABLE_NAME AS OBJECT_NAME, 'TABLE' AS OBJECT_TYPE, OWNER AS OBJECT_SCHEMA, NULL AS PARENT_SCHEMA, NULL AS PARENT_NAME, 0 AS SORT_ORDER \
          FROM ALL_TABLES WHERE OWNER = {s} \
          UNION ALL \
-         SELECT VIEW_NAME AS OBJECT_NAME, 'VIEW' AS OBJECT_TYPE, OWNER AS OBJECT_SCHEMA, 1 AS SORT_ORDER \
+         SELECT VIEW_NAME AS OBJECT_NAME, 'VIEW' AS OBJECT_TYPE, OWNER AS OBJECT_SCHEMA, NULL AS PARENT_SCHEMA, NULL AS PARENT_NAME, 1 AS SORT_ORDER \
          FROM ALL_VIEWS WHERE OWNER = {s} \
          UNION ALL \
-         SELECT OBJECT_NAME, OBJECT_TYPE, OWNER AS OBJECT_SCHEMA, \
+         SELECT OBJECT_NAME, OBJECT_TYPE, OWNER AS OBJECT_SCHEMA, NULL AS PARENT_SCHEMA, NULL AS PARENT_NAME, \
                 CASE WHEN OBJECT_TYPE = 'PROCEDURE' THEN 2 ELSE 3 END AS SORT_ORDER \
          FROM ALL_PROCEDURES \
          WHERE OWNER = {s} AND OBJECT_TYPE IN ('PROCEDURE', 'FUNCTION') AND PROCEDURE_NAME IS NULL \
          UNION ALL \
-         SELECT SEQUENCE_NAME AS OBJECT_NAME, 'SEQUENCE' AS OBJECT_TYPE, SEQUENCE_OWNER AS OBJECT_SCHEMA, 4 AS SORT_ORDER \
+         SELECT SEQUENCE_NAME AS OBJECT_NAME, 'SEQUENCE' AS OBJECT_TYPE, SEQUENCE_OWNER AS OBJECT_SCHEMA, NULL AS PARENT_SCHEMA, NULL AS PARENT_NAME, 4 AS SORT_ORDER \
          FROM ALL_SEQUENCES WHERE SEQUENCE_OWNER = {s} \
          UNION ALL \
          SELECT OBJECT_NAME, CASE OBJECT_TYPE WHEN 'PACKAGE BODY' THEN 'PACKAGE_BODY' ELSE OBJECT_TYPE END AS OBJECT_TYPE, \
-                OWNER AS OBJECT_SCHEMA, CASE WHEN OBJECT_TYPE = 'PACKAGE' THEN 5 ELSE 6 END AS SORT_ORDER \
+                OWNER AS OBJECT_SCHEMA, NULL AS PARENT_SCHEMA, NULL AS PARENT_NAME, CASE WHEN OBJECT_TYPE = 'PACKAGE' THEN 5 ELSE 6 END AS SORT_ORDER \
          FROM ALL_OBJECTS \
          WHERE OWNER = {s} AND OBJECT_TYPE IN ('PACKAGE', 'PACKAGE BODY') \
+         UNION ALL \
+         SELECT INDEX_NAME AS OBJECT_NAME, 'INDEX' AS OBJECT_TYPE, OWNER AS OBJECT_SCHEMA, TABLE_OWNER AS PARENT_SCHEMA, TABLE_NAME AS PARENT_NAME, 7 AS SORT_ORDER \
+         FROM ALL_INDEXES WHERE OWNER = {s} AND (GENERATED = 'N' OR GENERATED IS NULL) \
          ORDER BY SORT_ORDER, OBJECT_NAME",
         s = metadata_owner_sql(schema),
     )
@@ -122,27 +125,28 @@ pub async fn list_objects(pool: &mysql_async::Pool, schema: &str) -> Result<Vec<
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
-    Ok(rows
-        .iter()
-        .map(|row| ObjectInfo {
-            name: get_str(row, 0),
-            object_type: get_str(row, 1),
-            schema: get_opt_str(row, 2)
-                .filter(|schema| !schema.is_empty())
-                .or_else(|| (!schema.trim().is_empty()).then(|| schema.to_string())),
-            valid: None,
-            signature: None,
-            custom_type_kind: None,
-            has_members: None,
-            comment: None,
-            created_at: None,
-            updated_at: None,
-            parent_schema: None,
-            parent_name: None,
-            trigger: None,
-            xugu_type_members_expandable: None,
-        })
-        .collect())
+    Ok(rows.iter().map(|row| object_info_from_row(row, schema)).collect())
+}
+
+fn object_info_from_row(row: &mysql_async::Row, schema: &str) -> ObjectInfo {
+    ObjectInfo {
+        name: get_str(row, 0),
+        object_type: get_str(row, 1),
+        schema: get_opt_str(row, 2)
+            .filter(|schema| !schema.is_empty())
+            .or_else(|| (!schema.trim().is_empty()).then(|| schema.to_string())),
+        valid: None,
+        signature: None,
+        custom_type_kind: None,
+        has_members: None,
+        comment: None,
+        created_at: None,
+        updated_at: None,
+        parent_schema: get_opt_str(row, 3),
+        parent_name: get_opt_str(row, 4),
+        trigger: None,
+        xugu_type_members_expandable: None,
+    }
 }
 
 fn get_columns_sql(schema: &str, table: &str) -> String {
@@ -215,16 +219,16 @@ fn list_indexes_sql(schema: &str, table: &str) -> String {
     format!(
         "SELECT ai.INDEX_NAME, aic.COLUMN_NAME, ai.UNIQUENESS, \
          CASE WHEN ac.CONSTRAINT_NAME IS NULL THEN 0 ELSE 1 END AS IS_PRIMARY, ai.INDEX_TYPE, ai.PARTITIONED, \
-         ai.VISIBILITY, aic.DESCEND, aie.COLUMN_EXPRESSION, aic.COLUMN_POSITION \
+         ai.VISIBILITY, aic.DESCEND, aie.COLUMN_EXPRESSION, aic.COLUMN_POSITION, ai.OWNER \
          FROM ALL_INDEXES ai \
          JOIN ALL_IND_COLUMNS aic ON ai.INDEX_NAME = aic.INDEX_NAME AND ai.OWNER = aic.INDEX_OWNER \
            AND ai.TABLE_OWNER = aic.TABLE_OWNER AND ai.TABLE_NAME = aic.TABLE_NAME \
          LEFT JOIN ALL_IND_EXPRESSIONS aie ON aie.INDEX_OWNER = aic.INDEX_OWNER AND aie.INDEX_NAME = aic.INDEX_NAME \
            AND aie.TABLE_OWNER = aic.TABLE_OWNER AND aie.TABLE_NAME = aic.TABLE_NAME AND aie.COLUMN_POSITION = aic.COLUMN_POSITION \
          LEFT JOIN ALL_CONSTRAINTS ac ON ac.INDEX_NAME = ai.INDEX_NAME AND ac.OWNER = ai.TABLE_OWNER \
-           AND ac.TABLE_NAME = ai.TABLE_NAME AND ac.CONSTRAINT_TYPE = 'P' \
+           AND ac.TABLE_NAME = ai.TABLE_NAME AND ac.INDEX_OWNER = ai.OWNER AND ac.CONSTRAINT_TYPE = 'P' \
          WHERE ai.TABLE_OWNER = {s} AND ai.TABLE_NAME = {t} \
-         ORDER BY ai.INDEX_NAME, aic.COLUMN_POSITION",
+         ORDER BY ai.OWNER, ai.INDEX_NAME, aic.COLUMN_POSITION",
         s = metadata_owner_sql(schema),
         t = quote_value(table),
     )
@@ -236,16 +240,18 @@ pub async fn list_indexes(pool: &mysql_async::Pool, schema: &str, table: &str) -
     let result = conn.query_iter(&sql).await.map_err(|e| e.to_string())?;
     let rows: Vec<mysql_async::Row> = result.collect_and_drop().await.map_err(|e| e.to_string())?;
 
-    let mut indexes = BTreeMap::<String, IndexInfo>::new();
+    let mut indexes = BTreeMap::<(String, String), IndexInfo>::new();
     for row in &rows {
         let name = get_str(row, 0);
+        let owner = get_str(row, 10);
         let visibility = get_str(row, 6);
         let partitioned = get_str(row, 5);
         let direction = get_str(row, 7);
         let expression = get_opt_str(row, 8).filter(|value| !value.trim().is_empty());
         let column = get_str(row, 1);
         let position = row_get::<u64, _>(row, 9).unwrap_or(0) as usize;
-        let index = indexes.entry(name.clone()).or_insert_with(|| IndexInfo {
+        let index = indexes.entry((owner.clone(), name.clone())).or_insert_with(|| IndexInfo {
+            owner: Some(owner),
             key_directions: Vec::new(),
             visibility: Some(visibility.clone()),
             key_metadata_complete: true,
@@ -367,6 +373,29 @@ pub async fn list_triggers(pool: &mysql_async::Pool, schema: &str, table: &str) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_index_row_keeps_separate_raw_parent_identity() {
+        use mysql_async::{consts::ColumnType, Column, Value};
+        let values = vec![
+            Value::from(" Ix (a) "),
+            Value::from("INDEX"),
+            Value::from(" Index Owner "),
+            Value::from(" Parent Owner "),
+            Value::from(" T(a) "),
+            Value::Int(7),
+        ];
+        let columns = (0..values.len())
+            .map(|index| Column::new(ColumnType::MYSQL_TYPE_VAR_STRING).with_name(format!("c{index}").as_bytes()))
+            .collect::<Vec<_>>();
+        let row = mysql_common::row::new_row(values, columns.into());
+        let object = object_info_from_row(&row, "CURRENT");
+        assert_eq!(object.schema.as_deref(), Some(" Index Owner "));
+        assert_eq!(object.name, " Ix (a) ");
+        assert_eq!(object.parent_schema.as_deref(), Some(" Parent Owner "));
+        assert_eq!(object.parent_name.as_deref(), Some(" T(a) "));
+        assert!(list_objects_sql(" Owner ").contains("ALL_INDEXES"));
+    }
 
     #[test]
     fn ob_oracle_list_objects_sql_includes_routines() {

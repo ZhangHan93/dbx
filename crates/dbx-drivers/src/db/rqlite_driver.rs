@@ -172,6 +172,7 @@ pub async fn list_indexes(client: &RqliteClient, _schema: &str, table: &str) -> 
             .filter_map(|row| value_by_column(&column_result.columns, row, "name"))
             .collect();
         indexes.push(IndexInfo {
+            owner: None,
             key_directions: Vec::new(),
             visibility: None,
             key_metadata_complete: false,

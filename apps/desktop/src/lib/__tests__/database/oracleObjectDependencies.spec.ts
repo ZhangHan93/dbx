@@ -48,6 +48,7 @@ describe("Oracle object dependencies", () => {
     expect(oracleDependencyProvider.buildQuery(node({ schema: undefined }))).toBeNull();
     expect(oracleDependencyProvider.supports(node({ type: "procedure", parentType: "package", parentName: "PKG" }))).toBe(false);
     expect(oracleDependencyProvider.supports(node({ type: "procedure", parentType: "package", parentName: "PKG", parentSchema: undefined }))).toBe(false);
-    expect(oracleDependencyProvider.supports(node({ type: "trigger" }))).toBe(false);
+    expect(oracleDependencyProvider.supports(node({ type: "column" }))).toBe(false);
+    expect(oracleDependencyProvider.supports(node({ type: "trigger" }))).toBe(true);
   });
 });

@@ -867,6 +867,7 @@ pub struct AgentDriverClient {
     stdout: Option<BufReader<ChildStdout>>,
     stderr_tail: Arc<Mutex<StderrTail>>,
     handshake: Option<AgentHandshake>,
+    session_exact_metadata_identity: Option<bool>,
     next_id: u64,
     shared_runtime: Option<Arc<AgentRuntimeClient>>,
     agent_session_id: Option<String>,
@@ -1038,6 +1039,7 @@ impl AgentHandshake {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentCapability {
+    ExactMetadataIdentityV1,
     BlobBindStatementsV1,
     Connect,
     TestConnection,
@@ -1147,7 +1149,7 @@ fn parse_agent_rpc_error_header(header: &str) -> (Option<i64>, String) {
 }
 
 impl AgentCapability {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Connect,
         Self::TestConnection,
         Self::Metadata,
@@ -1174,6 +1176,7 @@ impl AgentCapability {
         Self::MongoBulkWrite,
         Self::MongoRenameCollection,
         Self::MongoFindCursor,
+        Self::ExactMetadataIdentityV1,
         Self::MultiSession,
         Self::StructuredErrorV1,
         Self::BlobBindStatementsV1,
@@ -1181,6 +1184,7 @@ impl AgentCapability {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ExactMetadataIdentityV1 => "exact_metadata_identity_v1",
             Self::BlobBindStatementsV1 => "blob_bind_statements_v1",
             Self::Connect => "connect",
             Self::TestConnection => "test_connection",
@@ -1734,6 +1738,7 @@ impl AgentDriverClient {
             stdout: Some(stdout),
             stderr_tail,
             handshake: None,
+            session_exact_metadata_identity: None,
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
@@ -1750,6 +1755,7 @@ impl AgentDriverClient {
             stdout: None,
             stderr_tail: runtime.stderr_tail.clone(),
             handshake: Some(runtime.handshake().clone()),
+            session_exact_metadata_identity: None,
             next_id: 0,
             shared_runtime: Some(runtime),
             agent_session_id: Some(agent_session_id),
@@ -2134,7 +2140,13 @@ impl AgentDriverClient {
     }
 
     pub async fn connect(&mut self, params: Value) -> Result<Value, String> {
-        self.call_method(AgentMethod::Connect, params).await
+        let result = self.call_method(AgentMethod::Connect, params).await?;
+        self.apply_connect_result(&result);
+        Ok(result)
+    }
+
+    pub(crate) fn apply_connect_result(&mut self, result: &Value) {
+        self.session_exact_metadata_identity = result.get("exactMetadataIdentity").and_then(Value::as_bool);
     }
 
     pub async fn open_session(&mut self, agent_session_id: &str, mut params: Value) -> Result<Value, String> {
@@ -2383,9 +2395,23 @@ impl AgentDriverClient {
         relation_name: Option<&str>,
         timeout_duration: Option<Duration>,
     ) -> Result<T, String> {
+        self.get_object_source_with_identity(database, schema, name, object_type, None, relation_name, timeout_duration)
+            .await
+    }
+
+    pub async fn get_object_source_with_identity<T: DeserializeOwned + Send + 'static, K: Serialize>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+        object_type: &K,
+        signature: Option<&str>,
+        relation_name: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
         self.call_method_with_timeout(
             AgentMethod::GetObjectSource,
-            agent_object_source_params_with_relation(database, schema, name, object_type, relation_name),
+            agent_object_source_params_with_identity(database, schema, name, object_type, signature, relation_name),
             timeout_duration,
         )
         .await
@@ -3189,6 +3215,8 @@ impl AgentDriverClient {
 
     pub fn supports_capability(&self, capability: AgentCapability) -> bool {
         agent_supports_capability(self.handshake.as_ref(), capability)
+            && (capability != AgentCapability::ExactMetadataIdentityV1
+                || self.session_exact_metadata_identity != Some(false))
     }
 
     /// Send a shutdown message to the agent and wait for the process to exit.
@@ -3286,7 +3314,8 @@ pub fn is_unsupported_handshake_error(error: &str) -> bool {
 pub fn agent_supports_capability(handshake: Option<&AgentHandshake>, capability: AgentCapability) -> bool {
     if matches!(
         capability,
-        AgentCapability::BlobBindStatementsV1
+        AgentCapability::ExactMetadataIdentityV1
+            | AgentCapability::BlobBindStatementsV1
             | AgentCapability::Kv
             | AgentCapability::KvTtl
             | AgentCapability::KvCas
@@ -3331,8 +3360,23 @@ pub fn agent_object_source_params_with_relation<K: Serialize>(
     object_type: &K,
     relation_name: Option<&str>,
 ) -> Value {
+    agent_object_source_params_with_identity(database, schema, name, object_type, None, relation_name)
+}
+
+pub fn agent_object_source_params_with_identity<K: Serialize>(
+    database: &str,
+    schema: &str,
+    name: &str,
+    object_type: &K,
+    signature: Option<&str>,
+    relation_name: Option<&str>,
+) -> Value {
     let mut params =
         serde_json::json!({ "database": database, "schema": schema, "name": name, "object_type": object_type });
+    // An empty signature identifies the zero-argument overload; absence means unknown.
+    if let Some(signature) = signature {
+        params["signature"] = Value::String(signature.to_string());
+    }
     if let Some(relation_name) = relation_name.map(str::trim).filter(|value| !value.is_empty()) {
         params["relation_name"] = Value::String(relation_name.to_string());
     }
@@ -3794,6 +3838,7 @@ impl AgentDriverClient {
             stdout: None,
             stderr_tail: Arc::new(Mutex::new(StderrTail::default())),
             handshake: None,
+            session_exact_metadata_identity: None,
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
@@ -3830,17 +3875,18 @@ mod tests {
     use super::{
         agent_close_query_session_params, agent_error_from_legacy, agent_handshake_params, agent_java_args,
         agent_java_args_with_extra, agent_java_args_with_extra_opts, agent_object_source_params,
-        agent_object_source_params_with_relation, agent_process_error_hint, agent_proxy_env_vars, agent_schema_params,
-        agent_schema_table_params, agent_supports_capability, agent_transaction_params, append_legacy_error_context,
-        decode_agent_response, format_agent_process_error, format_agent_startup_error, is_agent_rpc_response_error,
-        is_retryable_agent_startup_error, is_unsupported_handshake_error, legacy_agent_call_error,
-        mongo_collection_params, mongo_database_params, mongo_document_id_params, parse_agent_java_opts,
-        read_agent_json_response, read_agent_line, read_agent_line_with_limit, start_stderr_collector,
-        validate_dameng_java_system_properties, AgentCallError, AgentCapability, AgentDriverClient, AgentErrorCategory,
-        AgentErrorContext, AgentErrorStage, AgentHandshake, AgentKvMethod, AgentLaunchSpec, AgentMethod,
-        AgentOperationOutcome, AgentRuntimeClient, AgentSessionDisposition, AgentTableReadCloseParams,
-        AgentTableReadPageParams, AgentTableReadStartParams, MongoAgentMethod, StderrTail, AGENT_JAVA_TOO_OLD_MESSAGE,
-        AGENT_PROTOCOL_VERSION, AGENT_STDOUT_NOISE_SAMPLE_CHARS, MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES,
+        agent_object_source_params_with_identity, agent_object_source_params_with_relation, agent_process_error_hint,
+        agent_proxy_env_vars, agent_schema_params, agent_schema_table_params, agent_supports_capability,
+        agent_transaction_params, append_legacy_error_context, decode_agent_response, format_agent_process_error,
+        format_agent_startup_error, is_agent_rpc_response_error, is_retryable_agent_startup_error,
+        is_unsupported_handshake_error, legacy_agent_call_error, mongo_collection_params, mongo_database_params,
+        mongo_document_id_params, parse_agent_java_opts, read_agent_json_response, read_agent_line,
+        read_agent_line_with_limit, start_stderr_collector, validate_dameng_java_system_properties, AgentCallError,
+        AgentCapability, AgentDriverClient, AgentErrorCategory, AgentErrorContext, AgentErrorStage, AgentHandshake,
+        AgentKvMethod, AgentLaunchSpec, AgentMethod, AgentOperationOutcome, AgentRuntimeClient,
+        AgentSessionDisposition, AgentTableReadCloseParams, AgentTableReadPageParams, AgentTableReadStartParams,
+        MongoAgentMethod, StderrTail, AGENT_JAVA_TOO_OLD_MESSAGE, AGENT_PROTOCOL_VERSION,
+        AGENT_STDOUT_NOISE_SAMPLE_CHARS, MAX_CONSECUTIVE_AGENT_STDOUT_NOISE_LINES,
     };
     use crate::agent_recovery::{RecoveryDecision, RecoveryPolicy, RecoveryScope};
     use std::io::Cursor;
@@ -3865,6 +3911,7 @@ mod tests {
             stdout: None,
             stderr_tail: Arc::new(Mutex::new(StderrTail::default())),
             handshake: None,
+            session_exact_metadata_identity: None,
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
@@ -3875,6 +3922,70 @@ mod tests {
         let pool = super::PooledAgentClient::new(client).with_compatibility_mode(info.compatibility_mode);
         assert_eq!(pool.compatibility_mode(), Some("oracle"));
         assert!(pool.with_compatibility_mode(Some(" ".into())).compatibility_mode().is_none());
+    }
+
+    #[tokio::test]
+    async fn connect_narrows_exact_identity_only_for_the_connected_database() {
+        let script = std::env::temp_dir().join(format!("dbx-exact-connect-{}.py", uuid::Uuid::new_v4()));
+        std::fs::write(&script, r#"import json, sys
+print(json.dumps({'ready': True}), flush=True)
+for line in sys.stdin:
+    req = json.loads(line)
+    params = req.get('params', {})
+    if params.get('database') == 'failed':
+        print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'error': {'code': -1, 'message': 'connect failed'}}), flush=True)
+        continue
+    if req['method'] == 'handshake':
+        result = {'protocolVersion': 2, 'agentProtocolVersion': 2, 'capabilities': ['multi_session', 'exact_metadata_identity_v1']}
+    else:
+        result = {'ok': True}
+        if params.get('database') in ('legacy', 'modern'):
+            result['exactMetadataIdentity'] = params['database'] == 'modern'
+    print(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': result}), flush=True)
+"#).unwrap();
+        let launch = AgentLaunchSpec::new(test_python()).with_args([script.to_string_lossy().to_string()]);
+        let mut client = AgentDriverClient::spawn(launch.clone()).await.unwrap();
+        client.try_optional_handshake("test").await.unwrap();
+        assert!(client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.connect(serde_json::json!({"database": "legacy"})).await.unwrap();
+        assert!(!client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        assert!(client.connect(serde_json::json!({"database": "failed"})).await.is_err());
+        assert!(!client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.connect(serde_json::json!({"database": "modern"})).await.unwrap();
+        assert!(client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.connect(serde_json::json!({"database": "legacy"})).await.unwrap();
+        client.connect(serde_json::json!({"database": "old-response"})).await.unwrap();
+        assert!(client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.handshake.as_mut().unwrap().capabilities.retain(|capability| capability != "exact_metadata_identity_v1");
+        client.connect(serde_json::json!({"database": "modern"})).await.unwrap();
+        assert!(!client.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        client.shutdown().await;
+
+        let runtime = AgentRuntimeClient::spawn(launch, "test").await.unwrap();
+        let mut legacy = AgentDriverClient::shared_session(runtime.clone(), "legacy".into());
+        let mut modern = AgentDriverClient::shared_session(runtime.clone(), "modern".into());
+        for (database, session) in [("legacy", &mut legacy), ("modern", &mut modern)] {
+            let result = runtime
+                .call::<serde_json::Value>(
+                    "open_session",
+                    serde_json::json!({"database": database, "agentSessionId": database}),
+                    Some(Duration::from_secs(2)),
+                    None,
+                )
+                .await
+                .unwrap();
+            session.apply_connect_result(&result);
+        }
+        assert!(!legacy.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        assert!(modern.supports_capability(AgentCapability::ExactMetadataIdentityV1));
+        assert!(runtime.handshake().supports(AgentCapability::ExactMetadataIdentityV1));
+        let ordinary = legacy
+            .call::<serde_json::Value>("get_columns", serde_json::json!({"schema": "APP", "table": "T"}))
+            .await
+            .unwrap();
+        assert_eq!(ordinary["ok"], true);
+        runtime.kill_and_wait().await;
+        std::fs::remove_file(script).unwrap();
     }
 
     #[cfg(unix)]
@@ -4649,6 +4760,7 @@ for line in sys.stdin:
             stdout: None,
             stderr_tail: Arc::new(Mutex::new(StderrTail::default())),
             handshake: None,
+            session_exact_metadata_identity: None,
             next_id: 0,
             shared_runtime: None,
             agent_session_id: None,
@@ -5927,7 +6039,8 @@ for line in sys.stdin:
         assert_eq!(AgentCapability::MultiSession.as_str(), "multi_session");
         assert_eq!(AgentCapability::StructuredErrorV1.as_str(), "structured_error_v1");
         assert_eq!(AgentCapability::BlobBindStatementsV1.as_str(), "blob_bind_statements_v1");
-        assert_eq!(AgentCapability::ALL.len(), 29);
+        assert_eq!(AgentCapability::ExactMetadataIdentityV1.as_str(), "exact_metadata_identity_v1");
+        assert_eq!(AgentCapability::ALL.len(), 30);
     }
 
     #[test]
@@ -6243,6 +6356,25 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn object_source_params_preserve_overload_identity() {
+        for signature in ["", "v integer", "v INOUT integer"] {
+            assert_eq!(
+                agent_object_source_params_with_identity("onepass", "app", "run", &"PROCEDURE", Some(signature), None),
+                serde_json::json!({
+                    "database": "onepass", "schema": "app", "name": "run",
+                    "object_type": "PROCEDURE", "signature": signature,
+                })
+            );
+        }
+        let params = agent_object_source_params_with_identity("onepass", "app", "run", &"PROCEDURE", None, None);
+        assert!(params.get("signature").is_none());
+        let params =
+            agent_object_source_params_with_identity("onepass", "app", "audit", &"TRIGGER", None, Some("orders"));
+        assert_eq!(params["relation_name"], "orders");
+        assert!(params.get("signature").is_none());
+    }
+
+    #[test]
     fn agent_protocol_matches_contract_file() {
         let contract: serde_json::Value =
             serde_json::from_str(include_str!("../assets/agent-protocol-v2.json")).unwrap();
@@ -6285,6 +6417,20 @@ for line in sys.stdin:
         assert!(handshake.supports(AgentCapability::Metadata));
         assert!(!handshake.supports(AgentCapability::Query));
         assert!(!handshake.supports(AgentCapability::Kv));
+    }
+
+    #[test]
+    fn exact_metadata_identity_requires_explicit_process_support() {
+        assert!(!agent_supports_capability(None, AgentCapability::ExactMetadataIdentityV1));
+        let mut handshake = AgentHandshake {
+            protocol_version: AGENT_PROTOCOL_VERSION,
+            agent_protocol_version: AGENT_PROTOCOL_VERSION,
+            capabilities: vec!["metadata".into()],
+        };
+        assert!(agent_supports_capability(Some(&handshake), AgentCapability::Metadata));
+        assert!(!agent_supports_capability(Some(&handshake), AgentCapability::ExactMetadataIdentityV1));
+        handshake.capabilities.push("exact_metadata_identity_v1".into());
+        assert!(agent_supports_capability(Some(&handshake), AgentCapability::ExactMetadataIdentityV1));
     }
 
     #[test]

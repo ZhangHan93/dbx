@@ -1,6 +1,11 @@
 import type { DatabaseType } from "@/types/database";
 import { supportsTransfer } from "@/lib/database/databaseFeatureSupport";
 import { databaseTransferObjectFamily } from "@/lib/database/databaseDriverManifest";
+import { isXuguSyntheticScope } from "@/lib/sidebar/xuguPublicSynonyms";
+
+export function transferSchemasForDatabase(dbType: DatabaseType | undefined, schemas: string[]): string[] {
+  return dbType === "xugu" ? schemas.filter((schema) => !isXuguSyntheticScope(schema)) : schemas;
+}
 
 export enum TransferObjectFamily {
   Mysql = "mysql",
@@ -9,7 +14,7 @@ export enum TransferObjectFamily {
   SqlServer = "sqlserver",
 }
 
-export type TransferObjectKind = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "EVENT";
+export type TransferObjectKind = "TABLE" | "VIEW" | "MATERIALIZED_VIEW" | "PROCEDURE" | "FUNCTION" | "TRIGGER" | "SEQUENCE" | "EVENT" | "PACKAGE" | "SYNONYM";
 
 const MYSQL_KINDS: TransferObjectKind[] = ["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "EVENT"];
 const POSTGRES_KINDS: TransferObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE"];
@@ -34,6 +39,7 @@ export function isTransferPairSupported(source?: DatabaseType, target?: Database
 }
 
 export function transferObjectKindsForDatabase(dbType?: DatabaseType): TransferObjectKind[] {
+  if (dbType === "xugu") return ["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "PACKAGE", "SYNONYM"];
   switch (transferObjectFamily(dbType)) {
     case TransferObjectFamily.Mysql:
       return [...MYSQL_KINDS];
@@ -58,6 +64,7 @@ export function transferObjectKindsForDatabase(dbType?: DatabaseType): TransferO
  * incompatible target.
  */
 export function crossFamilyTransferableKinds(a?: DatabaseType, b?: DatabaseType): TransferObjectKind[] {
+  if (a === "xugu" || b === "xugu") return a === "xugu" && b === "xugu" ? transferObjectKindsForDatabase("xugu") : [];
   if (isSameTransferFamily(a, b)) {
     return transferObjectKindsForDatabase(a);
   }
