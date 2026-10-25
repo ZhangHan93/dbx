@@ -29,7 +29,7 @@ const { store, settings, backend, actualStoreHolder } = vi.hoisted(() => ({
   },
   actualStoreHolder: { value: null as unknown },
   settings: {
-    editorSettings: { sidebarShowConnectionNotes: false, globalConnectTimeoutSecs: 10, globalQueryTimeoutSecs: 0, connectTimeoutInheritConnectionIds: [], queryTimeoutInheritConnectionIds: [] },
+    editorSettings: { sidebarShowConnectionNotes: false, globalConnectTimeoutSecs: 10, globalQueryTimeoutSecs: 0, connectTimeoutInheritConnectionIds: [], queryTimeoutInheritConnectionIds: [], deepLinkConnectionConfirmMode: "always" as "always" | "create" | "update" | "all" },
     rememberedDatabaseForConnection: vi.fn(() => ""),
     initEditorSettings: vi.fn().mockResolvedValue(undefined),
     persistEditorSettings: vi.fn(),
@@ -236,6 +236,7 @@ beforeEach(() => {
   actualStoreHolder.value = null;
   visibleTab.value = "connection";
   i18n.global.locale.value = "en";
+  settings.editorSettings.deepLinkConnectionConfirmMode = "always";
   for (const fn of Object.values(backend)) fn.mockResolvedValue([]);
   backend.listenAgentInstallProgress.mockResolvedValue(() => {});
   store.updateConnection.mockResolvedValue(undefined);
@@ -767,5 +768,23 @@ describe("ConnectionDialog deep-link edit confirmation", () => {
         external_config: { portExplicit: true },
       }),
     );
+  });
+
+  it("applies an id update link without waiting for confirmation when the mode allows updates", async () => {
+    // 「仅带 id 的更新链接」/「所有连接链接」两种模式下，带 id 的深链不再停在编辑弹窗。
+    settings.editorSettings.deepLinkConnectionConfirmMode = "update";
+
+    await mountDialog(savedConnection(), "dbx://connection/new?id=saved-production&host=new.example.test");
+    await settle();
+
+    expect(store.updateConnection).toHaveBeenCalledTimes(1);
+    expect(store.updateConnection).toHaveBeenCalledWith(expect.objectContaining({ id: "saved-production", host: "new.example.test" }));
+  });
+
+  it("keeps an id update link open for confirmation in the default mode", async () => {
+    await mountDialog(savedConnection(), "dbx://connection/new?id=saved-production&host=new.example.test");
+    await settle();
+
+    expect(store.updateConnection).not.toHaveBeenCalled();
   });
 });

@@ -12,6 +12,7 @@ import {
   hasTableTreeLoadMore,
   isTableVGroupContainerNode,
   isTableVGroupGroupableRowType,
+  missingTableVGroupMemberNames,
   moveTableToVGroup,
   normalizeTableVGroupLayout,
   pruneTableVGroupMembers,
@@ -41,6 +42,43 @@ function otherNode(id: string): TreeNode {
 function groupIds(nodes: TreeNode[]): string[] {
   return nodes.filter((node) => node.type === "table-vgroup").map((node) => node.id);
 }
+
+describe("off-page table group members", () => {
+  const names = ["orders_2026", "ordersX2026", "orders%2026", "orders\\2026", "订单😀", "archived_orders"];
+  const layout: TableVGroupLayout = {
+    groups: [
+      { id: "parent", name: "Business", collapsed: true },
+      { id: "nested", name: "Nested", collapsed: false },
+    ],
+    order: [
+      { type: "table", name: "ungrouped" },
+      {
+        type: "group",
+        id: "parent",
+        children: [
+          { type: "table", name: "already_loaded" },
+          { type: "table", name: "a_view", rowType: "view" },
+          { type: "group", id: "nested", children: names.map((name) => ({ type: "table", name })) },
+        ],
+      },
+    ],
+  };
+
+  it("includes collapsed and nested members while skipping loaded tables and ungrouped entries", () => {
+    expect(missingTableVGroupMemberNames(layout, new Set(["already_loaded"]))).toEqual(names);
+    expect(missingTableVGroupMemberNames({ ...layout, enabled: false }, new Set())).toEqual([]);
+  });
+
+  it.each([
+    { includePatterns: [" ORDERS\\_2026 "], excludePatterns: [], expected: ["orders_2026"] },
+    { includePatterns: ["orders_2026"], excludePatterns: ["orders\\%2026", "orders\\\\2026"], expected: ["orders_2026", "ordersX2026"] },
+    { includePatterns: ["订单_"], excludePatterns: [], expected: ["订单😀"] },
+    { includePatterns: ["orders%"], excludePatterns: ["%X2026"], expected: ["orders_2026", "orders%2026", "orders\\2026"] },
+    { includePatterns: [" "], excludePatterns: ["archived%", "ORDERS%"], expected: ["订单😀"] },
+  ])("respects LIKE include $includePatterns and exclude $excludePatterns", ({ includePatterns, excludePatterns, expected }) => {
+    expect(missingTableVGroupMemberNames(layout, new Set(["already_loaded"]), { includePatterns, excludePatterns })).toEqual(expected);
+  });
+});
 
 describe("tableVGroup layout ops", () => {
   it("moves a table into a group and back to the ungrouped root", () => {

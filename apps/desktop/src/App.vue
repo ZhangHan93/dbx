@@ -211,7 +211,7 @@ import { dismissOpenModalSurface } from "@/lib/ui/modalSurface";
 import { hasTreeNodeDatabaseContext } from "@/lib/sidebar/treeNodeContext";
 import { objectBrowserTablesToAiTreeNodes } from "@/lib/ai/objectBrowserToAiTargets";
 import { aiTargetFromTab, type AiConversationBinding } from "@/lib/ai/aiConversationBinding";
-import type { AiExternalContextRequest } from "@/lib/ai/aiExternalContext";
+import { queryErrorSelection, type AiExternalContextRequest } from "@/lib/ai/aiExternalContext";
 import { isSchemaAware, isSingleDatabase, supportsConnectionQueryActions, usesTreeSchemaMode } from "@/lib/database/databaseFeatureSupport";
 import { codeMirrorSqlDialect, connectionObjectTreeNodeSchema, connectionUsesDatabaseObjectTreeMode, effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { canFormatSqlForDatabaseType, formatSqlForEditing, sqlFormatDialectForDbType } from "@/lib/sql/sqlFormatter";
@@ -2114,10 +2114,14 @@ function editorAiTarget(tabId?: string): AiConversationBinding | null {
 }
 
 function fixWithAi(tabId: string, errorMessage: string) {
+  const tab = queryStore.tabs.find((candidate) => candidate.id === tabId);
+  const selection = queryErrorSelection(tab);
+  const target = aiTargetFromTab(queryStore.activeResultExecutionTarget(tabId) ?? tab, (connectionId) => !!connectionStore.getConfig(connectionId));
   openRightSidebarPanel("ai");
   invokeWhenAiReady((handle) =>
     handle.openExternalContext({
-      target: editorAiTarget(tabId),
+      target,
+      selections: selection ? [selection] : [],
       action: "fix",
       instruction: errorMessage,
       unresolvedKey: "ai.externalTargetUnavailable",
@@ -5388,6 +5392,7 @@ onUnmounted(() => {
             @start-resize="startSidebarResize"
             @collapse="setSidebarOpen(false)"
             @open-settings="(initialTab) => openSettings(initialTab ?? 'appearance')"
+            @open-connection-settings="(connectionId) => openConnectionSettings(connectionId, 'advanced')"
             @add-to-ai="addToAi"
             @open-dependency-object="onOpenDependencyObject"
             @mousedown="rememberSidebarSearchSurface"

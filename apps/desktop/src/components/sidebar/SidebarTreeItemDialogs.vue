@@ -560,7 +560,7 @@ watch(
         <pre v-else class="max-h-[56vh] min-h-64 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap" v-html="highlight(structurePreviewSql)"></pre>
       </div>
       <DialogFooter>
-        <DdlStorageToggle :database-type="structurePreviewDdlStorageType" :disabled="isLoadingStructurePreview || !!structurePreviewError" class="mr-auto" />
+        <DdlStorageToggle :database-type="structurePreviewDdlStorageType" :disabled="isLoadingStructurePreview" class="mr-auto" />
         <Button variant="outline" @click="showStructurePreviewDialog = false">{{ t("dangerDialog.cancel") }}</Button>
         <Button variant="outline" :disabled="isLoadingStructurePreview || !structurePreviewSql" @click="copyStructurePreview">
           <Clipboard class="h-4 w-4" />

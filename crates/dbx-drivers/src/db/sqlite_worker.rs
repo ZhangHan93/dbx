@@ -123,6 +123,7 @@ impl SqliteWorkerSession<'_> {
             WorkerBody::Ok { columns, column_types, rows, affected_rows, truncated, .. } => Ok(QueryResult {
                 columns: columns.unwrap_or_default(),
                 column_types: column_types.unwrap_or_default(),
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],

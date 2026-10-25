@@ -280,8 +280,12 @@ impl MessageQueueAdmin for KafkaAdmin {
         // handful of Kafka Admin calls. Subscriptions are filtered in memory below.
         // (The previous 1 + 2N serial RPC pattern — describe + lag per group — took
         // tens of seconds on remote clusters with many groups, see #7163.)
-        let result: serde_json::Value =
-            self.call("mq_list_consumer_groups", serde_json::json!({ "topic": topic.topic })).await?;
+        let result: serde_json::Value = self
+            .call_with_agent_timeout(
+                "mq_list_consumer_groups",
+                serde_json::json!({ "topic": topic.topic, "timeout_ms": self.config.request_timeout_ms() }),
+            )
+            .await?;
         let groups = result.get("groups").and_then(|v| v.as_array()).cloned().unwrap_or_default();
 
         // For each group, check both active assignments and committed offsets.
@@ -296,7 +300,8 @@ impl MessageQueueAdmin for KafkaAdmin {
     }
 
     async fn get_kafka_consumer_group_snapshot(&self) -> Result<KafkaConsumerGroupSnapshot, String> {
-        self.call("mq_get_consumer_group_snapshot", consumer_group_snapshot_params(&self.config)).await
+        self.call_with_agent_timeout("mq_get_consumer_group_snapshot", consumer_group_snapshot_params(&self.config))
+            .await
     }
 
     async fn create_subscription(&self, _topic: &TopicRef, _sub: &str, _pos: ResetPosition) -> Result<(), String> {
@@ -683,6 +688,9 @@ fn peek_messages_params(
     if let Some(offset) = options.offset {
         params["offset"] = serde_json::json!(offset);
     }
+    if let Some(timestamp) = options.timestamp {
+        params["timestamp"] = serde_json::json!(timestamp);
+    }
     params
 }
 
@@ -806,10 +814,8 @@ fn kafka_subscription_from_group_row(group_id: &str, topic: &str, row: &serde_js
         })
         .unwrap_or_default();
 
-    // Sum lag over the topic's committed partitions. A partition without a
-    // resolved end offset contributes nothing (matches the agent's lag probe:
-    // unknown end offsets are not reported as zero lag).
-    let msg_backlog = committed
+    // Keep the known lag, but do not present an incomplete probe as healthy zero.
+    let partition_lags = committed
         .iter()
         .filter_map(|partition| {
             let partition_id = partition.get("partition").and_then(|v| v.as_i64())?;
@@ -817,12 +823,17 @@ fn kafka_subscription_from_group_row(group_id: &str, topic: &str, row: &serde_js
             let end_offset = end_offsets.get(&partition_id).copied()?;
             Some((end_offset - committed_offset).max(0))
         })
-        .sum();
+        .collect::<Vec<_>>();
+    let backlog_unavailable = committed.is_empty() || partition_lags.len() != committed.len();
+    let online_members =
+        (row.get("membersAvailable").and_then(|v| v.as_bool()) != Some(false)).then_some(consumers.len() as u32);
 
     Some(SubscriptionInfo {
         name: group_id.to_string(),
         sub_type: "consumer-group".to_string(),
-        msg_backlog,
+        msg_backlog: partition_lags.iter().sum(),
+        backlog_unavailable: Some(backlog_unavailable),
+        online_members,
         msg_rate_out: 0.0,
         msg_throughput_out: 0.0,
         consumers,
@@ -895,6 +906,7 @@ mod tests {
                 start_position: Some(PeekStartPosition::Offset),
                 partition: Some(2),
                 offset: Some(17),
+                timestamp: None,
             },
         );
 
@@ -976,7 +988,7 @@ mod tests {
             &cfg,
             &topic_ref(),
             20,
-            PeekMessagesOptions { start_position: None, partition: None, offset: Some(17) },
+            PeekMessagesOptions { start_position: None, partition: None, offset: Some(17), timestamp: None },
         );
 
         assert!(params.get("startPosition").is_none());
@@ -1216,6 +1228,8 @@ mod tests {
         assert_eq!(sub.name, "orders-service");
         assert_eq!(sub.sub_type, "consumer-group");
         assert_eq!(sub.msg_backlog, 11); // (10-3) + (12-8)
+        assert_eq!(sub.backlog_unavailable, Some(false));
+        assert_eq!(sub.online_members, Some(0));
         assert!(sub.consumers.is_empty());
     }
 
@@ -1251,6 +1265,8 @@ mod tests {
         assert_eq!(sub.name, "live-service");
         assert_eq!(sub.msg_backlog, 0);
         assert_eq!(sub.consumers.len(), 1);
+        assert_eq!(sub.online_members, Some(1));
+        assert_eq!(sub.backlog_unavailable, Some(true));
         assert_eq!(sub.consumers[0].consumer_name, "consumer-events");
         assert_eq!(sub.consumers[0].address, "/10.0.0.10");
     }
@@ -1298,6 +1314,23 @@ mod tests {
             .expect("the group still has visible committed offsets");
 
         assert_eq!(sub.msg_backlog, 7); // only partition 0 contributes
+        assert_eq!(sub.backlog_unavailable, Some(true));
+    }
+
+    #[test]
+    fn kafka_subscription_from_group_row_preserves_unknown_members_and_backlog() {
+        let row = serde_json::json!({
+            "groupId": "orders-service",
+            "membersAvailable": false,
+            "members": [],
+            "committedOffsets": [{ "topic": "orders", "partition": 0, "offset": 3 }],
+            "endOffsets": []
+        });
+
+        let sub = kafka_subscription_from_group_row("orders-service", "orders", &row).unwrap();
+
+        assert_eq!(sub.online_members, None);
+        assert_eq!(sub.backlog_unavailable, Some(true));
     }
 
     #[test]
@@ -1339,6 +1372,97 @@ mod tests {
         let missing = serde_json::json!({ "name": "unknown" });
         let partitions = missing.get("partitions").and_then(|v| v.as_u64()).map(|v| v as u32);
         assert!(!partitions.map(|p| p > 0).unwrap_or(false));
+    }
+
+    async fn delayed_consumer_group_admin() -> (KafkaAdmin, tempfile::TempPath) {
+        let script_path = tempfile::NamedTempFile::new().expect("create test agent script").into_temp_path();
+        std::fs::write(
+            &script_path,
+            r#"import json
+import sys
+import time
+
+print(json.dumps({"ready": True}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request["method"]
+    if method in ("mq_get_consumer_group_snapshot", "mq_list_consumer_groups"):
+        assert request["params"]["timeout_ms"] == 1000, "forward the configured agent deadline"
+        time.sleep(1.2)
+    if method == "mq_list_consumer_groups" and request["params"].get("topic") == "denied":
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"],
+                          "error": {"code": -1, "message": "Group authorization failed"}}), flush=True)
+        continue
+    if method == "mq_get_consumer_group_snapshot":
+        result = {"groups": [
+            {"groupId": "orders-service", "state": "EMPTY", "topics": ["orders"],
+             "totalLag": 2, "lagAvailable": True},
+            {"groupId": "unreachable", "state": "UNKNOWN", "lagAvailable": False,
+             "error": "Consumer group details unavailable: timed out"},
+        ]}
+    elif method == "mq_list_consumer_groups":
+        result = {"groups": [
+            {"groupId": "orders-service", "members": [],
+             "committedOffsets": [{"topic": "orders", "partition": 0, "offset": 3}],
+             "endOffsets": [{"topic": "orders", "partition": 0, "offset": 5}]},
+            {"groupId": "unreachable", "members": [], "committedOffsets": []},
+        ]}
+    elif method == "mq_list_topics":
+        result = {"topics": [{"name": "orders", "internal": False}]}
+    else:
+        print(json.dumps({"jsonrpc": "2.0", "id": request["id"],
+                          "error": {"code": -1, "message": "Group authorization failed"}}), flush=True)
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}), flush=True)
+"#,
+        )
+        .expect("write test agent script");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let client = AgentDriverClient::spawn(
+            AgentLaunchSpec::new(python).with_args([script_path.to_string_lossy().to_string()]),
+        )
+        .await
+        .expect("spawn test agent");
+        let mut config = kafka_config(serde_json::json!({ "bootstrapServers": "broker:9092" }), MqAuth::None, false);
+        config.query_timeout_secs = 1;
+        (KafkaAdmin { client: Arc::new(Mutex::new(client)), config }, script_path)
+    }
+
+    #[tokio::test]
+    async fn consumer_group_snapshot_does_not_preempt_agent_partial_results() {
+        let (admin, _script) = delayed_consumer_group_admin().await;
+        let snapshot =
+            admin.get_kafka_consumer_group_snapshot().await.expect("receive the bounded agent's partial results");
+        assert_eq!(snapshot.groups.len(), 2);
+        assert_eq!(snapshot.groups[0].group_id, "orders-service");
+        assert_eq!(snapshot.groups[0].total_lag, Some(2));
+        assert!(!snapshot.groups[1].lag_available);
+        assert_eq!(snapshot.groups[1].error.as_deref(), Some("Consumer group details unavailable: timed out"));
+
+        // The deadline must not kill the shared agent and break the next tab's request.
+        let topics = admin
+            .list_topics(
+                &NamespaceRef { tenant: "_kafka".to_string(), namespace: "_kafka".to_string() },
+                ListTopicsOpts::default(),
+            )
+            .await
+            .expect("agent remains usable after a partial snapshot");
+        assert_eq!(topics[0].name, "orders");
+    }
+
+    #[tokio::test]
+    async fn topic_subscriptions_do_not_preempt_agent_partial_results() {
+        let (admin, _script) = delayed_consumer_group_admin().await;
+        let subscriptions = admin
+            .list_subscriptions(&TopicRef { topic: "orders".to_string(), ..topic_ref() })
+            .await
+            .expect("receive topic subscriptions");
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].name, "orders-service");
+        assert_eq!(subscriptions[0].msg_backlog, 2);
+        let error =
+            admin.list_subscriptions(&TopicRef { topic: "denied".to_string(), ..topic_ref() }).await.unwrap_err();
+        assert!(error.contains("Group authorization failed"), "agent errors must remain visible: {error}");
     }
 
     #[tokio::test]

@@ -479,6 +479,7 @@ fn query_result(
     QueryResult {
         columns: result.columns,
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],

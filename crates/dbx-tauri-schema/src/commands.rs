@@ -733,6 +733,7 @@ pub async fn list_subpartitions(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn get_table_ddl(
     state: State<'_, Arc<AppState>>,
     connection_id: String,
@@ -744,9 +745,11 @@ pub async fn get_table_ddl(
     include_postgres_access: Option<bool>,
     portable: Option<bool>,
     exact_identity: Option<bool>,
+    separate_indexes: Option<bool>,
 ) -> Result<String, String> {
-    if exact_identity.unwrap_or(false) {
-        return dbx_core::schema::exact_metadata::ddl(
+    let separate_indexes = separate_indexes.unwrap_or(false) && object_type.is_none();
+    let result = if exact_identity.unwrap_or(false) {
+        dbx_core::schema::exact_metadata::ddl(
             &state,
             &connection_id,
             &database,
@@ -755,20 +758,23 @@ pub async fn get_table_ddl(
             object_type,
             portable.unwrap_or(false),
         )
-        .await;
-    }
-    if let Some(catalog) = external_doris_catalog(&state, &connection_id, catalog.as_deref()).await {
-        return dbx_core::schema::get_doris_catalog_table_ddl_core(&state, &connection_id, &catalog, &database, &table)
-            .await;
-    }
-    if portable.unwrap_or(false) {
+        .await?
+    } else if let Some(catalog) = external_doris_catalog(&state, &connection_id, catalog.as_deref()).await {
+        dbx_core::schema::get_doris_catalog_table_ddl_core(&state, &connection_id, &catalog, &database, &table).await?
+    } else if portable.unwrap_or(false) {
         dbx_core::schema::get_table_export_ddl_core(&state, &connection_id, &database, &schema, &table, object_type)
-            .await
+            .await?
     } else if include_postgres_access.unwrap_or(false) {
         dbx_core::schema::get_table_display_ddl_core(&state, &connection_id, &database, &schema, &table, object_type)
+            .await?
+    } else {
+        dbx_core::schema::get_table_ddl_core(&state, &connection_id, &database, &schema, &table, object_type).await?
+    };
+    if separate_indexes {
+        dbx_core::schema::separate_table_ddl_indexes_core(&state, &connection_id, &database, &schema, &table, &result)
             .await
     } else {
-        dbx_core::schema::get_table_ddl_core(&state, &connection_id, &database, &schema, &table, object_type).await
+        Ok(result)
     }
 }
 
@@ -789,13 +795,15 @@ pub async fn load_schema_diff_routines(
     database: String,
     schema: String,
     selected_routines: Option<Vec<String>>,
+    object_kinds: Option<Vec<db::ObjectSourceKind>>,
+    selected_objects: Option<Vec<dbx_core::schema::oracle_routines::RoutineSelection>>,
 ) -> Result<dbx_core::schema::oracle_routines::RoutineSnapshot, String> {
-    dbx_core::schema::oracle_routines::load_selected_schema_diff_routines_core(
+    dbx_core::schema::oracle_routines::load_schema_diff_routines_with_options_core(
         &state,
         &connection_id,
         &database,
         &schema,
-        selected_routines.as_deref(),
+        dbx_core::schema::oracle_routines::RoutineReadOptions { object_kinds, selected_objects, selected_routines },
     )
     .await
 }

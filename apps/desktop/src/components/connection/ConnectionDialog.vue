@@ -100,7 +100,16 @@ import {
 } from "@/lib/connection/timeoutLimits";
 import { buildOracleTnsConnectionString, normalizeOracleTnsAdminPath, parseOracleTnsConnectionString } from "@/lib/connection/oracleTnsConnection";
 import { applyConnectionDeepLinkUpdate, resolveConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLinkUpdate";
-import { connectionDeepLinkServiceHydrationValue, parseConnectionDeepLink, parseConnectionDeepLinkUpdate, parseServiceConnectionUrl, type ConnectionDeepLinkDraft, type ConnectionDeepLinkUpdate } from "@/lib/connection/connectionDeepLink";
+import {
+  connectionDeepLinkServiceHydrationValue,
+  parseConnectionDeepLink,
+  parseConnectionDeepLinkUpdate,
+  parseServiceConnectionUrl,
+  shouldAutoConfirmConnectionDeepLink,
+  shouldAutoConfirmConnectionPrefill,
+  type ConnectionDeepLinkDraft,
+  type ConnectionDeepLinkUpdate,
+} from "@/lib/connection/connectionDeepLink";
 import { connectionUrlPlaceholder as getUrlPlaceholder } from "@/lib/connection/connectionPresentation";
 import { parseGaussdbHosts, serializeGaussdbHosts, type GaussdbHostEntry } from "@/lib/connection/gaussdbHosts";
 import { h2ConnectionModeForConfig, h2FileJdbcUrlWithPath, h2FilePathFromJdbcUrl, isH2SplitJdbcUrl, type H2ConnectionMode } from "@/lib/database/h2Connection";
@@ -3143,6 +3152,12 @@ function switchGbaseProfile(profile: GbaseProfile) {
 let applyingConnectionUpdate = false;
 let appliedConnectionUpdate: ConnectionDeepLinkUpdate | null = null;
 
+/**
+ * 免确认保存的去重键。必须早于下面这个 `immediate` watcher 声明——更新链接的
+ * 自动保存就在该 watcher 里触发，晚声明会命中 TDZ。
+ */
+const submittedAutoCreatePrefillKey = ref<string | null>(null);
+
 function finishApplyingConnectionUpdate() {
   void nextTick(() => {
     applyingConnectionUpdate = false;
@@ -3338,7 +3353,10 @@ watch(
       customDriverName.value = isCustomCompatibleProfile() ? config.driver_label || "" : "";
       dialogStep.value = "config";
       configTab.value = initialConfigTab();
-      if (props.updatePrefill) finishApplyingConnectionUpdate();
+      if (props.updatePrefill) {
+        finishApplyingConnectionUpdate();
+        submitUpdateIfAutoConfirmed(props.updatePrefill);
+      }
       // Form/profile watchers normalize derived fields in this flush. Capture
       // the saved baseline afterwards so those initial changes are not treated
       // as user edits that invalidate persisted database metadata.
@@ -6446,9 +6464,7 @@ function resetForm(options: { preservePickerState?: boolean } = {}) {
   resetTestState();
 }
 
-const submittedOneTimePrefillKey = ref<string | null>(null);
-
-function oneTimePrefillKey(draft: ConnectionDeepLinkDraft) {
+function prefillDraftKey(draft: ConnectionDeepLinkDraft) {
   return JSON.stringify([
     draft.name,
     draft.dbType,
@@ -6469,11 +6485,31 @@ function oneTimePrefillKey(draft: ConnectionDeepLinkDraft) {
   ]);
 }
 
-function submitOneTimePrefill(draft: ConnectionDeepLinkDraft) {
-  if (!draft.oneTime) return;
-  const key = oneTimePrefillKey(draft);
-  if (submittedOneTimePrefillKey.value === key) return;
-  submittedOneTimePrefillKey.value = key;
+/**
+ * 免确认保存连接深链。
+ *
+ * `one_time` 临时连接一直是自动提交的；设置项 `deepLinkConnectionConfirmMode`
+ * 打开对应形态后，新建（`create`）与带 `id` 的更新（`update`）链接也走同一条路径：
+ * 弹窗完成预填后立刻保存，用户不需要再点确认。
+ *
+ * 仍然复用弹窗自己的 `save()`，因此驱动安装、URL 解析、校验等逻辑与手动保存完全一致；
+ * 一旦校验失败，`save()` 返回 false 且弹窗保持打开，用户可以继续手动补全。
+ */
+function submitPrefillIfAutoConfirmed(draft: ConnectionDeepLinkDraft) {
+  if (!shouldAutoConfirmConnectionPrefill(draft, settingsStore.editorSettings.deepLinkConnectionConfirmMode)) return;
+  const key = prefillDraftKey(draft);
+  if (submittedAutoCreatePrefillKey.value === key) return;
+  submittedAutoCreatePrefillKey.value = key;
+  void nextTick(() => save());
+}
+
+/** 带 `id` 的更新链接：预填完成后按设置决定是否直接保存。 */
+function submitUpdateIfAutoConfirmed(update: ConnectionDeepLinkUpdate) {
+  if (!shouldAutoConfirmConnectionDeepLink("update", settingsStore.editorSettings.deepLinkConnectionConfirmMode)) return;
+  const key = `update:${update.connectionId}:${JSON.stringify(update.patch)}`;
+  if (submittedAutoCreatePrefillKey.value === key) return;
+  submittedAutoCreatePrefillKey.value = key;
+  // 让表单 watcher 先跑完一轮派生字段归一化，再按当前表单内容保存。
   void nextTick(() => save());
 }
 
@@ -6543,7 +6579,7 @@ function applyConnectionDraftToForm(draft: ConnectionDeepLinkDraft) {
 function applyConnectionPrefill(draft: ConnectionDeepLinkDraft) {
   resetForm();
   applyConnectionDraftToForm(draft);
-  submitOneTimePrefill(draft);
+  submitPrefillIfAutoConfirmed(draft);
 }
 
 watch(
@@ -6551,7 +6587,7 @@ watch(
   (value) => {
     if (!value) {
       const draftId = editingId.value ? null : draftTestConnectionId.value;
-      submittedOneTimePrefillKey.value = null;
+      submittedAutoCreatePrefillKey.value = null;
       resetForm();
       if (draftId) {
         void api.disconnectDb(draftId).catch(() => undefined);

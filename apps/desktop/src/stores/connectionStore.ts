@@ -84,6 +84,7 @@ import {
   hasTableTreeLoadMore,
   hasTableVGroupEntries,
   isTableVGroupContainerNode,
+  missingTableVGroupMemberNames,
   moveTableToVGroup as moveTableToVGroupOp,
   normalizeTableVGroupLayout as normalizeTableVGroupLayoutOp,
   pruneTableVGroupMembers as pruneTableVGroupMembersOp,
@@ -7043,6 +7044,7 @@ export const useConnectionStore = defineStore("connection", () => {
           if (hasMore && !searchFilter) {
             children = [...children, buildLoadMoreNode(node, pageSize, pageSize)];
           }
+          children = await loadMissingTableVGroupMembers(node, children, load, "", undefined, searchFilter, tableNameFilter);
           if (isTreeLoadSearchChanged(searchFilter, options)) return;
           if (!tableNameFilterRevisionMatches(options)) return;
           const targetNode = treeNodeLoadTarget(load);
@@ -7132,7 +7134,7 @@ export const useConnectionStore = defineStore("connection", () => {
           const tableNameFilter = activeTableNameFilterForScope({
             connectionId,
             database,
-            schema,
+            schema: simpleObjectDisplay ? (effectiveSchema ?? querySchema) : schema,
             nodeKind: simpleObjectDisplay ? "simple-tables" : "group-tables",
           });
           const isSidebarTableSearch = !!options?.sidebarTableSearchParentId;
@@ -7188,6 +7190,9 @@ export const useConnectionStore = defineStore("connection", () => {
               children.push(buildEventTriggersNode(connectionId, database));
             }
           }
+          const childCountBeforeMembers = children.length;
+          children = await loadMissingTableVGroupMembers(node, children, load, querySchema, effectiveSchema, searchFilter, tableNameFilter);
+          if (nextObjectCount !== undefined) nextObjectCount += children.length - childCountBeforeMembers;
           if (isTreeLoadSearchChanged(searchFilter, options)) return;
           if (!tableNameFilterRevisionMatches(options)) return;
           const targetNode = treeNodeLoadTarget(load);
@@ -7350,6 +7355,9 @@ export const useConnectionStore = defineStore("connection", () => {
             children = page.hasMore && (!searchFilter || globalPageSearch !== undefined) ? [...page.children, buildLoadMoreNode(node, page.nextOffset, pageSize, page.nextAnchor, globalPageSearch)] : page.children;
             nextObjectCount = page.objectCount;
           }
+          const childCountBeforeMembers = children.length;
+          children = await loadMissingTableVGroupMembers(node, children, load, querySchema, effectiveSchema, searchFilter, effectiveTableNameFilterForNode(node, tableNameFilter));
+          nextObjectCount += children.length - childCountBeforeMembers;
           if (isTdengineTableGroup(node) && cacheRevision !== tdengineTreeCacheRevision(node)) return;
           if (isTreeLoadSearchChanged(searchFilter, options)) return;
           if (!tableNameFilterRevisionMatches(options)) return;
@@ -10461,6 +10469,52 @@ export const useConnectionStore = defineStore("connection", () => {
     if (!container?.children) return;
     if (container.children.some((child) => child.type === "group-tables" || isTreeGroupNodeType(child.type))) return;
     container.children = applyTableVGroupsToChildren(stripTableVGroupsFromChildren(container.children), tableVGroupLayouts.value[scopeKey], scope);
+  }
+
+  async function loadMissingTableVGroupMembers(node: TreeNode, children: TreeNode[], load: TreeNodeLoadHandle, querySchema: string, effectiveSchema?: string, searchFilter?: string, tableNameFilter?: TableNameFilter): Promise<TreeNode[]> {
+    // Search remains a filtered projection. A complete listing already establishes
+    // which members exist; only a partial unfiltered list needs supplementation.
+    if (!node.connectionId || node.database == null || searchFilter || tableVGroupKindOfContainerNode(node) !== "tables" || !hasTableTreeLoadMore(children)) return children;
+    const resolved = resolveTableVGroupScope(node);
+    if (!resolved) return children;
+    const loadedNames = collectTableTreeNames(children);
+    const memberNames = () => missingTableVGroupMemberNames(tableVGroupLayouts.value[resolved.scopeKey], loadedNames, tableNameFilter);
+    const missing = memberNames();
+    if (!missing.length) return children;
+
+    // HTTP list requests encode filters in the URL. Bound each batch by encoded
+    // length so long/non-ASCII identifiers do not exceed proxy request limits.
+    const batches: string[][] = [];
+    let batch: string[] = [];
+    let encodedLength = 0;
+    for (const name of missing) {
+      const pattern = name.replace(/[\\%_]/g, "\\$&");
+      const length = encodeURIComponent(JSON.stringify(pattern)).length + 3;
+      if (batch.length && encodedLength + length > 2000) {
+        batches.push(batch);
+        batch = [];
+        encodedLength = 0;
+      }
+      batch.push(pattern);
+      encodedLength += length;
+    }
+    if (batch.length) batches.push(batch);
+    const tables: TableInfo[] = [];
+    for (const includePatterns of batches) {
+      if (!treeNodeLoadTarget(load)) return children;
+      tables.push(...(await withMetadataLoadTimeout(node.connectionId, api.listTables(node.connectionId, node.database, querySchema, undefined, undefined, undefined, ["TABLE"], node.catalog, { includePatterns, excludePatterns: tableNameFilter?.excludePatterns ?? [] }), "tables")));
+    }
+    // A group may have been deleted/moved while metadata was loading. Only
+    // publish members that still belong to the current layout, by exact name.
+    const wanted = new Set(memberNames());
+    // Case-insensitive name filters can return the same table across batches.
+    // Keep distinct case-sensitive names, but count each real table only once.
+    const uniqueTables = [...new Map(tables.filter((table) => wanted.has(table.name)).map((table) => [table.name, table])).values()];
+    const members =
+      node.type === "group-tables"
+        ? objectGroupChildrenFromObjects({ node, parentNodeId: objectGroupRefreshParentId(node) ?? node.id, effectiveSchema, objectTypes: ["TABLE"], objects: mergeTableInfosIntoObjects([], uniqueTables, effectiveSchema) })
+        : buildTableTreeNodes({ nodeId: node.id, connectionId: node.connectionId, database: node.database, schema: effectiveSchema, catalog: node.catalog, tables: uniqueTables });
+    return [...children, ...members.filter((child) => child.type === "table")];
   }
 
   /** 分组成员回收：只有「本 scope 的完整列表」才能判定成员存亡。

@@ -2417,6 +2417,22 @@ impl AgentDriverClient {
         .await
     }
 
+    pub async fn get_object_source_with_origin<T: DeserializeOwned + Send + 'static, K: Serialize>(
+        &mut self,
+        database: &str,
+        schema: &str,
+        name: &str,
+        object_type: &K,
+        signature: Option<&str>,
+        relation_name: Option<&str>,
+        timeout_duration: Option<Duration>,
+    ) -> Result<T, String> {
+        let mut params =
+            agent_object_source_params_with_identity(database, schema, name, object_type, signature, relation_name);
+        params["include_source_origin"] = serde_json::json!(true);
+        self.call_method_with_timeout(AgentMethod::GetObjectSource, params, timeout_duration).await
+    }
+
     pub async fn get_columns<T: DeserializeOwned + Send + 'static>(
         &mut self,
         database: &str,

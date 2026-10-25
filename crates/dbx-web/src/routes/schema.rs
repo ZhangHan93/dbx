@@ -33,6 +33,7 @@ pub struct SchemaQuery {
     pub portable: Option<bool>,
     pub execution_id: Option<String>,
     pub exact_identity: Option<bool>,
+    pub separate_indexes: Option<bool>,
 }
 
 async fn run_cancellable<T, F>(state: &Arc<WebState>, execution_id: Option<String>, future: F) -> Result<T, AppError>
@@ -932,6 +933,7 @@ pub async fn get_ddl(
     State(state): State<Arc<WebState>>,
     Query(q): Query<SchemaQuery>,
 ) -> Result<Json<String>, AppError> {
+    let separate_indexes = q.separate_indexes.unwrap_or(false) && q.object_type.is_none();
     let database = q.database.as_deref().unwrap_or("");
     let schema = q.schema.as_deref().unwrap_or("");
     let table = q.table.as_deref().unwrap_or("");
@@ -978,6 +980,20 @@ pub async fn get_ddl(
             .await
             .map_err(AppError::from)?
     };
+    let result = if separate_indexes {
+        dbx_core::schema::separate_table_ddl_indexes_core(
+            &state.app,
+            &q.connection_id,
+            database,
+            schema,
+            table,
+            &result,
+        )
+        .await
+        .map_err(AppError::from)?
+    } else {
+        result
+    };
     Ok(Json(result))
 }
 
@@ -998,6 +1014,8 @@ pub struct RoutineSnapshotQuery {
     #[serde(flatten)]
     scope: SchemaQuery,
     selected_routines: Option<String>,
+    object_kinds: Option<String>,
+    selected_objects: Option<String>,
 }
 
 pub async fn load_schema_diff_routines(
@@ -1011,12 +1029,24 @@ pub async fn load_schema_diff_routines(
         .transpose()
         .map_err(|error| AppError::from(format!("Invalid selected routine names: {error}")))?;
     let q = query.scope;
-    let snapshot = dbx_core::schema::oracle_routines::load_selected_schema_diff_routines_core(
+    let object_kinds = query
+        .object_kinds
+        .as_deref()
+        .map(serde_json::from_str::<Vec<dbx_core::db::ObjectSourceKind>>)
+        .transpose()
+        .map_err(|error| AppError::from(format!("Invalid program object kinds: {error}")))?;
+    let selected_objects = query
+        .selected_objects
+        .as_deref()
+        .map(serde_json::from_str::<Vec<dbx_core::schema::oracle_routines::RoutineSelection>>)
+        .transpose()
+        .map_err(|error| AppError::from(format!("Invalid selected program identities: {error}")))?;
+    let snapshot = dbx_core::schema::oracle_routines::load_schema_diff_routines_with_options_core(
         &state.app,
         &q.connection_id,
         q.database.as_deref().unwrap_or(""),
         q.schema.as_deref().unwrap_or(""),
-        selected_routines.as_deref(),
+        dbx_core::schema::oracle_routines::RoutineReadOptions { object_kinds, selected_objects, selected_routines },
     )
     .await
     .map_err(AppError::from)?;

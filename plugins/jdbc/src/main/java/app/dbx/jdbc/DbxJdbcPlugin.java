@@ -204,11 +204,18 @@ public final class DbxJdbcPlugin {
         String sharedConnectionKey = "";
         Connection sharedConnection;
         boolean manualTransactionActive;
+        boolean deferLobs;
         final Map<String, QuerySession> querySessions = new HashMap<>();
         final Map<String, CancellationRequest> cancellationRequests = new HashMap<>();
         volatile Statement activeStatement;
         volatile boolean closing;
         final java.util.concurrent.locks.ReentrantLock operation = new java.util.concurrent.locks.ReentrantLock();
+        final DeferredLobValues largeValues = new DeferredLobValues(call -> {
+            Statement previous = activeStatement;
+            trackActiveStatement(call);
+            try { call.execute(); }
+            finally { trackActiveStatement(previous); }
+        }, () -> closing || isCancellationRequested(CANCELLATION_REQUEST.get()));
     }
 
     static final class CancellationRequest {
@@ -530,12 +537,59 @@ public final class DbxJdbcPlugin {
     }
 
     private static void writeResponse(BufferedWriter writer, ObjectNode response) throws IOException {
+        if (response.has("error") && !responseFitsBudget(response, 64 * 1024 * 1024)) {
+            ObjectNode bounded = MAPPER.createObjectNode();
+            bounded.set("id", response.path("id"));
+            bounded.set("error", MAPPER.createObjectNode().put("message", RESPONSE_LIMIT_MESSAGE));
+            response = bounded;
+        }
         synchronized (writer) {
             writer.write(MAPPER.writeValueAsString(response));
-            writer.newLine();
+            writer.write('\n');
             writer.flush();
         }
     }
+
+    private static final String RESPONSE_LIMIT_MESSAGE = "JDBC response exceeds the 64 MiB transport limit. The statement was not retried; changes may already have taken effect. Reduce the selected data and verify any writes before retrying.";
+
+    static void checkResponseBudget(JsonNode id, JsonNode result, JsonNode params, int maximum) throws SQLException {
+        ObjectNode response = MAPPER.createObjectNode();
+        response.set("id", id);
+        response.set("result", result);
+        try {
+            if (responseFitsBudget(response, maximum)) return;
+        } catch (IOException error) {
+            throw new SQLException("Failed to encode JDBC response", error);
+        }
+        String sessionId = optionalText(result, "session_id");
+        for (JsonNode cell : result.path("large_value_cells")) connectionState().largeValues.release(cell.path("value_ref").asText());
+        if (sessionId == null) sessionId = optionalText(params, "sessionId");
+        if (sessionId != null) closeQuerySession(sessionId);
+        throw new SQLException(RESPONSE_LIMIT_MESSAGE);
+    }
+
+    private static boolean responseFitsBudget(JsonNode response, int maximum) throws IOException {
+        try {
+            MAPPER.writeValue(new java.io.OutputStream() {
+                private int remaining = maximum - 1;
+                @Override public void write(int value) throws IOException {
+                    if (remaining-- <= 0) throw new ResponseLimitException();
+                }
+                @Override public void write(byte[] bytes, int offset, int count) throws IOException {
+                    if (count > remaining) throw new ResponseLimitException();
+                    remaining -= count;
+                }
+            }, response);
+            return true;
+        } catch (IOException error) {
+            Throwable cause = error;
+            while (cause != null && !(cause instanceof ResponseLimitException)) cause = cause.getCause();
+            if (cause == null) throw error;
+            return false;
+        }
+    }
+
+    private static final class ResponseLimitException extends IOException {}
 
     private static void closeLogicalSession(JdbcConnectionState state) {
         state.closing = true;
@@ -582,7 +636,7 @@ public final class DbxJdbcPlugin {
         return LOGICAL_SESSIONS.get(sessionId);
     }
 
-    private static JsonNode handleLogicalSession(String method, JsonNode params, JsonNode connection,
+    private static JsonNode handleLogicalSession(JsonNode requestId, String method, JsonNode params, JsonNode connection,
                                                   JdbcConnectionState state) throws Exception {
         String id = requireText(params, "jdbcSessionId");
         if ("closeJdbcSession".equals(method)) {
@@ -595,10 +649,14 @@ public final class DbxJdbcPlugin {
             if (shuttingDown || state.closing) throw new SQLException("JDBC logical session is closed");
             if ("openJdbcSession".equals(method)) return okResult();
             CONNECTION_STATE.set(state);
+            Set<String> checkpoint = state.largeValues.checkpoint();
             try {
                 registerDrivers(connection);
-                return handle(method, params, connection);
+                JsonNode result = handle(method, params, connection);
+                checkResponseBudget(requestId, result, params, 64 * 1024 * 1024);
+                return result;
             } catch (Exception | LinkageError error) {
+                state.largeValues.releaseSince(checkpoint);
                 if ("connect".equals(method)
                     && (state.sharedConnection == null || !isPostgresJdbcUrl(optionalText(connection, "connection_string")))) {
                     closeSharedConnection();
@@ -626,6 +684,7 @@ public final class DbxJdbcPlugin {
         response.set("id", id.isMissingNode() ? MAPPER.getNodeFactory().numberNode(1) : id);
 
         JsonNode connection = MAPPER.createObjectNode();
+        Set<String> checkpoint = request.path("params").hasNonNull("jdbcSessionId") ? null : connectionState().largeValues.checkpoint();
         try {
             String method = requireText(request, "method");
             JsonNode params = request.path("params");
@@ -637,7 +696,7 @@ public final class DbxJdbcPlugin {
                 return response;
             }
             if (params.hasNonNull("jdbcSessionId")) {
-                response.set("result", handleLogicalSession(method, params, connection, retainedState));
+                response.set("result", handleLogicalSession(response.path("id"), method, params, connection, retainedState));
                 return response;
             }
             if ("close".equals(method)) {
@@ -653,8 +712,11 @@ public final class DbxJdbcPlugin {
                 return response;
             }
             registerDrivers(connection);
-            response.set("result", handle(method, params, connection));
+            JsonNode result = handle(method, params, connection);
+            checkResponseBudget(response.path("id"), result, params, 64 * 1024 * 1024);
+            response.set("result", result);
         } catch (Throwable error) {
+            if (checkpoint != null) connectionState().largeValues.releaseSince(checkpoint);
             // The plugin protocol boundary must report linkage errors from vendor drivers instead of exiting silently.
             ObjectNode errorNode = MAPPER.createObjectNode();
             errorNode.put("message", enrichDriverHint(connection, throwableMessage(error)));
@@ -736,6 +798,8 @@ public final class DbxJdbcPlugin {
     }
 
     private static JsonNode handle(String method, JsonNode params, JsonNode connection) throws Exception {
+        connectionState().deferLobs = params.path("deferLobs").asBoolean(false)
+            && Set.of("executeQuery", "executeQueryPage", "execute_query_page", "executeInManualTransaction", "execute_in_manual_transaction").contains(method);
         String database = optionalText(params, "database");
         boolean exactIdentity = params.path("exact_identity").asBoolean(false);
         if (exactIdentity && !driverQuirks(connection).useOracleMetadata()) {
@@ -750,6 +814,11 @@ public final class DbxJdbcPlugin {
             }
         }
         return switch (method) {
+            case "read_large_value_chunk" -> MAPPER.valueToTree(connectionState().largeValues.fetch(
+                connectionState().sharedConnection, requireText(params, "valueRef"),
+                params.path("offset").asLong(-1), params.path("limit").asInt(0)));
+            case "release_large_value" -> MAPPER.valueToTree(Map.of("released",
+                connectionState().largeValues.release(requireText(params, "valueRef"))));
             case "testConnection" -> connectionTestResult(openConnection(connection));
             case "connect" -> {
                 openConnection(connection);
@@ -832,7 +901,8 @@ public final class DbxJdbcPlugin {
                 database,
                 metadataText(params, "schema", exactIdentity),
                 exactIdentity ? metadataText(params, "name", true) : requireText(params, "name"),
-                requireText(params, "object_type"), exactIdentity
+                requireText(params, "object_type"), exactIdentity,
+                params.path("include_source_origin").asBoolean(false)
             );
             case "getColumns" -> getColumns(
                 connection,
@@ -1305,6 +1375,7 @@ public final class DbxJdbcPlugin {
     }
 
     private static void applyOracleProperties(JsonNode connection, Properties properties) {
+        properties.putIfAbsent("oracle.net.disableOob", "true");
         properties.putIfAbsent("remarksReporting", "false");
         properties.putIfAbsent("restrictGetTables", "true");
         properties.putIfAbsent("includeSynonyms", "false");
@@ -1431,6 +1502,7 @@ public final class DbxJdbcPlugin {
         ZoneId timestampZone = tdengineTimestampZone(connection, conn);
         boolean bitStringColumns = usesBitStringColumns(connection);
         boolean fullPrecisionIntegers = usesFullPrecisionIntegers(connection);
+        Boolean deferredOceanbase = deferredLobMode(connection, conn);
         try (Statement statement = conn.createStatement()) {
             trackActiveStatement(statement);
             if (connectionState().closing) throw new SQLException("JDBC logical session is closed");
@@ -1441,6 +1513,7 @@ public final class DbxJdbcPlugin {
             ObjectNode result = MAPPER.createObjectNode();
             ArrayNode columns = MAPPER.createArrayNode();
             ArrayNode rows = MAPPER.createArrayNode();
+            ArrayNode largeCells = MAPPER.createArrayNode();
             boolean truncated = false;
 
             try (ResultSet rs = executed.resultSet()) {
@@ -1460,17 +1533,16 @@ public final class DbxJdbcPlugin {
                             truncated = true;
                             break;
                         }
-                        ArrayNode row = MAPPER.createArrayNode();
-                        for (int i = 1; i <= columnCount; i++) {
-                            row.add(MAPPER.valueToTree(readValue(rs, meta, i, preserveOracleDateTime, timestampZone, bitStringColumns, fullPrecisionIntegers)));
-                        }
-                        rows.add(row);
+                        ResultRow row = readResultRow(rs, meta, preserveOracleDateTime, timestampZone, bitStringColumns, fullPrecisionIntegers, deferredOceanbase);
+                        appendLargeCells(largeCells, row, rows.size());
+                        rows.add(row.values());
                     }
                 }
             }
 
             result.set("columns", columns);
             result.set("rows", rows);
+            result.set("large_value_cells", largeCells);
             result.put("affected_rows", columns.isEmpty() ? Math.max(executed.updateCount(), 0) : 0);
             result.put("execution_time_ms", (System.nanoTime() - start) / 1_000_000);
             result.put("truncated", truncated);
@@ -1559,8 +1631,9 @@ public final class DbxJdbcPlugin {
         private final ZoneId timestampZone;
         private final boolean bitStringColumns;
         private final boolean fullPrecisionIntegers;
+        private final Boolean deferredOceanbase;
         private int rowsReturned;
-        private ArrayNode pendingRow;
+        private ResultRow pendingRow;
 
         private QuerySession(
             String id,
@@ -1575,7 +1648,8 @@ public final class DbxJdbcPlugin {
             boolean preserveOracleDateTime,
             ZoneId timestampZone,
             boolean bitStringColumns,
-            boolean fullPrecisionIntegers
+            boolean fullPrecisionIntegers,
+            Boolean deferredOceanbase
         ) {
             this.id = id;
             this.statement = statement;
@@ -1590,6 +1664,7 @@ public final class DbxJdbcPlugin {
             this.timestampZone = timestampZone;
             this.bitStringColumns = bitStringColumns;
             this.fullPrecisionIntegers = fullPrecisionIntegers;
+            this.deferredOceanbase = deferredOceanbase;
         }
     }
 
@@ -1661,7 +1736,8 @@ public final class DbxJdbcPlugin {
                 preserveOracleDateTime,
                 timestampZone,
                 bitStringColumns,
-                usesFullPrecisionIntegers(connection)
+                usesFullPrecisionIntegers(connection),
+                deferredLobMode(connection, conn)
             );
             connectionState().querySessions.put(sessionId, session);
             try {
@@ -1724,44 +1800,53 @@ public final class DbxJdbcPlugin {
         if (connectionState().closing) throw new SQLException("JDBC logical session is closed");
         int effectivePageSize = Math.max(1, pageSize);
         ArrayNode rows = MAPPER.createArrayNode();
+        ArrayNode largeCells = MAPPER.createArrayNode();
         boolean truncated = false;
 
+        try {
         while (rows.size() < effectivePageSize && session.rowsReturned < session.maxRows) {
-            ArrayNode row;
+            ResultRow row;
             if (session.pendingRow != null) {
                 row = session.pendingRow;
                 session.pendingRow = null;
             } else {
                 if (!session.resultSet.next()) {
                     closeQuerySession(session.id);
-                    return queryPageResult(session, rows, false, false);
+                    return queryPageResult(session, rows, largeCells, false, false);
                 }
-                row = readRow(session.resultSet, session.meta, session.preserveOracleDateTime, session.timestampZone, session.bitStringColumns, session.fullPrecisionIntegers);
+                row = readResultRow(session.resultSet, session.meta, session.preserveOracleDateTime, session.timestampZone, session.bitStringColumns, session.fullPrecisionIntegers, session.deferredOceanbase);
             }
-            rows.add(row);
+            appendLargeCells(largeCells, row, rows.size());
+            rows.add(row.values());
             session.rowsReturned++;
         }
 
         if (session.rowsReturned >= session.maxRows) {
             truncated = session.pendingRow != null || session.resultSet.next();
             closeQuerySession(session.id);
-            return queryPageResult(session, rows, truncated, false);
+            return queryPageResult(session, rows, largeCells, truncated, false);
         }
 
         boolean hasMore = session.resultSet.next();
         if (!hasMore) {
             closeQuerySession(session.id);
-            return queryPageResult(session, rows, false, false);
+            return queryPageResult(session, rows, largeCells, false, false);
         }
 
-        session.pendingRow = readRow(session.resultSet, session.meta, session.preserveOracleDateTime, session.timestampZone, session.bitStringColumns, session.fullPrecisionIntegers);
-        return queryPageResult(session, rows, false, true);
+        session.pendingRow = readResultRow(session.resultSet, session.meta, session.preserveOracleDateTime, session.timestampZone, session.bitStringColumns, session.fullPrecisionIntegers, session.deferredOceanbase);
+        return queryPageResult(session, rows, largeCells, false, true);
+        } catch (SQLException | RuntimeException | LinkageError error) {
+            for (JsonNode cell : largeCells) connectionState().largeValues.release(cell.path("value_ref").asText());
+            closeQuerySession(session.id);
+            throw error;
+        }
     }
 
-    private static ObjectNode queryPageResult(QuerySession session, ArrayNode rows, boolean truncated, boolean hasMore) {
+    private static ObjectNode queryPageResult(QuerySession session, ArrayNode rows, ArrayNode largeCells, boolean truncated, boolean hasMore) {
         ObjectNode result = MAPPER.createObjectNode();
         result.set("columns", session.columns.deepCopy());
         result.set("rows", rows);
+        result.set("large_value_cells", largeCells);
         result.put("affected_rows", 0);
         result.put("execution_time_ms", (System.nanoTime() - session.startNanos) / 1_000_000);
         result.put("truncated", truncated);
@@ -1785,6 +1870,7 @@ public final class DbxJdbcPlugin {
         if (session == null) {
             return false;
         }
+        if (session.pendingRow != null) releaseRowValues(session.pendingRow);
         try {
             session.resultSet.close();
         } catch (Exception ignored) {
@@ -1802,6 +1888,62 @@ public final class DbxJdbcPlugin {
         for (String sessionId : sessionIds) {
             closeQuerySession(sessionId);
         }
+    }
+
+    private static Boolean deferredLobMode(JsonNode config, Connection connection) throws SQLException {
+        if (!connectionState().deferLobs) return null;
+        String url = jdbcUrl(config);
+        if (isOracleUrl(url)) return false;
+        if (!urlMatchesPrefix(url, "jdbc:oceanbase:")) return null;
+        try {
+            var protocolMethod = connection.getClass().getMethod("getProtocol");
+            Object protocol = protocolMethod.invoke(connection);
+            boolean oracle = (boolean) protocolMethod.getReturnType().getMethod("isOracleMode").invoke(protocol);
+            return oracle ? Boolean.TRUE : null;
+        } catch (ReflectiveOperationException error) {
+            throw new SQLException("Cannot verify OceanBase LOB mode", error);
+        }
+    }
+
+    private record ResultRow(ArrayNode values, ArrayNode largeCells) {}
+
+    private static ResultRow readResultRow(ResultSet rs, ResultSetMetaData meta, boolean preserveOracleDateTime,
+        ZoneId timestampZone, boolean bitStringColumns, boolean fullPrecisionIntegers, Boolean oceanbase) throws SQLException {
+        if (oceanbase == null) return new ResultRow(readRow(rs, meta, preserveOracleDateTime, timestampZone, bitStringColumns, fullPrecisionIntegers), MAPPER.createArrayNode());
+        ArrayNode row = MAPPER.createArrayNode();
+        ArrayNode cells = MAPPER.createArrayNode();
+        DeferredLobValues values = connectionState().largeValues;
+        Set<String> checkpoint = values.checkpoint();
+        try {
+            for (int i = 1; i <= meta.getColumnCount(); i++) {
+                int type = meta.getColumnType(i);
+                if (type == Types.CLOB || type == Types.BLOB) {
+                    Object locator = type == Types.BLOB ? rs.getBlob(i) : rs.getClob(i);
+                    DeferredLobValues.Preview preview = values.capture(connectionState().sharedConnection, locator, oceanbase);
+                    row.add(preview.text());
+                    if (preview.ref() != null) cells.add(MAPPER.createObjectNode()
+                        .put("column_index", i - 1).put("original_bytes", preview.originalBytes()).put("value_ref", preview.ref()));
+                } else {
+                    row.add(MAPPER.valueToTree(readValue(rs, meta, i, preserveOracleDateTime, timestampZone, bitStringColumns, fullPrecisionIntegers)));
+                }
+            }
+            return new ResultRow(row, cells);
+        } catch (SQLException error) {
+            values.releaseSince(checkpoint);
+            throw error;
+        }
+    }
+
+    private static void appendLargeCells(ArrayNode cells, ResultRow row, int rowIndex) {
+        for (JsonNode cell : row.largeCells()) {
+            ObjectNode target = cell.deepCopy();
+            target.put("row_index", rowIndex);
+            cells.add(target);
+        }
+    }
+
+    private static void releaseRowValues(ResultRow row) {
+        for (JsonNode cell : row.largeCells()) connectionState().largeValues.release(cell.path("value_ref").asText());
     }
 
     private static ArrayNode readRow(
@@ -4504,6 +4646,7 @@ public final class DbxJdbcPlugin {
     private static void closeSharedConnection() {
         JdbcConnectionState state = connectionState();
         closeAllQuerySessions();
+        state.largeValues.clear();
         if (state.sharedConnection != null) {
             if (state.manualTransactionActive) {
                 try {
@@ -5175,6 +5318,11 @@ public final class DbxJdbcPlugin {
 
     private static JsonNode getObjectSource(JsonNode connection, String database, String schema, String name, String objectType, boolean exactIdentity)
         throws SQLException {
+        return getObjectSource(connection, database, schema, name, objectType, exactIdentity, false);
+    }
+
+    private static JsonNode getObjectSource(JsonNode connection, String database, String schema, String name, String objectType, boolean exactIdentity, boolean includeOrigin)
+        throws SQLException {
         Connection conn = openConnection(connection);
         if (driverQuirks(connection).useOracleMetadata()) {
             String metadataType = oracleMetadataObjectType(objectType);
@@ -5183,6 +5331,9 @@ public final class DbxJdbcPlugin {
                 return oracleTypeSource(conn, owner, name, metadataType);
             }
             String owner = exactIdentity ? schema : oracleEffectiveSchema(conn, schema);
+            if (includeOrigin && "PACKAGE".equals(metadataType)) {
+                metadataType = "PACKAGE_SPEC";
+            }
             String sql = "SELECT DBMS_METADATA.GET_DDL(?, ?, ?) FROM DUAL";
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setString(1, metadataType);
@@ -5197,6 +5348,9 @@ public final class DbxJdbcPlugin {
                     item.put("object_type", objectType);
                     putNullable(item, "schema", owner);
                     putNullable(item, "source", rs.getString(1));
+                    if (includeOrigin) {
+                        item.put("source_origin", "oracle-metadata");
+                    }
                     return item;
                 }
             }

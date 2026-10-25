@@ -5,6 +5,7 @@ import type { MultiDbExecutionTarget, MultiDbResultRunExecution } from "@/types/
 import type { DatabaseType } from "@/types/generated/databaseTypes";
 import type { PluginAiRecommendation } from "@/types/pluginAiRecommendations";
 import type { GraphResult } from "@/lib/graph/graphResult";
+import type { OracleRoutinePlanDraft } from "@/types/schemaDiff";
 
 export type { DatabaseType } from "@/types/generated/databaseTypes";
 
@@ -2340,6 +2341,9 @@ export interface TableStructureEditorDraft {
   /** Original DDL and display preference retained so restoring a draft cannot change its baseline. */
   rawDdlContent?: string;
   excludeDdlStorage?: boolean;
+  includeDdlStorage?: boolean;
+  compactDdlSql?: boolean;
+  separateDdlIndexes?: boolean;
   /** Edited DDL script, or null/undefined when the DDL tab was left untouched. */
   ddlDraft?: string | null;
   newTableName: string;
@@ -2769,6 +2773,8 @@ export interface QueryTab {
     tableName: string;
     objectType?: ObjectSourceKind;
     formatDialect?: SqlFormatDialect;
+    displaySource?: string;
+    separateIndexes?: boolean;
   };
   /**
    * 「先出 tab 再加载」的中间态：DDL 新标签已经可见，但 DDL 还在路上
@@ -3002,6 +3008,8 @@ export interface SavedSqlLibrary {
 }
 
 /** Serializable configuration of a saved data-transfer task. */
+export type TransferPackageDraft = Pick<OracleRoutinePlanDraft, "identity" | "sourceName" | "sql" | "packageBodySource" | "packageContract" | "confirmPackagePair"> & { reviewedTargetDraft?: boolean };
+
 export interface TransferTaskConfig {
   sourceConnectionId: string;
   /** Undefined means the connection's built-in/default catalog. */
@@ -3014,6 +3022,7 @@ export interface TransferTaskConfig {
   targetSchema?: string;
   /** Selected object names grouped by object kind (TABLE, VIEW, ...). */
   objects: Partial<Record<TransferObjectKind, string[]>>;
+  oraclePackageDrafts?: TransferPackageDraft[];
   content: TransferContent;
   mode: TransferMode;
   targetTableNameCase: TransferTableNameCase;

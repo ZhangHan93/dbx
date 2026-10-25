@@ -731,6 +731,7 @@ async fn fetch_table_export_batch(
         return Ok(QueryResult {
             columns: col_names.to_vec(),
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
             spatial_values: vec![],

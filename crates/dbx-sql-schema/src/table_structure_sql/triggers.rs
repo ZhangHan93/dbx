@@ -400,6 +400,58 @@ fn create_oracle_trigger_sql(
     ))
 }
 
+pub(crate) fn oracle_snapshot_trigger_source(
+    owner: &str,
+    table: &str,
+    trigger: &dbx_sql_core::types::TriggerInfo,
+) -> Result<String, String> {
+    let statement = trigger
+        .statement
+        .as_deref()
+        .filter(|statement| !statement.trim().is_empty())
+        .ok_or("Trigger statement/body is missing from schema snapshot")?;
+    let enabled = trigger.enabled.ok_or("Trigger firing state is unavailable")?;
+    let statement = statement.trim();
+    let mut ddl = if let Some(source) = dbx_sql_core::object_source_sql::oracle_trigger_source_with_create(statement)? {
+        source
+    } else {
+        if trigger.condition.as_deref().is_some_and(|condition| !condition.trim().is_empty()) {
+            return Err("Trigger condition requires its complete source definition".into());
+        }
+        let mut warnings = Vec::new();
+        let timing = match trigger.level.as_deref().map(str::to_ascii_uppercase).as_deref() {
+            Some("ROW" | "EACH ROW") if !trigger.timing.to_ascii_uppercase().contains("ROW") => {
+                format!("{} EACH ROW", trigger.timing)
+            }
+            Some("STATEMENT") if trigger.timing.to_ascii_uppercase().contains("ROW") => {
+                return Err("Trigger timing and level conflict".into())
+            }
+            Some("ROW" | "EACH ROW" | "STATEMENT") | None => trigger.timing.clone(),
+            Some(_) => return Err("Trigger level is unavailable or unsupported".into()),
+        };
+        create_oracle_trigger_sql(
+            Some(crate::models::connection::DatabaseType::Oracle),
+            StructureDialect::Oracle,
+            Some(owner),
+            &qualified_table(StructureDialect::Oracle, Some(owner), table),
+            &trigger.name,
+            &timing,
+            &trigger.event,
+            statement,
+            &mut warnings,
+            false,
+        )
+        .ok_or_else(|| warnings.join("; "))?
+    };
+    if !enabled {
+        ddl.push_str(&format!(
+            "\nALTER TRIGGER {} DISABLE;",
+            qualified_table(StructureDialect::Oracle, Some(owner), &trigger.name)
+        ));
+    }
+    Ok(ddl)
+}
+
 /// The driver strips the dictionary declaration only when the trigger is fully described by its
 /// timing, event and body; otherwise the source still starts with `TRIGGER ...`.
 fn is_structured_oracle_trigger_source(original: &TriggerInfo) -> bool {
@@ -424,7 +476,7 @@ fn oracle_trigger_body(statement: &str) -> &str {
 }
 
 fn starts_with_trigger_declaration(statement: &str) -> bool {
-    let keywords = leading_keywords(statement, 4);
+    let keywords = leading_keywords(statement, 5);
     match keywords.first().map(String::as_str) {
         Some("TRIGGER") => true,
         Some("CREATE") => keywords.iter().any(|keyword| keyword == "TRIGGER"),

@@ -5,6 +5,7 @@ import { getStarRocksCapabilities } from "@/lib/table/starrocksCapabilities";
 import { starRocksAlterOptionsFromDdl, starRocksColumnDefinitionLocked, type StarRocksAlterOptions } from "@/lib/table/starrocksAlterOptions";
 import { getColumnDefaultValuePresets } from "@/lib/table/columnDefaultPresets";
 import { applyDdlStoragePreference } from "@/lib/sql/ddlStorage";
+import { compactDdlSql } from "@/lib/sql/ddlCompact";
 import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
 import StructureIndexColumnPicker from "./StructureIndexColumnPicker.vue";
 import TableColumnPasteDialog from "./TableColumnPasteDialog.vue";
@@ -303,9 +304,15 @@ const foreignKeysLoading = ref(false);
 const constraintsLoading = ref(false);
 const triggersLoading = ref(false);
 const rawDdlContent = ref("");
-const ddlStorageExcluded = ref(settingsStore.editorSettings.excludeDdlStorage);
-const ddlContent = computed(() => applyDdlStoragePreference(rawDdlContent.value, databaseType.value, ddlStorageExcluded.value));
+const ddlStorageIncluded = ref(settingsStore.editorSettings.includeDdlStorage);
+const ddlCompacted = ref(settingsStore.editorSettings.compactDdlSql);
+const ddlIndexesSeparated = ref(settingsStore.editorSettings.separateDdlIndexes);
+const ddlContent = computed(() => {
+  const sql = applyDdlStoragePreference(rawDdlContent.value, databaseType.value, !ddlStorageIncluded.value);
+  return ddlCompacted.value ? compactDdlSql(sql, databaseType.value) : sql;
+});
 const ddlLoading = ref(false);
+const ddlLoadError = ref("");
 let ddlLoadRequestId = 0;
 const ddlEditorContainer = ref<HTMLDivElement>();
 const ddlSearchPanelRef = ref<InstanceType<typeof EditorSearchPanel>>();
@@ -326,12 +333,23 @@ const ddlDraft = ref<string | null>(null);
  * create-table flow has no DDL tab, and an empty baseline only renders the
  * "no records" placeholder, which must never become executable text.
  */
-const ddlEditingEnabled = computed(() => !isCreateMode.value && !!ddlContent.value.trim());
+const ddlEditingEnabled = computed(() => !isCreateMode.value && !ddlLoading.value && !ddlLoadError.value && !!ddlContent.value.trim());
 const ddlDirty = computed(() => ddlDraft.value !== null && ddlDraft.value.trim() !== ddlContent.value.trim());
-watch([() => settingsStore.editorSettings.excludeDdlStorage, ddlDirty], ([exclude, dirty]) => {
-  if (!dirty && ddlStorageExcluded.value !== exclude) {
+watch([() => settingsStore.editorSettings.includeDdlStorage, () => settingsStore.editorSettings.compactDdlSql, () => settingsStore.editorSettings.separateDdlIndexes, ddlDirty], ([include, compact, separate, dirty]) => {
+  if (!dirty && (ddlStorageIncluded.value !== include || ddlCompacted.value !== compact || ddlIndexesSeparated.value !== separate)) {
+    const indexesChanged = ddlIndexesSeparated.value !== separate;
     ddlDraft.value = null;
-    ddlStorageExcluded.value = exclude;
+    ddlStorageIncluded.value = include;
+    ddlCompacted.value = compact;
+    ddlIndexesSeparated.value = separate;
+    if (indexesChanged && (databaseType.value === "oracle" || databaseType.value === "oceanbase-oracle")) {
+      destroyDdlEditor();
+      ddlLoadRequestId++;
+      ddlLoading.value = false;
+      ddlLoadError.value = "";
+      ddlFetched.value = false;
+      if (structureEditorReady && activeTab.value === "ddl") void fetchDdl();
+    }
   }
 });
 
@@ -547,21 +565,29 @@ async function fetchDdl(force = false) {
   if (!props.connectionId || !props.database || !props.tableName || (!force && ddlFetched.value) || !tableMetadataCapabilities.value.ddl) return;
   if (force) destroyDdlEditor();
   const request = ddlRequest();
+  const separateIndexes = (databaseType.value === "oracle" || databaseType.value === "oceanbase-oracle") && ddlIndexesSeparated.value;
   const requestId = ++ddlLoadRequestId;
   const revision = store.connectionStateRevision(request.connectionId);
   const fingerprint = connection.value ? connectionConfigFingerprint(connection.value) : "";
-  const current = () => !primaryKeyUnmounted && requestId === ddlLoadRequestId && JSON.stringify(request) === JSON.stringify(ddlRequest()) && store.connectionStateRevision(request.connectionId) === revision && (connection.value ? connectionConfigFingerprint(connection.value) : "") === fingerprint;
+  const current = () =>
+    !primaryKeyUnmounted &&
+    requestId === ddlLoadRequestId &&
+    JSON.stringify(request) === JSON.stringify(ddlRequest()) &&
+    separateIndexes === ((databaseType.value === "oracle" || databaseType.value === "oceanbase-oracle") && ddlIndexesSeparated.value) &&
+    store.connectionStateRevision(request.connectionId) === revision &&
+    (connection.value ? connectionConfigFingerprint(connection.value) : "") === fingerprint;
   ddlLoading.value = true;
+  ddlLoadError.value = "";
   try {
-    const { ddl } = await loadObjectDdl(request, { force });
+    const { ddl } = await loadObjectDdl({ ...request, separateIndexes }, { force });
     const formatted = await formatStructureDdl(ddl);
     if (!current()) return;
     rawDdlContent.value = formatted;
     ddlFetched.value = true;
   } catch (e: any) {
     if (!current()) return;
-    rawDdlContent.value = `-- Error: ${e?.message || e}`;
-    ddlFetched.value = true;
+    ddlLoadError.value = String(e?.message || e);
+    ddlFetched.value = false;
   } finally {
     if (current()) ddlLoading.value = false;
   }
@@ -2539,7 +2565,20 @@ let restoringDraft = false;
 let syncingDraft = false;
 let draftHydrated = false;
 let lastAppliedInitialTabRequestId: number | undefined;
-let hydratingRestoredDraft = false;
+const hydratingRestoredDraft = ref(false);
+const draftHydrationError = ref("");
+let draftHydrationRequestId = 0;
+let restoredDraftTarget = "";
+
+function draftTargetIdentity() {
+  return JSON.stringify([props.connectionId, props.database, metadataSchema.value, props.tableName, props.catalog, props.tableType, props.exactIdentity === true, databaseType.value]);
+}
+
+function invalidateDraftHydration() {
+  draftHydrationRequestId++;
+  hydratingRestoredDraft.value = false;
+  clearSqlPreviewState();
+}
 let structureScrollDraftSyncTimer: ReturnType<typeof setTimeout> | undefined;
 let structureColumnScrollingTimer: ReturnType<typeof setTimeout> | undefined;
 let lastColumnVirtualRenderScrollTop = 0;
@@ -2788,7 +2827,9 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     // refetched, and copying every table's DDL into every draft is pure weight.
     ddlContent: ddlDraft.value === null ? undefined : ddlContent.value,
     rawDdlContent: ddlDraft.value === null ? undefined : rawDdlContent.value,
-    excludeDdlStorage: ddlStorageExcluded.value,
+    includeDdlStorage: ddlStorageIncluded.value,
+    compactDdlSql: ddlCompacted.value,
+    separateDdlIndexes: ddlIndexesSeparated.value,
     newTableName: newTableName.value,
     tableComment: tableComment.value,
     originalTableComment: originalTableComment.value,
@@ -2835,7 +2876,7 @@ function emitDraftToParent(draft: TableStructureEditorDraft | undefined) {
 }
 
 function syncStructureScrollDraftToParent() {
-  if (!draftHydrated || restoringDraft || syncingDraft) return;
+  if ((!draftHydrated && restoredDraftTarget !== draftTargetIdentity()) || restoringDraft || syncingDraft) return;
   const draft = lastSyncedDraft ?? props.draft;
   if (!draft) {
     syncDraftToParent();
@@ -2854,7 +2895,7 @@ function syncDraftToParent() {
     clearTimeout(structureScrollDraftSyncTimer);
     structureScrollDraftSyncTimer = undefined;
   }
-  if (!draftHydrated) return;
+  if (!draftHydrated && restoredDraftTarget !== draftTargetIdentity()) return;
   if (restoringDraft || syncingDraft) return;
   syncingDraft = true;
   emitDraftToParent(createCurrentDraft());
@@ -2877,7 +2918,9 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   // would read as dirty (or clean) against the wrong reference text.
   if (draft.ddlContent) {
     rawDdlContent.value = draft.rawDdlContent ?? draft.ddlContent;
-    ddlStorageExcluded.value = draft.excludeDdlStorage ?? false;
+    ddlStorageIncluded.value = draft.includeDdlStorage ?? !(draft.excludeDdlStorage ?? false);
+    ddlCompacted.value = draft.compactDdlSql ?? false;
+    ddlIndexesSeparated.value = draft.separateDdlIndexes ?? false;
     ddlFetched.value = true;
   }
   ddlDraft.value = draft.ddlDraft ?? null;
@@ -2953,6 +2996,7 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   if (indexes.value.length) loadedMetadataFacets.add("indexes");
   structureScrollPositions = cloneDraftValue(draft.scrollPositions || {});
   restoringDraft = false;
+  restoredDraftTarget = draftTargetIdentity();
   draftHydrated = !needsColumnDraftMetadataHydration();
   restoreStructureScrollPosition();
 }
@@ -2961,39 +3005,89 @@ function needsColumnDraftMetadataHydration() {
   return !isCreateMode.value && columns.value.some((column) => !column.original && !column.id.startsWith("new:") && !!column.name.trim());
 }
 
-async function hydrateRestoredDraftFromDatabase() {
-  if (!needsColumnDraftMetadataHydration() || hydratingRestoredDraft) return;
-  const connectionId = props.connectionId;
-  const database = props.database;
-  const catalog = props.catalog;
-  const schema = metadataSchema.value;
-  const tableName = props.tableName;
-  if (!connectionId || !database || !tableName) return;
-
-  hydratingRestoredDraft = true;
-  let shouldRefreshPreview = false;
+async function hydrateRestoredDraftFromDatabase(force = false): Promise<boolean> {
+  if (!needsColumnDraftMetadataHydration()) {
+    if (draftHydrationError.value || hydratingRestoredDraft.value) {
+      invalidateDraftHydration();
+      draftHydrationError.value = "";
+      markDraftHydratedAndSync();
+      scheduleSqlPreviewRefresh();
+    }
+    return true;
+  }
+  if (hydratingRestoredDraft.value && !force) return false;
+  const request = ddlRequest();
+  if (!request.connectionId || !request.database || !request.tableName) return false;
+  const identity = draftTargetIdentity();
+  const dbType = databaseType.value;
+  const requestId = ++draftHydrationRequestId;
+  const config = store.getConfig(request.connectionId);
+  const fingerprint = config ? connectionConfigFingerprint(config) : "";
+  let revision: number | undefined;
+  const current = () =>
+    !primaryKeyUnmounted &&
+    requestId === draftHydrationRequestId &&
+    identity === draftTargetIdentity() &&
+    (revision === undefined || store.connectionStateRevision(request.connectionId) === revision) &&
+    (store.getConfig(request.connectionId) ? connectionConfigFingerprint(store.getConfig(request.connectionId)!) : "") === fingerprint;
+  hydratingRestoredDraft.value = true;
+  draftHydrationError.value = "";
+  clearSqlPreviewState();
+  scheduleSqlPreviewRefresh();
+  let completed = false;
   try {
-    await store.ensureConnected(connectionId);
-    const request = ddlRequest();
-    let { value: nextColumns } = await loadObjectMetadataFacet(request, "columns", () => getStructureColumns(request));
-    if (databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
+    await store.ensureConnected(request.connectionId);
+    if (!current()) return false;
+    revision = store.connectionStateRevision(request.connectionId);
+    let { value: nextColumns } = await loadObjectMetadataFacet(request, "columns", () => getStructureColumns(request), { force });
+    if (!current()) return false;
+    let formattedDdl: string | undefined;
+    if (dbType === "manticoresearch" && tableMetadataCapabilities.value.ddl) {
       try {
-        const { ddl } = await loadObjectDdl({ connectionId, database, schema, tableName, catalog, queryTimeoutSecs: store.getConfig(connectionId)?.query_timeout_secs });
-        rawDdlContent.value = await formatStructureDdl(ddl);
-        ddlFetched.value = true;
+        const { ddl } = await loadObjectDdl(request);
+        formattedDdl = await formatStructureDdl(ddl);
         nextColumns = applyManticoreDdlColumnExtras(nextColumns, ddl);
       } catch {
         /* ignore — Manticore column properties can still come from SHOW COLUMNS when available */
       }
     }
-    columns.value = rehydrateColumnDraftsFromMetadata(columns.value, nextColumns, databaseType.value);
+    if (!current()) return false;
+    const candidate = rehydrateColumnDraftsFromMetadata(columns.value, nextColumns, dbType);
+    if (candidate.some((column) => !column.original && !column.id.startsWith("new:") && !!column.name.trim())) throw new Error(t("oceanbasePrimaryKey.incompleteMetadata"));
+    columns.value = candidate;
+    if (formattedDdl !== undefined) {
+      rawDdlContent.value = formattedDdl;
+      ddlFetched.value = true;
+    }
     markDraftHydratedAndSync();
-    shouldRefreshPreview = true;
+    completed = true;
+    return true;
   } catch (e: any) {
-    console.warn("[DBX][structure-editor:draft-hydration-failed]", e);
+    if (current()) draftHydrationError.value = `${t("oceanbasePrimaryKey.incompleteMetadata")} ${e?.message || String(e)}`;
+    return false;
   } finally {
-    hydratingRestoredDraft = false;
-    if (shouldRefreshPreview) scheduleSqlPreviewRefresh();
+    if (requestId === draftHydrationRequestId) {
+      hydratingRestoredDraft.value = false;
+      clearSqlPreviewState();
+      if (completed || ddlDirty.value) scheduleSqlPreviewRefresh();
+    }
+  }
+}
+
+async function initializeRestoredDraftMetadata(identity: string, revalidateRestoredColumns = false) {
+  const current = () => !primaryKeyUnmounted && identity === draftTargetIdentity();
+  if (!current()) return;
+  applyInitialStructureTarget();
+  void loadMysqlAutoIncrementCounter(true);
+  if (oracleIndexRefreshError.value) {
+    await retryOracleIndexRefresh();
+  } else if ((props.exactIdentity || oracleIndexRefreshGuard.value) && !isCreateMode.value) {
+    await loadStructure(true, { columns: false, indexes: true, constraints: false, foreignKeys: false, triggers: false, partitions: false, tableComment: false }, true, { blockSecondaryMetadata: true, preserveDraft: true, forceMetadata: true });
+  }
+  if (!current()) return;
+  await loadActiveTableStructureMetadataIfNeeded();
+  if (current() && revalidateRestoredColumns) {
+    void revalidateCachedStructureMetadata(structureLoadRequestId, { columns: true, tableComment: false }, undefined);
   }
 }
 
@@ -3167,7 +3261,11 @@ function scheduleSqlPreviewRefresh() {
   // none of the column-draft/metadata gates below apply to it — waiting on them
   // would leave the preview pending with nothing left to trigger it.
   if (!ddlDirty.value) {
-    if (hydratingRestoredDraft || needsColumnDraftMetadataHydration()) return;
+    if (hydratingRestoredDraft.value || needsColumnDraftMetadataHydration() || draftHydrationError.value) {
+      clearSqlPreviewState();
+      sqlPreviewPending.value = hydratingRestoredDraft.value;
+      return;
+    }
     if (!isCreateMode.value && secondaryMetadataLoading.value) {
       deferredSqlPreviewRefresh = true;
       return;
@@ -3278,6 +3376,11 @@ async function refreshSqlPreview() {
     sqliteSchemaRevision.value = undefined;
     sqlPreviewLoading.value = false;
     sqlPreviewPending.value = false;
+    return;
+  }
+  if (hydratingRestoredDraft.value || needsColumnDraftMetadataHydration() || draftHydrationError.value) {
+    clearSqlPreviewState();
+    sqlPreviewPending.value = hydratingRestoredDraft.value;
     return;
   }
   if (!isCreateMode.value && databaseType.value === "starrocks") {
@@ -3543,6 +3646,7 @@ const canApply = computed(
     !mysqlTableEngineLoading.value &&
     !sqlPreviewLoading.value &&
     !sqlPreviewPending.value &&
+    (ddlDirty.value || (!hydratingRestoredDraft.value && !needsColumnDraftMetadataHydration() && !draftHydrationError.value)) &&
     pendingStatements.value.length > 0 &&
     warnings.value.length === 0 &&
     !concurrentAvailabilityInvalidated.value &&
@@ -3558,6 +3662,9 @@ function clearDraft() {
 }
 
 function resetState() {
+  invalidateDraftHydration();
+  restoredDraftTarget = "";
+  draftHydrationError.value = "";
   invalidateOracleIndexReady();
   loading.value = false;
   saving.value = false;
@@ -3658,6 +3765,12 @@ function resetState() {
 async function reloadStructureFromDatabase() {
   if (isCreateMode.value) return;
   if (oracleIndexRefreshError.value) return retryOracleIndexRefresh();
+  if (needsColumnDraftMetadataHydration() || draftHydrationError.value) {
+    const identity = draftTargetIdentity();
+    if (await hydrateRestoredDraftFromDatabase(true)) await initializeRestoredDraftMetadata(identity);
+    return;
+  }
+  invalidateDraftHydration();
   draftHydrated = false;
   if (activeTab.value !== "triggers") {
     triggers.value = [];
@@ -6127,6 +6240,7 @@ async function copyPreviewSql() {
 }
 
 async function copyDdlContent() {
+  if (ddlLoading.value || ddlLoadError.value) return;
   // Copy what the editor actually shows, so an edited script is not silently
   // replaced by the database's original DDL.
   const ddl = ddlDraft.value ?? ddlContent.value;
@@ -7271,19 +7385,9 @@ onMounted(() => {
     // MCP DDL, restoring its loaded-facet flags would otherwise bypass the
     // invalidated backend cache entirely. Legacy/dirty drafts remain intact.
     const revalidateRestoredColumns = props.draft.dirty === false && !isCreateMode.value && loadedMetadataFacets.has("columns") && !(databaseType.value === "manticoresearch" && tableMetadataCapabilities.value.ddl);
-    void hydrateRestoredDraftFromDatabase().then(async () => {
-      applyInitialStructureTarget();
-      void loadMysqlAutoIncrementCounter(true);
-      if (oracleIndexRefreshError.value) {
-        await retryOracleIndexRefresh();
-      } else if ((props.exactIdentity || oracleIndexRefreshGuard.value) && !isCreateMode.value) {
-        await loadStructure(true, { columns: false, indexes: true, constraints: false, foreignKeys: false, triggers: false, partitions: false, tableComment: false }, true, { blockSecondaryMetadata: true, preserveDraft: true, forceMetadata: true });
-      }
-      await loadActiveTableStructureMetadataIfNeeded();
-      if (revalidateRestoredColumns) {
-        // The existing revalidation checks again for edits made while loading.
-        void revalidateCachedStructureMetadata(structureLoadRequestId, { columns: true, tableComment: false }, undefined);
-      }
+    const restoredIdentity = draftTargetIdentity();
+    void hydrateRestoredDraftFromDatabase().then((completed) => {
+      if (completed) return initializeRestoredDraftMetadata(restoredIdentity, revalidateRestoredColumns);
     });
   } else if (isCreateMode.value) {
     markDraftHydratedAndSync();
@@ -7305,12 +7409,11 @@ onActivated(() => {
     void loadMysqlTableEngine(props.draft?.mysqlTableEngine !== undefined);
   }
   if (props.draft?.initialized && !draftHydrated) {
-    restoreDraft(props.draft);
+    if (restoredDraftTarget !== draftTargetIdentity()) restoreDraft(props.draft);
     applyInitialStructureTarget();
-    void hydrateRestoredDraftFromDatabase().then(() => {
-      applyInitialStructureTarget();
-      void loadMysqlAutoIncrementCounter(true);
-      void loadActiveTableStructureMetadataIfNeeded();
+    const restoredIdentity = draftTargetIdentity();
+    void hydrateRestoredDraftFromDatabase().then((completed) => {
+      if (completed) return initializeRestoredDraftMetadata(restoredIdentity);
     });
   }
   restoreStructureScrollPosition();
@@ -7331,6 +7434,7 @@ onDeactivated(() => {
   destroyDdlEditor();
 });
 onBeforeUnmount(() => {
+  invalidateDraftHydration();
   stopStructureToolbarObserver();
   ++copySourceScopeRequestId;
   resetCopySourceTables();
@@ -7491,6 +7595,12 @@ watch([columns, indexes, indexesLoading, loading, oracleIndexReady], () => {
 
 watch([() => props.connectionId, () => props.database, databaseType], () => {
   void loadDynamicDataTypeOptions();
+});
+
+watch(draftTargetIdentity, () => {
+  invalidateDraftHydration();
+  restoredDraftTarget = "";
+  draftHydrationError.value = "";
 });
 
 watch([() => props.connectionId, () => props.database, () => props.schema, () => props.catalog, () => props.tableName, databaseType, activeTab], () => {
@@ -9320,19 +9430,20 @@ watch(
               {{ t("common.loading") }}
             </div>
             <template v-else>
-              <div v-if="ddlContent && !ddlSearchOpen" class="absolute right-3 top-3 z-10 flex items-center gap-1.5">
-                <DdlStorageToggle :database-type="databaseType" :disabled="ddlDirty" />
+              <div v-if="(ddlContent || ddlLoadError) && !ddlSearchOpen" class="absolute right-3 top-3 z-10 flex items-center gap-1.5">
+                <DdlStorageToggle :database-type="databaseType" :disabled="ddlDirty" :preferences="{ includeDdlStorage: ddlStorageIncluded, compactDdlSql: ddlCompacted, separateDdlIndexes: ddlIndexesSeparated }" />
                 <Button v-if="ddlDirty" variant="outline" size="sm" class="h-7 gap-1 px-2" :title="t('structureEditor.resetDdl')" @click="resetDdlDraft">
                   <RotateCcw class="h-3.5 w-3.5" />
                   {{ t("structureEditor.resetDdl") }}
                 </Button>
-                <Button variant="outline" size="sm" class="h-7 gap-1 px-2" :title="t('grid.copyDdl')" @click="copyDdlContent">
+                <Button variant="outline" size="sm" class="h-7 gap-1 px-2" :disabled="!!ddlLoadError" :title="t('grid.copyDdl')" @click="copyDdlContent">
                   <Copy class="h-3.5 w-3.5" />
                   {{ t("grid.copyDdl") }}
                 </Button>
               </div>
-              <div ref="ddlEditorContainer" class="structure-ddl-editor h-full min-h-full min-w-0 w-full"></div>
-              <EditorSearchPanel v-if="ddlEditorView" ref="ddlSearchPanelRef" :view="ddlEditorView" @open="ddlSearchOpen = true" @close="ddlSearchOpen = false" />
+              <p v-if="ddlLoadError" role="alert" class="pt-10 text-sm text-destructive">{{ ddlLoadError }}</p>
+              <div v-else ref="ddlEditorContainer" class="structure-ddl-editor h-full min-h-full min-w-0 w-full"></div>
+              <EditorSearchPanel v-if="ddlEditorView && !ddlLoadError" ref="ddlSearchPanelRef" :view="ddlEditorView" @open="ddlSearchOpen = true" @close="ddlSearchOpen = false" />
             </template>
           </TabsContent>
         </Tabs>
@@ -9407,8 +9518,8 @@ watch(
       </div>
       <Button data-retry-oracle-index-refresh variant="outline" size="sm" :disabled="saving || postSaveRefreshing" @click="retryOracleIndexRefresh">{{ t("common.retry") }}</Button>
     </div>
-    <div v-if="errorMessage" class="shrink-0 rounded-md border border-destructive/30 bg-destructive/10 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)] text-destructive">
-      {{ errorMessage }}
+    <div v-if="errorMessage || draftHydrationError" class="shrink-0 rounded-md border border-destructive/30 bg-destructive/10 px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)] text-destructive">
+      {{ errorMessage || draftHydrationError }}
     </div>
 
     <div class="flex shrink-0 items-center justify-end gap-2">

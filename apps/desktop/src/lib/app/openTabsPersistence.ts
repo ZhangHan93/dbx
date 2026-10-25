@@ -284,7 +284,9 @@ function restoreOpenTabsArray(parsed: unknown, rawActiveTabId: string | null, op
       if (options.queryOnly && mode !== "query") return false;
       if (options.filter === "pinned" && !tab.pinned && !unfinishedTypeChange) return false;
       if (options.filter === "recovery" && !unfinishedTypeChange) return false;
-      if (mode !== "query" && validConnectionIds && !validConnectionIds.has(tab.connectionId)) return false;
+      // 删除连接时按策略保留下来的非 SQL 页签会带 detachedConnectionName，等新建同名连接后
+      // 重绑；不能在恢复阶段因为连接「暂时不存在」就把它们丢掉，否则 keep-all-tabs 形同虚设。
+      if (mode !== "query" && !tab.detachedConnectionName && validConnectionIds && !validConnectionIds.has(tab.connectionId)) return false;
       return true;
     });
     const tabs: QueryTab[] = filtered.map((tab) => {

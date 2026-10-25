@@ -21,6 +21,7 @@ mod starrocks_layout;
 mod starrocks_partition;
 mod transwarp;
 mod triggers;
+pub(crate) use triggers::oracle_snapshot_trigger_source;
 mod types;
 mod util;
 mod validation;

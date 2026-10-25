@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { OBJECT_BROWSER_COMPACT_WIDTHS, normalizeObjectBrowserCompactWidth, type ObjectBrowserCompactWidth } from "@/lib/table/objectBrowserCompactWidth";
-import { applyDdlStoragePreference } from "@/lib/sql/ddlStorage";
+import { applyDdlTextPreferences } from "@/lib/sql/ddlPreferences";
 import DatabaseActionsMenu from "@/components/objects/DatabaseActionsMenu.vue";
 import FirebirdObjectManager from "@/components/objects/FirebirdObjectManager.vue";
 import { useDatabaseBrowserMutation } from "@/lib/database/databaseBrowserActions";
@@ -122,7 +122,7 @@ import OracleTableRenamePreview from "@/components/objects/OracleTableRenamePrev
 import OracleRoutineRenamePreview from "@/components/objects/OracleRoutineRenamePreview.vue";
 import OraclePackageSaveAsDialog from "@/components/objects/OraclePackageSaveAsDialog.vue";
 import OracleInvalidObjectsDialog from "@/components/objects/OracleInvalidObjectsDialog.vue";
-import { executeOraclePackageSaveAs, OraclePackageSaveAsFailure, prepareOraclePackageSaveAs, type OraclePackageSaveAsPlan } from "@/lib/table/oraclePackageSaveAs";
+import { prepareOraclePackageSaveAsExecution, OraclePackageSaveAsFailure, prepareOraclePackageSaveAs, type OraclePackageSaveAsPlan } from "@/lib/table/oraclePackageSaveAs";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { autoRevealExportedPathIfConfigured, promptExportSavePath } from "@/lib/export/exportPath";
 import { generateDatabaseExportId } from "@/lib/export/databaseExport";
@@ -321,9 +321,10 @@ const tableColumns = ref<ColumnInfo[]>([]);
 const tableColumnsLoading = ref(false);
 const tableColumnsLoaded = ref(false);
 const rawTableDdlContent = ref("");
-const tableDdlContent = computed(() => applyDdlStoragePreference(rawTableDdlContent.value, effectiveDatabaseType.value, settingsStore.editorSettings.excludeDdlStorage));
+const tableDdlContent = computed(() => applyDdlTextPreferences(rawTableDdlContent.value, effectiveDatabaseType.value, settingsStore.editorSettings));
 const tableDdlLoading = ref(false);
 const tableDdlLoaded = ref(false);
+let tableDdlRequestId = 0;
 const tableIndexes = ref<IndexInfo[]>([]);
 const tableIndexesLoading = ref(false);
 const tableIndexesLoaded = ref(false);
@@ -1581,25 +1582,40 @@ async function fetchTableDdl(force = settingsStore.editorSettings.refreshDdlOnOp
   const row = sidePanelRow.value;
   if (!row || (tableDdlLoaded.value && !force)) return;
   const epoch = sidePanelGuard.capture();
+  const requestId = ++tableDdlRequestId;
+  const request = tableMetadataRequest(row);
+  if (effectiveDatabaseType.value === "oracle" || effectiveDatabaseType.value === "oceanbase-oracle") request.separateIndexes = settingsStore.editorSettings.separateDdlIndexes;
   tableDdlLoading.value = true;
   let loadedSuccessfully = false;
   try {
-    const { ddl } = await sidePanelGuard.wait(epoch, loadObjectDdl(tableMetadataRequest(row), { force }), metadataLoadBudgetMs(props.connection.query_timeout_secs));
-    if (sidePanelGuard.isStale(epoch)) return;
+    const { ddl } = await sidePanelGuard.wait(epoch, loadObjectDdl(request, { force }), metadataLoadBudgetMs(props.connection.query_timeout_secs));
+    if (sidePanelGuard.isStale(epoch) || requestId !== tableDdlRequestId) return;
     const formatDialect = sqlFormatDialectForDbType(effectiveDatabaseType.value);
     const unqualified = applyDdlDatabaseQualifier(ddl, formatDialect, effectiveDatabaseType.value, settingsStore.editorSettings.generateSqlIncludeDatabaseName, props.database, props.catalog);
     rawTableDdlContent.value = settingsStore.editorSettings.generateSqlQuoteIdentifiers ? unqualified : omitDdlIdentifierQuotes(unqualified, formatDialect);
     loadedSuccessfully = true;
   } catch (e: any) {
-    if (sidePanelGuard.isStale(epoch)) return;
+    if (sidePanelGuard.isStale(epoch) || requestId !== tableDdlRequestId) return;
     rawTableDdlContent.value = `-- Error: ${e?.message || e}`;
   } finally {
-    if (sidePanelGuard.isFresh(epoch)) {
+    if (sidePanelGuard.isFresh(epoch) && requestId === tableDdlRequestId) {
       tableDdlLoaded.value = loadedSuccessfully;
       tableDdlLoading.value = false;
     }
   }
 }
+
+watch(
+  () => settingsStore.editorSettings.separateDdlIndexes,
+  () => {
+    if (effectiveDatabaseType.value !== "oracle" && effectiveDatabaseType.value !== "oceanbase-oracle") return;
+    tableDdlRequestId++;
+    tableDdlLoaded.value = false;
+    tableDdlLoading.value = false;
+    rawTableDdlContent.value = "";
+    if (sidePanelMode.value === "table-info" && sidePanelRow.value && tableInfoTab.value === "ddl") void fetchTableDdl(false);
+  },
+);
 
 async function fetchTableColumns(force = false) {
   const row = sidePanelRow.value;
@@ -1845,6 +1861,7 @@ async function refreshActiveTableInfo() {
 }
 
 function copyTableDdl() {
+  if (tableDdlLoading.value || !tableDdlLoaded.value) return;
   void copyToClipboard(tableDdlContent.value);
   toast(t("grid.copyDdl"), 2000);
 }
@@ -2366,18 +2383,12 @@ async function confirmPackageSaveAs() {
       packageSaveAsName.value.trim() === plan.target.newName
     );
   };
+  let prepared: Awaited<ReturnType<typeof prepareOraclePackageSaveAsExecution>> | undefined;
   try {
+    prepared = await prepareOraclePackageSaveAsExecution(plan, isCurrentPlan);
+    const execute = prepared;
     const executed = await executeObjectBrowserSqlWithProductionGuard(plan.statements.join("\n\n"), async () => {
-      await executeOraclePackageSaveAs(
-        plan,
-        () =>
-          packageSaveAsPlan.value === plan &&
-          packageSaveAsOpen.value &&
-          packageSaveAsTarget.value?.name === plan.target.oldName &&
-          props.connection.id === plan.target.connectionId &&
-          props.database === plan.target.database &&
-          (row.schema || selectedSchema.value || props.database) === plan.target.schema,
-      );
+      await execute();
       return true;
     });
     if (!executed) return;
@@ -2400,6 +2411,7 @@ async function confirmPackageSaveAs() {
       }
     }
   } finally {
+    await prepared?.dispose();
     packageSaveAsExecuting.value = false;
   }
 }
@@ -3415,8 +3427,17 @@ async function confirmBatchEmptyTables() {
 async function exportStructure(row: ObjectBrowserRow) {
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const ddl = await api.getTableDdl(props.connection.id, props.database, schema, row.name, tableDdlObjectType(row.type), props.catalog, true);
-    await saveFileContent(buildSingleDdlExportFileContent(applyDdlStoragePreference(ddl, effectiveDatabaseType.value, settingsStore.editorSettings.excludeDdlStorage)), `${row.name}.sql`, "SQL", "sql");
+    const ddl = await api.getTableDdl(
+      props.connection.id,
+      props.database,
+      schema,
+      row.name,
+      tableDdlObjectType(row.type),
+      props.catalog,
+      true,
+      ...((effectiveDatabaseType.value === "oracle" || effectiveDatabaseType.value === "oceanbase-oracle") && row.type === "TABLE" && settingsStore.editorSettings.separateDdlIndexes ? ([undefined, true] as const) : []),
+    );
+    await saveFileContent(buildSingleDdlExportFileContent(applyDdlTextPreferences(ddl, effectiveDatabaseType.value, settingsStore.editorSettings)), `${row.name}.sql`, "SQL", "sql");
   } catch (e: any) {
     console.error("Export structure failed:", e);
   }
@@ -5723,7 +5744,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
             <TableProperties class="w-3.5 h-3.5 text-muted-foreground" />
             <span class="text-xs font-medium flex-1 min-w-0 truncate">{{ sidePanelRow?.name }}</span>
             <div v-if="tableInfoTab === 'ddl' && tableMetadataCapabilities.ddl" class="table-info-actions flex min-w-0 shrink-0 items-center gap-1">
-              <Button variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :title="t('grid.copyDdl')" :aria-label="t('grid.copyDdl')" @click="copyTableDdl">
+              <Button variant="ghost" size="sm" class="table-info-action-button h-6 px-2 text-xs" :disabled="tableDdlLoading || !tableDdlLoaded" :title="t('grid.copyDdl')" :aria-label="t('grid.copyDdl')" @click="copyTableDdl">
                 <Copy class="w-3 h-3" />
                 <span class="table-info-action-label">{{ t("grid.copyDdl") }}</span>
               </Button>
@@ -5765,7 +5786,7 @@ function getObjectBrowserMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
               <RefreshCw class="h-3.5 w-3.5" :class="{ 'animate-spin': activeTableInfoLoading }" />
             </Button>
           </div>
-          <div v-if="tableInfoTab === 'ddl' && effectiveDatabaseType === 'oceanbase-oracle'" class="border-b px-3 py-2">
+          <div v-if="tableInfoTab === 'ddl' && (effectiveDatabaseType === 'oracle' || effectiveDatabaseType === 'oceanbase-oracle')" class="border-b px-3 py-2">
             <DdlStorageToggle :database-type="effectiveDatabaseType" :disabled="tableDdlLoading" />
           </div>
           <p v-if="propertyFocus && (tableInfoTab === 'indexes' || tableInfoTab === 'relations')" class="break-all border-b px-3 py-2 font-mono text-sm text-muted-foreground">{{ propertyFocus.owner }}.{{ propertyFocus.name }}</p>

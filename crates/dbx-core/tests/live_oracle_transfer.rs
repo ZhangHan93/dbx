@@ -107,6 +107,7 @@ async fn live_oracle_transfer_creates_table_with_index_comment_and_trigger() {
         create_table: true,
         drop_target_before_create: false,
         drop_target_confirmed: false,
+        oracle_packages: None,
         content: TransferContent::StructureAndData,
         objects: Some(vec![
             TransferObjectSelection { object_type: TransferObjectKind::Sequence, names: vec![sequence.clone()] },
@@ -234,6 +235,7 @@ async fn live_oracle_transfer_places_tables_in_target_default_tablespace() {
         create_table: true,
         drop_target_before_create: false,
         drop_target_confirmed: false,
+        oracle_packages: None,
         content: TransferContent::StructureAndData,
         objects: None,
         mode: TransferMode::Append,

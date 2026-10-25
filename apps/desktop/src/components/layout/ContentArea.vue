@@ -165,6 +165,7 @@ import { useConnectionStore } from "@/stores/connectionStore";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import type { ContentAreaSurfaceEmits, ContentAreaSurfaceProps } from "@/components/layout/querySurfaces";
 import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGridRowNumberMode, type DataGridSearchMode, type ResultRunDisplayMode } from "@/stores/settingsStore";
+import { applySqlKeywordCase, loadSqlKeywordSpans } from "@/lib/sql/sqlKeywordCase";
 import { useToast } from "@/composables/useToast";
 import { isTauriRuntime } from "@/lib/backend/tauriRuntime";
 import { canCancelQueryExecution, isActiveResultLoading, queryExecutionLabelKey, shouldShowCancelAction } from "@/lib/sql/queryExecutionState";
@@ -210,10 +211,10 @@ import { useTabScroll } from "@/composables/useTabScroll";
 import { useToolbarOverflow } from "@/composables/useToolbarOverflow";
 import { formatElapsedSeconds } from "@/lib/common/elapsedTime";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { loadObjectDdl } from "@/lib/metadata/objectDdlCache";
+import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
+import { applyDdlTextPreferences } from "@/lib/sql/ddlPreferences";
 import { analyzeEditableQuery } from "@/lib/sql/sqlAnalysis";
 import { loadQueryResultTransferSourceDdl } from "@/components/transfer/queryResultTransferSource";
-import { formatDdlForDisplay } from "@/lib/sql/ddlDisplay";
 import { sqlObjectNavigationTypeFromTableType } from "@/lib/sql/sqlNavigation";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
 import type { QueryMessage, QueryResult, QueryTab, RedisResultViewMode, TableInfoTab, TabOutputView, TreeNode, VectorCollectionMeta } from "@/types/database";
@@ -328,6 +329,7 @@ const setColorizeDataGridCellTypes = (value: boolean) => settingsStore.updateEdi
 const { toast } = useToast();
 const DEFAULT_QUERY_RESULTS_PANE_SIZE = 68;
 const ddlRefreshInProgress = ref(false);
+let ddlRefreshGeneration = 0;
 
 onMounted(() => {
   // The watcher below warms the grid for query/data tabs. Keep source-only
@@ -482,11 +484,20 @@ function viewTableSql(preview: DataGridSqlPreview) {
   };
 }
 
-function openTableSqlInNewQuery(sql: string) {
+async function openTableSqlInNewQuery(sql: string) {
   const snapshot = tableSqlPreview.value;
   if (!snapshot?.connectionId || !sql.trim()) return;
   tableSqlPreview.value = null;
-  queryStore.createTab(snapshot.connectionId, snapshot.database, undefined, "query", snapshot.schema, sql, snapshot.catalog, { forceNew: true, schemaQualifiesSql: true });
+  // The grid's preview SQL is generated uppercase; a query tab opened from it
+  // should still honor the formatter's keyword case setting (issue #13235).
+  const keywordCase = settingsStore.editorSettings.sqlFormatter.keywordCase;
+  let sqlForTab = sql;
+  if (keywordCase === "lower" || keywordCase === "upper") {
+    const dialect = sqlFormatDialectForDbType(activeEffectiveDatabaseType.value);
+    const spans = await loadSqlKeywordSpans(sql, dialect);
+    if (spans) sqlForTab = applySqlKeywordCase(sql, { from: 0, to: sql.length }, keywordCase, spans);
+  }
+  queryStore.createTab(snapshot.connectionId, snapshot.database, undefined, "query", snapshot.schema, sqlForTab, snapshot.catalog, { forceNew: true, schemaQualifiesSql: true });
 }
 
 watch(
@@ -1436,52 +1447,51 @@ function onHandleStructureViewData() {
  */
 async function loadActiveDdlViewer(force: boolean) {
   const tab = props.activeTab;
-  const ddlViewer = tab.ddlViewer;
-  if (!ddlViewer || ddlRefreshInProgress.value) return;
+  if (!tab.ddlViewer) return;
+  const generation = ++ddlRefreshGeneration;
   ddlRefreshInProgress.value = true;
   const pendingLoad = !!tab.ddlLoad;
-  if (pendingLoad) tab.ddlLoad = { startedAt: Date.now() };
+  tab.ddlLoad = { startedAt: Date.now() };
   try {
-    const { ddl } = await loadObjectDdl(
-      {
-        connectionId: tab.connectionId,
-        database: tab.database,
-        schema: ddlViewer.schema || tab.database,
-        queryTimeoutSecs: (connectionStore.getConfig(tab.connectionId) ?? props.activeConnection)?.query_timeout_secs,
-        tableName: ddlViewer.tableName,
-        objectType: ddlViewer.objectType,
-        catalog: tab.catalog,
-      },
-      { force },
-    );
-    const dialect = ddlViewer.formatDialect ?? activeSqlFormatDialect.value;
-    const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(tab.connectionId) ?? props.activeConnection);
-    const displayed = await formatDdlForDisplay(
-      ddl,
-      {
-        dialect,
-        databaseType,
-        database: tab.database,
-        catalog: tab.catalog,
-        includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
-        quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
-        excludeDdlStorage: settingsStore.editorSettings.excludeDdlStorage,
-      },
-      settingsStore.editorSettings.sqlFormatter,
-    );
-    queryStore.updateSql(tab.id, displayed);
-    tab.originalSql = displayed;
-    if (pendingLoad) tab.ddlLoad = undefined;
-  } catch (error: any) {
-    if (pendingLoad) {
-      tab.ddlLoad = { startedAt: Date.now(), error: error?.message || String(error) };
-    } else {
-      toast(t("contextMenu.ddlRefreshFailed", { message: error?.message || String(error) }), 5000);
+    await queryStore.loadDdlViewerTab(tab.id, force);
+    if (generation === ddlRefreshGeneration && !pendingLoad && tab.ddlLoad?.error) {
+      toast(t("contextMenu.ddlRefreshFailed", { message: tab.ddlLoad.error }), 5000);
+      tab.ddlLoad = undefined;
     }
   } finally {
-    ddlRefreshInProgress.value = false;
+    if (generation === ddlRefreshGeneration) ddlRefreshInProgress.value = false;
   }
 }
+
+watch(
+  [() => props.activeTab.id, () => settingsStore.editorSettings.includeDdlStorage, () => settingsStore.editorSettings.compactDdlSql, () => settingsStore.editorSettings.separateDdlIndexes],
+  (current, previous) => {
+    if (previous && current[0] !== previous[0]) {
+      ddlRefreshGeneration++;
+      ddlRefreshInProgress.value = false;
+    }
+    const tab = props.activeTab;
+    const viewer = tab.ddlViewer;
+    const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(tab.connectionId) ?? props.activeConnection);
+    if (!viewer || (databaseType !== "oracle" && databaseType !== "oceanbase-oracle")) return;
+    const indexChanged = previous && current[0] === previous[0] && current[3] !== previous[3];
+    if (tab.ddlLoad && !tab.ddlLoad.error && !indexChanged) return;
+    if (viewer.displaySource !== undefined && viewer.separateIndexes === settingsStore.editorSettings.separateDdlIndexes && !tab.ddlLoad?.error) {
+      if (indexChanged) {
+        tab.ddlLoad = undefined;
+        ddlRefreshGeneration++;
+        ddlRefreshInProgress.value = false;
+      }
+      const displayed = applyDdlTextPreferences(viewer.displaySource, databaseType, settingsStore.editorSettings);
+      queryStore.updateSql(tab.id, displayed);
+      tab.originalSql = displayed;
+      return;
+    }
+    tab.ddlLoad = { startedAt: Date.now() };
+    void loadActiveDdlViewer(false);
+  },
+  { immediate: true },
+);
 
 function refreshDdlViewer() {
   void loadActiveDdlViewer(true);
@@ -1789,8 +1799,9 @@ function dispatchBeforeResultTabSwitch() {
 }
 
 /**
- * 点击结果标签：切换显示的同时固定该结果（issue #9975）。
- * 未固定的结果会被下一次普通查询复用/覆盖，点击后固定即可保留下来。
+ * 点击结果标签：切换显示的同时切换固定状态（issue #9975、#13306）。
+ * 未固定的结果会被下一次普通查询复用/覆盖，点击后固定即可保留下来；
+ * 点击已固定的结果则直接取消固定，无需再打开右键菜单。
  */
 async function selectResultRunFromTab(runId: string) {
   if (!(await selectResultRun(runId))) return;
@@ -2100,7 +2111,8 @@ defineExpose({
       <Splitpanes horizontal class="query-output-splitpanes flex-1 min-h-0 overflow-hidden" @resize="onResultsSplitResize" @resized="onResultsResized">
         <Pane v-if="!resultOnly" class="min-h-0" :size="editorPaneSize" :min-size="resultsPaneOpen ? 15 : 100">
           <div class="h-full flex flex-col relative">
-            <div v-if="activeTab.ddlViewer" class="flex h-10 shrink-0 items-center gap-2 border-b px-3">
+            <div v-if="activeTab.ddlViewer" class="flex min-h-10 shrink-0 flex-wrap items-center gap-2 border-b px-3 py-1">
+              <DdlStorageToggle :database-type="activeEffectiveDatabaseType" class="mr-auto" />
               <Button variant="outline" size="sm" :disabled="ddlRefreshInProgress" @click="refreshDdlViewer">
                 <RefreshCcw class="h-4 w-4" :class="ddlRefreshInProgress ? 'animate-spin' : ''" />
                 {{ t("structureEditor.refresh") }}
@@ -2864,6 +2876,7 @@ defineExpose({
                 :cache-key="activeResultGridCacheKey"
                 :column-width-cache-key="activeResultGridColumnWidthCacheKey"
                 :pending-state-key="activeResultGridInstanceKey"
+                :tab-id="activeTab.id"
                 :view-generation="activeTab.resultViewGeneration"
                 class="flex-1 min-h-0"
                 :result="activeGridResult!"
@@ -3425,6 +3438,7 @@ defineExpose({
           :busy-started-at="activeTab.isExecuting ? activeTab.queryExecutionStartedAt : undefined"
           :editable="!activeTab.tableMetaPending && (isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType) || !!influxDbV1DeleteSaveHandler)"
           :custom-save-handler="influxDbV1DeleteSaveHandler"
+          :tab-id="activeTab.id"
           context="table-data"
           @view-sql="viewTableSql"
           :initial-where-input="activeTab.whereInput"

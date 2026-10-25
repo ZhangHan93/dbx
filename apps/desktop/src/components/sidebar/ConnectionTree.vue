@@ -137,6 +137,7 @@ const sidebarContextMenuItems = ref<ContextMenuItem[]>([]);
 const { presentMenu, SidebarMenuPreferencesDialog, sidebarMenuPreferencesOpen, sidebarMenuPreferences } = useSidebarMenuPresentation();
 const emit = defineEmits<{
   "open-settings": [initialTab: string];
+  "open-connection-settings": [connectionId: string];
   "add-to-ai": [nodes: TreeNode | TreeNode[]];
   "open-dependency-object": [context: ObjectDependencyTarget, target: SqlObjectNavigationTarget];
 }>();
@@ -2794,6 +2795,7 @@ defineExpose({
       @open-object-source="openSidebarObjectSource"
       @open-procedure="openSidebarProcedure"
       @open-settings="openSidebarSettings"
+      @open-connection-settings="(connectionId) => emit('open-connection-settings', connectionId)"
       @open-data="openSidebarData"
       @open-visible-databases="openSidebarVisibleDatabases"
       @open-visible-schemas="openSidebarVisibleSchemas"

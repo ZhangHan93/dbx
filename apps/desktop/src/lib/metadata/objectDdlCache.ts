@@ -32,6 +32,7 @@ export interface ObjectDdlRequest {
   objectType?: ObjectSourceKind;
   catalog?: string;
   exactIdentity?: boolean;
+  separateIndexes?: boolean;
 }
 
 export interface ObjectDdlLoadResult {
@@ -66,7 +67,7 @@ function cacheSegment(value: string | undefined): string {
 }
 
 export function objectDdlCacheKey(request: ObjectDdlRequest): string {
-  return `${[OBJECT_DDL_CACHE_PREFIX, cacheSegment(request.connectionId), cacheSegment(request.database), cacheSegment(request.schema), cacheSegment(request.tableName), cacheSegment(request.catalog), cacheSegment(request.objectType ?? "TABLE"), ...(request.exactIdentity ? ["exact-v1"] : [])].join(":")}:`;
+  return `${[OBJECT_DDL_CACHE_PREFIX, cacheSegment(request.connectionId), cacheSegment(request.database), cacheSegment(request.schema), cacheSegment(request.tableName), cacheSegment(request.catalog), cacheSegment(request.objectType ?? "TABLE"), ...(request.exactIdentity ? ["exact-v1"] : []), ...(request.separateIndexes ? ["separate-indexes-v1"] : [])].join(":")}:`;
 }
 
 function invalidationPrefix(match: MetadataCacheInvalidation): string {
@@ -156,8 +157,12 @@ async function loadRemoteDdl(request: ObjectDdlRequest, cacheKey: string, force:
   signal.addEventListener("abort", cancel, { once: true });
   recordMetadataCacheRemoteMiss(cacheKey);
   const remote = request.exactIdentity
-    ? api.getTableDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog, false, true)
-    : api.getTableDisplayDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog);
+    ? request.separateIndexes
+      ? api.getTableDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog, false, true, true)
+      : api.getTableDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog, false, true)
+    : request.separateIndexes
+      ? api.getTableDisplayDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog, true)
+      : api.getTableDisplayDdl(request.connectionId, request.database, request.schema, request.tableName, request.objectType, request.catalog);
   entry.promise = waitForMetadata(
     remote.then((rawDdl) => {
       const ddl = sanitizeDdl(rawDdl);

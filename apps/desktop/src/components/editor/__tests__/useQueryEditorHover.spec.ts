@@ -42,7 +42,7 @@ function createHarness(overrides: Partial<QueryEditorProps> = {}, semanticComple
   };
   const connectionStore = store as unknown as Options["connectionStore"];
   const metadata = useQueryEditorCompletionMetadata({ props, view: shallowRef<EditorView | null>(currentView), connectionStore, sqlBehaviorDialect: () => props.dialect, maxCompletionTables: 200, remoteLatencyBudgetMs: 40, onDemandMinPrefix: 2, semanticCompletionEnabled });
-  const settings = reactive({ editorSettings: { tableHoverLookupMode: "fallback", showTableDdlHoverPreview: true, generateSqlQuoteIdentifiers: true, generateSqlIncludeDatabaseName: false, excludeDdlStorage: false, sqlFormatter: {} } });
+  const settings = reactive({ editorSettings: { tableHoverLookupMode: "fallback", showTableDdlHoverPreview: true, generateSqlQuoteIdentifiers: true, generateSqlIncludeDatabaseName: false, includeDdlStorage: true, compactDdlSql: true, separateDdlIndexes: false, sqlFormatter: {} } });
   const contextMenuOpen = ref(false);
   const createHoverDom = vi.fn((_title: string, _detail: string, _sql?: string, _rows?: string[]) => ({ dom: document.createElement("div") }));
   const hover = useQueryEditorHover({ props, contextMenuOpen, settingsStore: settings as Options["settingsStore"], connectionStore, metadata, createHoverDom, maxCompletionTables: 200, semanticCompletionEnabled });
@@ -51,6 +51,49 @@ function createHarness(overrides: Partial<QueryEditorProps> = {}, semanticComple
 }
 
 describe("QueryEditor hover resolution", () => {
+  it.each(["oracle", "oceanbase-oracle"] as const)("keeps complete independent %s indexes and applies text preferences after hover formatting", async (type) => {
+    loadDdl.mockResolvedValueOnce({ ddl: `CREATE  TABLE "users" ("id" NUMBER) ${type === "oracle" ? "PCTFREE 0" : "PCTFREE=0"};\nCREATE  INDEX "ix" ON "users"("id");` });
+    const { store, settings, resolve, createHoverDom } = createHarness({ databaseType: type, dialect: "mysql" });
+    settings.editorSettings.includeDdlStorage = false;
+    settings.editorSettings.separateDdlIndexes = true;
+    store.lookupLocalCompletionTables.mockReturnValue([{ name: "users", schema: "public" }]);
+    (await resolve())!.create();
+    expect(loadDdl).toHaveBeenCalledWith(expect.objectContaining({ separateIndexes: true, schema: "public", tableName: "users" }));
+    const result = createHoverDom.mock.calls[0][2]!;
+    expect(result).toContain('CREATE INDEX "ix"');
+    expect(result).not.toContain("PCTFREE");
+    expect(result).not.toContain("CREATE  ");
+  });
+
+  it("does not replace a failed full-index request with a simplified metadata reconstruction", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    loadDdl.mockRejectedValueOnce(new Error("index metadata unavailable"));
+    const { store, settings, resolve, createHoverDom } = createHarness({ databaseType: "oracle", dialect: "mysql" });
+    settings.editorSettings.separateDdlIndexes = true;
+    store.lookupLocalCompletionTables.mockReturnValue([{ name: "users", schema: "public" }]);
+    (await resolve())!.create();
+    expect(createHoverDom.mock.calls[0][2]).toBeUndefined();
+    expect(createHoverDom.mock.calls[0][3]).toEqual(["[DBX] Failed to load table structure — check connection"]);
+    expect(getColumns).not.toHaveBeenCalled();
+    expect(listIndexes).not.toHaveBeenCalled();
+  });
+
+  it("drops a late hover result after its DDL preferences change", async () => {
+    let finish!: (result: { ddl: string }) => void;
+    loadDdl.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const { store, settings, resolve } = createHarness({ databaseType: "oracle", dialect: "mysql" });
+    store.lookupLocalCompletionTables.mockReturnValue([{ name: "users", schema: "public" }]);
+    const pending = resolve();
+    await vi.waitFor(() => expect(loadDdl).toHaveBeenCalled());
+    settings.editorSettings.separateDdlIndexes = true;
+    finish({ ddl: "CREATE TABLE users (id NUMBER);" });
+    expect(await pending).toBeNull();
+  });
+
   it.each(["connection", "database", "menu"])("does no metadata work without an available %s context", async (missing) => {
     const harness = createHarness();
     if (missing === "connection") harness.props.connectionId = undefined;

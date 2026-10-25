@@ -387,6 +387,7 @@ pub async fn execute_query_with_max_rows(
         return Ok(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -411,6 +412,7 @@ pub async fn execute_query_with_max_rows(
         Ok(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -432,6 +434,7 @@ pub async fn execute_query_with_max_rows(
         Ok(QueryResult {
             columns: vec![],
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![],
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -615,6 +618,7 @@ fn query_result_from_turso_result(
     QueryResult {
         columns: result.columns,
         column_types: Vec::new(),
+        deferred_large_value_cells: Vec::new(),
         column_sortables: vec![],
         spatial_columns: vec![],
         spatial_values: vec![],

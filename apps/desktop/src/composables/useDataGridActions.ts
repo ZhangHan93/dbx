@@ -144,7 +144,7 @@ export function useDataGridActions(activeTab: ComputedRef<QueryTab | undefined>)
       catalog: tableMeta?.catalog,
       columns: realColumns?.map((column) => column.name),
       primaryKeys,
-      ...tableDataLargeValuePreviewOptions(effectiveDbType, realColumns ?? [], primaryKeys, previewPageSize ?? limit),
+      ...tableDataLargeValuePreviewOptions(effectiveDbType, realColumns ?? [], primaryKeys, previewPageSize ?? limit, config?.db_type === "jdbc"),
       includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
       includeRowId: useRowId,
       limit,

@@ -24,6 +24,7 @@ mod iris_tests;
 
 mod db2;
 mod ddl_plan;
+pub(crate) mod oracle_table_contract;
 mod overwrite_clear;
 mod structure_plan;
 pub(crate) mod xugu_objects;
@@ -266,10 +267,11 @@ pub enum TransferObjectKind {
     MaterializedView,
     Procedure,
     Function,
+    Package,
+    PackageBody,
     Trigger,
     Sequence,
     Event,
-    Package,
     Synonym,
 }
 
@@ -312,10 +314,14 @@ pub fn transfer_object_kinds(db_type: &DatabaseType) -> Vec<TransferObjectKind> 
     if *db_type == DatabaseType::Xugu {
         return xugu_objects::supported_kinds();
     }
-    match transfer_object_family(db_type) {
+    let mut kinds = match transfer_object_family(db_type) {
         Some(family) => transfer_object_kinds_for_family(&family),
         None => Vec::new(),
+    };
+    if matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
+        kinds.extend([TransferObjectKind::Package, TransferObjectKind::PackageBody]);
     }
+    kinds
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,6 +371,8 @@ pub struct TransferRequest {
     /// Production database confirmation for drop_target_before_create.
     #[serde(default)]
     pub drop_target_confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_packages: Option<crate::schema::oracle_routines::OraclePackageTransferRequest>,
 }
 
 fn default_quote_target_column_names() -> bool {
@@ -383,6 +391,8 @@ pub struct TransferOwnershipPreview {
     /// re-reads source and target metadata before executing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structure: Option<TransferStructurePreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_packages: Option<crate::schema::oracle_routines::OraclePackageTransferPreview>,
 }
 
 /// SQL plan preview for a `drop_target_before_create` (rebuild) transfer.
@@ -493,6 +503,8 @@ impl TransferStructureOperation {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferStructurePreviewTable {
+    #[serde(skip)]
+    pub(crate) oracle_plan: Option<ddl_plan::PreparedTableDdl>,
     pub source_table: String,
     pub target_table: String,
     /// The target table already exists and this transfer plans no structure DDL for it,
@@ -532,6 +544,15 @@ impl<'a> TransferObjectSelectionMode<'a> {
 }
 
 impl TransferRequest {
+    pub(crate) fn has_package_selection(&self) -> bool {
+        self.objects.as_ref().is_some_and(|objects| {
+            objects.iter().any(|selection| {
+                matches!(selection.object_type, TransferObjectKind::Package | TransferObjectKind::PackageBody)
+                    && !selection.names.is_empty()
+            })
+        })
+    }
+
     fn object_selection_mode(&self) -> TransferObjectSelectionMode<'_> {
         match self.objects.as_deref() {
             Some(selections) => TransferObjectSelectionMode::Explicit(selections),
@@ -576,6 +597,12 @@ pub struct TransferTableResult {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferProgress {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_package_approval: Option<crate::schema::oracle_routines::OraclePackageTransferPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_package_preflight: Option<crate::schema::oracle_routines::OraclePackageTransferPreview>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oracle_routine_operation: Option<crate::schema::oracle_routines::RoutineOperationRecord>,
     pub transfer_id: String,
     pub table: String,
     pub table_index: usize,
@@ -1121,6 +1148,15 @@ pub fn validate_transfer_database_pair(
     source_db_type: &DatabaseType,
     target_db_type: &DatabaseType,
 ) -> Result<(), String> {
+    if request.has_package_selection()
+        && !(matches!((source_db_type, target_db_type), (DatabaseType::Xugu, DatabaseType::Xugu))
+            && request.oracle_packages.is_none())
+        && ![source_db_type, target_db_type]
+            .into_iter()
+            .all(|product| matches!(product, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+    {
+        return Err("Package transfer requires actual Oracle or OceanBase Oracle endpoints; the Oracle family alone does not establish package support".into());
+    }
     if transfer_support_level(source_db_type).is_none() {
         return Err(format!("{} 暂未声明数据传输兼容级别", source_db_type.as_str()));
     }
@@ -1382,6 +1418,11 @@ pub fn target_object_exists_sql(
     name: &str,
     kind: &TransferObjectKind,
 ) -> Result<String, String> {
+    if matches!(kind, TransferObjectKind::Package | TransferObjectKind::PackageBody)
+        && !matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle)
+    {
+        return Err("Package existence requires actual Oracle or OceanBase Oracle".into());
+    }
     let schema = quote_string_literal(schema);
     let name = quote_string_literal(name);
     let q = |literal: &str| literal.to_string();
@@ -1434,6 +1475,8 @@ pub fn target_object_exists_sql(
             | TransferObjectKind::MaterializedView
             | TransferObjectKind::Procedure
             | TransferObjectKind::Function
+            | TransferObjectKind::Package
+            | TransferObjectKind::PackageBody
             | TransferObjectKind::Trigger
             | TransferObjectKind::Sequence,
         ) => format!(
@@ -1443,6 +1486,8 @@ pub fn target_object_exists_sql(
                 TransferObjectKind::MaterializedView => "'MATERIALIZED VIEW'",
                 TransferObjectKind::Procedure => "'PROCEDURE'",
                 TransferObjectKind::Function => "'FUNCTION'",
+                TransferObjectKind::Package => "'PACKAGE'",
+                TransferObjectKind::PackageBody => "'PACKAGE BODY'",
                 TransferObjectKind::Trigger => "'TRIGGER'",
                 _ => "'SEQUENCE'",
             })
@@ -9545,12 +9590,13 @@ pub fn ordered_transfer_object_kinds(kinds: Vec<TransferObjectKind>) -> Vec<Tran
         TransferObjectKind::Sequence => 1,
         TransferObjectKind::View => 2,
         TransferObjectKind::MaterializedView => 2,
-        TransferObjectKind::Function => 3,
-        TransferObjectKind::Procedure => 4,
-        TransferObjectKind::Trigger => 5,
-        TransferObjectKind::Event => 6,
         TransferObjectKind::Package => 3,
         TransferObjectKind::Synonym => 4,
+        TransferObjectKind::Function => 3,
+        TransferObjectKind::Procedure => 4,
+        TransferObjectKind::PackageBody => 5,
+        TransferObjectKind::Trigger => 6,
+        TransferObjectKind::Event => 7,
     };
     let mut kinds = kinds;
     kinds.sort_by_key(rank);
@@ -9590,6 +9636,9 @@ pub fn object_kind_selected_or_defaulted(
     selections: Option<&[TransferObjectSelection]>,
     kind: &TransferObjectKind,
 ) -> bool {
+    if selections.is_none() && matches!(kind, TransferObjectKind::Package | TransferObjectKind::PackageBody) {
+        return false;
+    }
     selections.is_none_or(|selections| !selected_object_names(selections, kind).is_empty())
 }
 
@@ -9686,11 +9735,25 @@ pub async fn transfer_schema_objects<F>(
     request: &TransferRequest,
     source_pool_key: &str,
     target_pool_key: &str,
-    progress_callback: F,
+    mut progress_callback: F,
 ) -> Result<TransferObjectOutcome, String>
 where
     F: FnMut(TransferProgress),
 {
+    if request.has_package_selection() {
+        let source_db_type = get_db_type(state, &request.source_connection_id).await?;
+        let target_db_type = get_db_type(state, &request.target_connection_id).await?;
+        validate_transfer_database_pair(request, &source_db_type, &target_db_type)?;
+    }
+    let packages = match crate::schema::oracle_routines::claim_transfer_packages(state, request, None).await {
+        Ok(packages) => packages,
+        Err(error) => {
+            let progress = error.into_progress(request);
+            let message = progress.error.clone().unwrap();
+            progress_callback(progress);
+            return Err(message);
+        }
+    };
     if matches!(request.content, TransferContent::DataOnly) {
         return Ok(TransferObjectOutcome::default());
     }
@@ -9700,15 +9763,29 @@ where
         &request.target_connection_id,
     )
     .await?;
-    transfer_schema_objects_with_routine_context(
+    let mut outcome = transfer_schema_objects_with_routine_context(
         state,
         request,
         source_pool_key,
         target_pool_key,
         routine_context.as_ref(),
-        progress_callback,
+        &mut progress_callback,
     )
-    .await
+    .await?;
+    if let Some(packages) = packages {
+        let (package_outcome, cancelled, preflight_error) =
+            packages.run(state, request, outcome.failed.is_empty(), progress_callback).await;
+        outcome.transferred.extend(package_outcome.transferred);
+        outcome.skipped.extend(package_outcome.skipped);
+        outcome.failed.extend(package_outcome.failed);
+        if cancelled {
+            return Err("Cancelled".into());
+        }
+        if let Some(error) = preflight_error {
+            return Err(error);
+        }
+    }
+    Ok(outcome)
 }
 
 pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
@@ -9722,11 +9799,17 @@ pub(crate) async fn transfer_schema_objects_with_routine_context<F>(
 where
     F: FnMut(TransferProgress),
 {
-    if matches!(request.content, TransferContent::DataOnly) {
+    if matches!(request.content, TransferContent::DataOnly) && !request.has_package_selection() {
         return Ok(TransferObjectOutcome::default());
     }
     let source_db_type = get_db_type(state, &request.source_connection_id).await?;
     let target_db_type = get_db_type(state, &request.target_connection_id).await?;
+    if request.has_package_selection() {
+        validate_transfer_database_pair(request, &source_db_type, &target_db_type)?;
+    }
+    if matches!(request.content, TransferContent::DataOnly) {
+        return Ok(TransferObjectOutcome::default());
+    }
     if !should_transfer_schema_objects(&source_db_type, &target_db_type, request) {
         return Ok(TransferObjectOutcome::default());
     }
@@ -9821,6 +9904,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -10066,6 +10152,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -10212,6 +10301,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -10306,6 +10398,9 @@ where
             let table = format!("schema object: {name}");
             let mut progress = |outcome: &mut TransferObjectOutcome, status: TransferStatus, error: Option<String>| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.clone(),
                     table_index: request.tables.len(),
@@ -11112,6 +11207,25 @@ async fn build_rebuild_preview(
     Ok(TransferRebuildPreview { sql: phases.join("\n\n"), tables, backup_sql, cleanup_sql })
 }
 
+pub(crate) async fn build_package_transfer_structure(
+    state: &Arc<AppState>,
+    request: &TransferRequest,
+    source_db_type: &DatabaseType,
+    target_db_type: &DatabaseType,
+    source_pool_key: &str,
+    target_pool_key: &str,
+) -> Result<TransferStructurePreview, String> {
+    structure_plan::build_structure_preview(
+        state,
+        request,
+        source_db_type,
+        target_db_type,
+        source_pool_key,
+        target_pool_key,
+    )
+    .await
+}
+
 pub async fn preview_transfer_ownership(
     state: &Arc<AppState>,
     request: &TransferRequest,
@@ -11120,6 +11234,9 @@ pub async fn preview_transfer_ownership(
     source_pool_key: &str,
     target_pool_key: &str,
 ) -> Result<TransferOwnershipPreview, String> {
+    if request.has_package_selection() {
+        validate_transfer_request(request)?;
+    }
     validate_transfer_database_pair(request, source_db_type, target_db_type)?;
     // PostgreSQL-compatible transfers report role ownership gaps for the confirmation flow.
     let (missing_owners, target_owner) =
@@ -11151,7 +11268,10 @@ pub async fn preview_transfer_ownership(
     // Structure-only transfers expose the statements their create pass will run. The other
     // content modes keep their existing previews: data-only runs no DDL, and
     // structure-and-data is deliberately unchanged here.
-    let structure = if matches!(request.content, TransferContent::StructureOnly) {
+    let mut structure = if matches!(request.content, TransferContent::StructureOnly)
+        || (request.has_package_selection()
+            && matches!(source_db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle))
+    {
         Some(
             structure_plan::build_structure_preview(
                 state,
@@ -11167,7 +11287,30 @@ pub async fn preview_transfer_ownership(
         None
     };
 
-    Ok(TransferOwnershipPreview { missing_owners, target_owner, rebuild, structure })
+    let oracle_packages =
+        crate::schema::oracle_routines::prepare_transfer_packages(state, request, structure.as_mut()).await?;
+    if let (Some(packages), Some(structure)) = (&oracle_packages, &mut structure) {
+        let sql = packages
+            .plan
+            .steps
+            .iter()
+            .filter(|step| !step.sql.trim().is_empty())
+            .map(|step| step.sql.as_str())
+            .collect::<Vec<_>>()
+            .join("\n/\n");
+        if !sql.is_empty() {
+            structure.sql.push_str("\n\n");
+            structure.sql.push_str(&sql);
+        }
+        structure.schema_objects_expanded = request.objects.iter().flatten().all(|selection| {
+            selection.names.is_empty()
+                || matches!(
+                    selection.object_type,
+                    TransferObjectKind::Table | TransferObjectKind::Package | TransferObjectKind::PackageBody
+                )
+        });
+    }
+    Ok(TransferOwnershipPreview { missing_owners, target_owner, rebuild, structure, oracle_packages })
 }
 
 fn postgres_transfer_grant_statements_sql(
@@ -11748,6 +11891,9 @@ where
         offset += row_count as u64;
 
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: table.to_string(),
             table_index,
@@ -12238,6 +12384,9 @@ where
             }
 
             progress_callback(TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: request.transfer_id.clone(),
                 table: format!("rename: {table}"),
                 table_index: i,
@@ -12511,7 +12660,7 @@ async fn create_transfer_target_table(
     // confirmation dialog and the actual creation can never disagree on the DDL
     // or the names inside it. Rebuild mode additionally fails closed here when
     // source metadata cannot be trusted.
-    let prepared = ddl_plan::prepare_table_ddl(
+    let mut prepared = ddl_plan::prepare_table_ddl(
         state,
         request,
         table,
@@ -12524,6 +12673,21 @@ async fn create_transfer_target_table(
         known_foreign_keys,
     )
     .await?;
+    if let Some(frozen) = request
+        .oracle_packages
+        .as_ref()
+        .and_then(|packages| packages.pending_tables.as_ref())
+        .and_then(|pending| pending.tables.iter().find(|frozen| frozen.source_table() == table))
+    {
+        let regenerated = frozen.verify_server_plan(
+            table,
+            &request.target_schema,
+            target_table,
+            &prepared.ddl,
+            prepared.source_evidence.clone().ok_or("The original table evidence is unavailable before CREATE")?,
+        )?;
+        prepared.ddl = regenerated.final_ddl().to_owned();
+    }
     let reused_source_ddl = prepared.reused_source_ddl;
     let ddl = prepared.ddl;
     let ddl = if pg_compat_transfer && !owned_sequences.is_empty() {
@@ -13099,6 +13263,9 @@ where
             .map_err(|error| format!("Native Inceptor transfer failed for '{table}': {error}"))?;
         let copied = total_rows.expect("complex transfer count validated");
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: table.to_string(),
             table_index,
@@ -13153,6 +13320,9 @@ where
             batch_size as u64,
             &mut |rows| {
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.to_string(),
                     table_index,
@@ -13172,6 +13342,9 @@ where
                 total_transferred = rows;
                 log::info!("[transfer] {table}: COPY fast path moved {rows} rows in {:?}", started.elapsed());
                 progress_callback(TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: request.transfer_id.clone(),
                     table: table.to_string(),
                     table_index,
@@ -13444,6 +13617,9 @@ where
             offset += row_count as u64;
 
             progress_callback(TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: request.transfer_id.clone(),
                 table: table.to_string(),
                 table_index,
@@ -14066,6 +14242,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("extension: {}", extension.extension_name),
             table_index,
@@ -14087,6 +14266,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("enum: {}", enum_type.type_name),
             table_index,
@@ -14108,6 +14290,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("domain: {}", domain.domain_name),
             table_index,
@@ -14134,6 +14319,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("sequence: {}", sequence.name),
             table_index,
@@ -14269,6 +14457,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("schema object: {}", object.name),
             table_index,
@@ -14329,6 +14520,9 @@ where
             }
             completed_steps += 1;
             progress_callback(TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: request.transfer_id.clone(),
                 table: format!("materialized view: {}", view.view_name),
                 table_index,
@@ -14363,6 +14557,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("trigger: {}", trigger.trigger_name),
             table_index,
@@ -14383,6 +14580,9 @@ where
             .map_err(|e| format!("Failed to drop PostgreSQL trigger {}: {e}", trigger.trigger_name))?;
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: format!("trigger: {}", trigger.trigger_name),
             table_index,
@@ -14411,6 +14611,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: "row security policies".to_string(),
             table_index,
@@ -14432,6 +14635,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: "ownership".to_string(),
             table_index,
@@ -14463,6 +14669,9 @@ where
         }
         completed_steps += 1;
         progress_callback(TransferProgress {
+            oracle_package_approval: None,
+            oracle_package_preflight: None,
+            oracle_routine_operation: None,
             transfer_id: request.transfer_id.clone(),
             table: "grants".to_string(),
             table_index,
@@ -15211,6 +15420,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         db::QueryResult {
             columns: Vec::new(),
             column_types: Vec::new(),
+            deferred_large_value_cells: Vec::new(),
             column_sortables: Vec::new(),
             spatial_columns: vec![],
             spatial_values: vec![],
@@ -15503,6 +15713,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             batch_size: 1000,
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["content"], "structureOnly");
@@ -15542,6 +15753,33 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             let dm = transfer_object_kinds(&DatabaseType::Dameng);
             assert!(dm.contains(&TransferObjectKind::Trigger));
             assert!(dm.contains(&TransferObjectKind::Sequence));
+            assert!(!dm.contains(&TransferObjectKind::Package));
+            for product in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+                let kinds = transfer_object_kinds(&product);
+                assert!(kinds.contains(&TransferObjectKind::Package));
+                assert!(kinds.contains(&TransferObjectKind::PackageBody));
+                assert!(target_object_exists_sql(
+                    &product,
+                    "Owner.With.Dot",
+                    "Pkg.With.Dot😀",
+                    &TransferObjectKind::Package
+                )
+                .unwrap()
+                .contains("OBJECT_TYPE = 'PACKAGE'"));
+                assert!(target_object_exists_sql(
+                    &product,
+                    "Owner.With.Dot",
+                    "Pkg.With.Dot😀",
+                    &TransferObjectKind::PackageBody
+                )
+                .unwrap()
+                .contains("OBJECT_TYPE = 'PACKAGE BODY'"));
+            }
+            assert!(
+                target_object_exists_sql(&DatabaseType::Dameng, "OWNER", "PKG", &TransferObjectKind::Package).is_err()
+            );
+            assert!(!object_kind_selected_or_defaulted(None, &TransferObjectKind::Package));
+            assert!(!object_kind_selected_or_defaulted(None, &TransferObjectKind::PackageBody));
             let sqlserver = transfer_object_kinds(&DatabaseType::SqlServer);
             assert!(sqlserver.contains(&TransferObjectKind::View));
             assert!(sqlserver.contains(&TransferObjectKind::Procedure));
@@ -15592,6 +15830,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 table_filters: std::collections::HashMap::new(),
                 drop_target_before_create: false,
                 drop_target_confirmed: false,
+                oracle_packages: None,
             }
         }
 
@@ -15618,6 +15857,44 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 .contains("追加或覆盖"));
             let rebuild = TransferRequest { drop_target_before_create: true, ..request.clone() };
             assert!(validate_transfer_database_pair(&rebuild, &DatabaseType::Xugu, &DatabaseType::Xugu).is_err());
+        }
+
+        #[test]
+        fn explicit_package_requests_round_trip_and_reject_unsupported_products_before_filtering() {
+            let request = TransferRequest {
+                objects: Some(vec![
+                    TransferObjectSelection {
+                        object_type: TransferObjectKind::Package,
+                        names: vec!["Pkg.With.Dot:😀".into()],
+                    },
+                    TransferObjectSelection {
+                        object_type: TransferObjectKind::PackageBody,
+                        names: vec!["Pkg.With.Dot:😀".into()],
+                    },
+                ]),
+                ..base_request()
+            };
+            let wire = serde_json::to_value(&request).unwrap();
+            assert_eq!(wire["objects"][0]["objectType"], "PACKAGE");
+            assert_eq!(wire["objects"][1]["objectType"], "PACKAGE_BODY");
+            let restored: TransferRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(restored.objects, request.objects);
+            for source in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+                for target in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+                    assert!(validate_transfer_database_pair(&restored, &source, &target).is_ok());
+                }
+                for target in [DatabaseType::Dameng, DatabaseType::Mysql, DatabaseType::Postgres, DatabaseType::Xugu] {
+                    assert!(validate_transfer_database_pair(&restored, &source, &target)
+                        .unwrap_err()
+                        .contains("actual Oracle"));
+                    assert!(validate_transfer_database_pair(&restored, &target, &source)
+                        .unwrap_err()
+                        .contains("actual Oracle"));
+                }
+            }
+            let legacy = TransferRequest { objects: None, ..restored };
+            assert!(!legacy.has_package_selection());
+            assert!(validate_transfer_database_pair(&legacy, &DatabaseType::Dameng, &DatabaseType::Oracle).is_ok());
         }
 
         #[test]
@@ -15716,6 +15993,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 objects: Some(Vec::new()),
                 drop_target_before_create: false,
                 drop_target_confirmed: false,
+                oracle_packages: None,
             };
             assert!(validate_transfer_request(&base).is_ok());
 
@@ -15758,6 +16036,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
                 objects: Some(Vec::new()),
                 drop_target_before_create: false,
                 drop_target_confirmed: false,
+                oracle_packages: None,
             };
 
             // drop_target_before_create=false → valid
@@ -17085,6 +17364,7 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
             batch_size: 1000,
             drop_target_before_create: false,
             drop_target_confirmed: false,
+            oracle_packages: None,
         }
     }
 
@@ -24442,6 +24722,9 @@ CREATE INDEX items_name_idx ON public.items (id);"#;
             try_send_transfer_progress(
                 &sender,
                 TransferProgress {
+                    oracle_package_approval: None,
+                    oracle_package_preflight: None,
+                    oracle_routine_operation: None,
                     transfer_id: "transfer".to_string(),
                     table: "table".to_string(),
                     table_index: 0,

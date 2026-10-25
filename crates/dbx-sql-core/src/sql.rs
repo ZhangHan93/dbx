@@ -3365,6 +3365,18 @@ impl OraclePlSqlBlock {
             return self.with_function_is_complete();
         }
 
+        if self.tokens.first().is_some_and(|token| token.is_word("CREATE")) {
+            let object = Self::skip_create_modifiers(&self.tokens[1..]);
+            if object.first().is_some_and(|token| token.is_word("TRIGGER"))
+                && object
+                    .iter()
+                    .find(|token| token.is_any_word(&["BEGIN", "DECLARE", "COMPOUND", "CALL"]))
+                    .is_some_and(|token| token.is_word("CALL"))
+            {
+                return self.tokens.last().is_some_and(OraclePlSqlToken::is_semicolon);
+            }
+        }
+
         // Package/type specifications have declarations and an outer END with
         // no BEGIN. Bodies also own an outer END beyond nested routine END
         // pairs so an inner END cannot finish the object.
@@ -5534,6 +5546,24 @@ SELECT 2 FROM RDB$DATABASE;";
                     split_sql_statements_for_database(&format!("{routine}\nSELECT 1 FROM dual;"), database),
                     vec![routine.to_string(), "SELECT 1 FROM dual".to_string()],
                     "{database:?}: {routine}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn oracle_split_ends_call_trigger_before_following_ddl() {
+        let trigger = "CREATE OR REPLACE TRIGGER \"S\".\"TR\" BEFORE INSERT ON \"S\".\"T\" FOR EACH ROW CALL \"S\".\"P\"(:NEW.ID, 'a;b');";
+        for database in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+            for separator in ["\n", "\n/\n"] {
+                let sql = format!("{trigger}{separator}ALTER TRIGGER \"S\".\"TR\" DISABLE; COMMENT ON TABLE \"S\".\"T\" IS 'unchanged';");
+                assert_eq!(
+                    split_sql_statements_for_database(&sql, database),
+                    vec![
+                        trigger.to_string(),
+                        "ALTER TRIGGER \"S\".\"TR\" DISABLE".to_string(),
+                        "COMMENT ON TABLE \"S\".\"T\" IS 'unchanged'".to_string()
+                    ]
                 );
             }
         }

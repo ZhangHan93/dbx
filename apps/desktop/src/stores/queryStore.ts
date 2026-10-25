@@ -97,6 +97,7 @@ import { getCachedTableMetadata, loadTableColumns, loadTableIndexes, loadTableMe
 import { loadObjectDdl } from "@/lib/metadata/objectDdlCache";
 import { MetadataTaskLimiter } from "@/lib/metadata/metadataTaskLimiter";
 import { formatDdlForDisplay } from "@/lib/sql/ddlDisplay";
+import { applyDdlTextPreferences } from "@/lib/sql/ddlPreferences";
 import { buildTableSelectSql, quoteTableDataIdentifier } from "@/lib/table/tableSelectSql";
 import {
   connectionObjectTreeNodeSchema,
@@ -2308,12 +2309,13 @@ export const useQueryStore = defineStore("query", () => {
   async function releaseResultLargeValues(...results: Array<QueryResult | undefined>) {
     const released = new Set<string>();
     for (const result of results) {
-      const context = result?.large_value_context;
-      if (!context) continue;
+      if (!result?.large_value_context) continue;
+      const context = result.large_value_context;
       const refs = new Set([...(result.large_value_refs ?? []), ...(result.large_value_cells ?? []).flatMap((cell) => (cell.value_ref ? [cell.value_ref] : []))]);
       for (const valueRef of refs) {
-        if (released.has(valueRef)) continue;
-        released.add(valueRef);
+        const key = resultLargeValueKey(result, valueRef);
+        if (released.has(key)) continue;
+        released.add(key);
         try {
           await api.releaseLargeValue({ ...context, valueRef });
         } catch (error) {
@@ -2765,7 +2767,9 @@ export const useQueryStore = defineStore("query", () => {
     const handoffs = await api.listDetachedTabHandoffs().catch(() => []);
     for (const handoff of handoffs) {
       if (!handoff || handoff.schemaVersion !== 1 || !handoff.tabId || !handoff.tab || typeof handoff.tab.id !== "string" || handoff.tab.id !== handoff.tabId) continue;
-      if (validConnectionIds && handoff.tab.mode !== "query" && !validConnectionIds.has(handoff.tab.connectionId)) continue;
+      // 与恢复持久化页签同理：带 detachedConnectionName 的非 SQL 页签是按删除策略特意保留的，
+      // 等新建同名连接后重绑，不能因为连接暂时不存在就丢弃。
+      if (validConnectionIds && handoff.tab.mode !== "query" && !handoff.tab.detachedConnectionName && !validConnectionIds.has(handoff.tab.connectionId)) continue;
       try {
         await adoptDetachedTab(handoff);
         await api.deleteDetachedTabHandoff(handoff.tabId);
@@ -3494,52 +3498,84 @@ export const useQueryStore = defineStore("query", () => {
    * 加载在 store 侧进行，不依赖该 tab 是否处于激活状态；失败就地写入
    * `ddlLoad.error`，由编辑区渲染错误 + Retry，而不是弹 toast。
    */
-  async function loadDdlViewerTab(id: string) {
+  async function loadDdlViewerTab(id: string, force?: boolean) {
     const tab = tabs.value.find((candidate) => candidate.id === id);
     const request = tab?.ddlLoad;
     const ddlViewer = tab?.ddlViewer;
     if (!tab || !request || !ddlViewer || !tab.connectionId) return;
     const { connectionId } = tab;
     const { database } = tab;
+    const catalog = tab.catalog;
+    const schema = ddlViewer.schema;
+    const tableName = ddlViewer.tableName;
+    const objectType = ddlViewer.objectType;
     const settingsStore = useSettingsStore();
-    try {
-      const connectionStore = useConnectionStore();
+    const connectionStore = useConnectionStore();
+    const isCurrent = () => {
+      const current = tabs.value.find((candidate) => candidate.id === id);
+      return current?.ddlLoad === request && current.ddlViewer === ddlViewer && current.connectionId === connectionId && current.database === database && current.catalog === catalog && ddlViewer.schema === schema && ddlViewer.tableName === tableName && ddlViewer.objectType === objectType;
+    };
+    const currentSeparateIndexes = () => {
       const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(connectionId));
-      const { ddl } = await loadObjectDdl(
-        {
-          connectionId,
-          queryTimeoutSecs: connectionStore.getConfig(connectionId)?.query_timeout_secs,
-          database,
-          schema: ddlViewer.schema || database,
-          tableName: ddlViewer.tableName,
-          objectType: ddlViewer.objectType,
-          catalog: tab.catalog,
-        },
-        // 与弹框打开一致：默认优先使用缓存，开启「每次打开时刷新」才强制重查
-        { force: settingsStore.editorSettings.refreshDdlOnOpen },
-      );
-      const displayed = await formatDdlForDisplay(
-        ddl,
-        {
-          dialect: ddlViewer.formatDialect ?? "generic",
+      return (databaseType === "oracle" || databaseType === "oceanbase-oracle") && settingsStore.editorSettings.separateDdlIndexes;
+    };
+    let refresh = force ?? settingsStore.editorSettings.refreshDdlOnOpen;
+    while (isCurrent()) {
+      const separateIndexes = currentSeparateIndexes();
+      try {
+        const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(connectionId));
+        const formatOptions = {
+          dialect: ddlViewer.formatDialect ?? ("generic" as const),
           databaseType,
           database,
           catalog: tab.catalog,
           includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
           quoteIdentifiers: settingsStore.editorSettings.generateSqlQuoteIdentifiers,
-          excludeDdlStorage: settingsStore.editorSettings.excludeDdlStorage,
-        },
-        settingsStore.editorSettings.sqlFormatter,
-      );
-      // 加载期间 tab 被关掉，或 pending 状态已被一次重试取代：静默丢弃这次结果
-      const current = tabs.value.find((candidate) => candidate.id === id);
-      if (current?.ddlLoad !== request) return;
-      updateSql(id, displayed);
-      markTabClean(current);
-      current.ddlLoad = undefined;
-    } catch (e: any) {
-      const failed = tabs.value.find((candidate) => candidate.id === id);
-      if (failed?.ddlLoad === request) failed.ddlLoad = { startedAt: Date.now(), error: e?.message || String(e) };
+        };
+        const { ddl } = await loadObjectDdl(
+          {
+            connectionId,
+            queryTimeoutSecs: connectionStore.getConfig(connectionId)?.query_timeout_secs,
+            database,
+            schema: ddlViewer.schema || database,
+            tableName: ddlViewer.tableName,
+            objectType: ddlViewer.objectType,
+            catalog: tab.catalog,
+            separateIndexes,
+          },
+          // 与弹框打开一致：默认优先使用缓存，开启「每次打开时刷新」才强制重查
+          { force: refresh },
+        );
+        if (!isCurrent()) return;
+        if (separateIndexes !== currentSeparateIndexes()) {
+          refresh = false;
+          continue;
+        }
+        const displaySource = await formatDdlForDisplay(ddl, formatOptions, settingsStore.editorSettings.sqlFormatter);
+        // 加载期间 tab 被关掉，或 pending 状态已被一次重试取代：静默丢弃这次结果
+        const current = tabs.value.find((candidate) => candidate.id === id);
+        if (!isCurrent() || !current) return;
+        if (separateIndexes !== currentSeparateIndexes()) {
+          refresh = false;
+          continue;
+        }
+        const displayed = applyDdlTextPreferences(displaySource, databaseType, settingsStore.editorSettings);
+        ddlViewer.displaySource = displaySource;
+        ddlViewer.separateIndexes = separateIndexes;
+        updateSql(id, displayed);
+        markTabClean(current);
+        current.ddlLoad = undefined;
+        return;
+      } catch (e: any) {
+        if (!isCurrent()) return;
+        if (separateIndexes !== currentSeparateIndexes()) {
+          refresh = false;
+          continue;
+        }
+        const failed = tabs.value.find((candidate) => candidate.id === id);
+        if (failed?.ddlLoad === request) failed.ddlLoad = { startedAt: Date.now(), error: e?.message || String(e) };
+        return;
+      }
     }
   }
 
@@ -5618,7 +5654,7 @@ export const useQueryStore = defineStore("query", () => {
           catalog: tableMeta.catalog,
           columns: tableMeta.columns.map((column) => column.name),
           primaryKeys,
-          ...tableDataLargeValuePreviewOptions(effectiveDbType, tableMeta.columns, primaryKeys, limit),
+          ...tableDataLargeValuePreviewOptions(effectiveDbType, tableMeta.columns, primaryKeys, limit, conn?.db_type === "jdbc"),
           includeDatabaseName: settingsStore.editorSettings.generateSqlIncludeDatabaseName,
           includeRowId,
           whereInput: tab.whereInput,
@@ -5744,18 +5780,20 @@ export const useQueryStore = defineStore("query", () => {
    * 关闭一律走非 force 路径（`closeScopedTabsWhere` → `beginBatchClose`）：干净页签立即关闭，
    * 未保存的 SQL 草稿与表结构草稿都要经保存/放弃确认，删除连接不能静默丢改动。
    *
-   * 该连接下的 SQL 页签都会记录原连接名（`detachedConnectionName`），便于新建同名连接后
-   * 重新绑定；包括因用户在确认框中选择取消而残留的页签。
+   * 该连接下的**所有**页签都会记录原连接名（`detachedConnectionName`），便于新建同名连接后
+   * 重新绑定；包括因用户在确认框中选择取消而残留的页签。数据/结构等非 SQL 页签同样要标记：
+   * `keep-all-tabs` 会把它们一并保留，不标记就会一直指向已删除的连接
+   * （"Connection config not found"）。
    */
   function detachConnectionTabsForDelete(connectionId: string, options: { keep?: DeletedConnectionTabKeepMode; connectionName?: string } = {}) {
     const keepMode = options.keep ?? "none";
     const keep = keepMode === "all" ? () => true : keepMode === "pinned-sql" ? (tab: QueryTab) => tab.mode === "query" && tab.pinned === true : keepMode === "sql" ? (tab: QueryTab) => tab.mode === "query" : () => false;
     const connectionName = options.connectionName?.trim();
-    // 先给该连接下的 SQL 页签打上脱离标记。关闭流程可能因为「未保存」确认被用户取消，
+    // 先给该连接下的页签打上脱离标记。关闭流程可能因为「未保存」确认被用户取消，
     // 取消后残留的页签同样需要能按连接名重绑到新建的同名连接。
     if (connectionName) {
       for (const tab of tabs.value) {
-        if (tab.connectionId !== connectionId || tab.mode !== "query") continue;
+        if (tab.connectionId !== connectionId) continue;
         tab.detachedConnectionName = connectionName;
       }
     }
@@ -8954,6 +8992,21 @@ export const useQueryStore = defineStore("query", () => {
       }
       const sourceLabelDatabase = targetDatabase || conn?.database;
       const executionClientSessionId = options?.pagination?.clientSessionId ?? (tab.mode === "query" || tab.mode === "data" ? tabClientSessionId(tab) : undefined);
+      const deferLobs = conn?.db_type === "jdbc" && (tab.mode === "query" || tab.mode === "data");
+      const bindLargeValueContext = (results: QueryResult[], txnSessionId?: string): QueryResult[] => {
+        for (const result of results) {
+          if (!result.large_value_cells?.some((cell) => cell.value_ref)) continue;
+          result.large_value_refs = result.large_value_cells.flatMap((cell) => (cell.value_ref ? [cell.value_ref] : []));
+          result.large_value_context = {
+            connectionId: executionConnectionId,
+            database: executionDatabase,
+            clientSessionId: executionClientSessionId,
+            txnSessionId,
+            catalog: executionCatalog,
+          };
+        }
+        return results;
+      };
       if (tab.mode === "query" && tab.objectSource && !usesExternalExecutionTarget && effectiveDbType && tabs.value.includes(tab) && executionConnectionId === tab.connectionId && executionDatabase === tab.database) {
         await prepareObjectSourceRoutineRun(tab, effectiveDbType, executionDatabase, sqlToExecute, sqlStatementParameterOptions, traceId);
       }
@@ -8963,14 +9016,15 @@ export const useQueryStore = defineStore("query", () => {
         return false;
       }
 
+      const dataTabMeta = tab.mode === "data" ? tableMetaForDataTab(tab) : undefined;
+      const useTableDataPreview = canUseTableDataLargeValuePreview(effectiveDbType, dataTabMeta?.columns ?? [], dataTabMeta?.primaryKeys ?? []);
       const executeWithoutManualTransaction = (): Promise<QueryResult[]> => {
         queryExecutionLog("info", "execute-multi:start", { traceId, elapsed: elapsed() });
         // Query and data tabs use a tab-scoped pool so repeated executions keep
         // connection-local state and avoid MySQL pool resets on every refresh.
-        const dataTabMeta = tab.mode === "data" ? tableMetaForDataTab(tab) : undefined;
-        const useTableDataPreview = canUseTableDataLargeValuePreview(effectiveDbType, dataTabMeta?.columns ?? [], dataTabMeta?.primaryKeys ?? []);
         const useJdbcDriverRowOffset = tab.mode === "data" && jdbcConnectionUsesDriverRowOffset(conn, effectiveDbType);
         const executionOptions = {
+          ...(deferLobs ? { deferLobs: true } : {}),
           ...(typeof pageLimit === "number"
             ? useAgentResultSession
               ? {
@@ -9018,26 +9072,29 @@ export const useQueryStore = defineStore("query", () => {
           return executeCursorOffsetPage({
             offset: pageOffset,
             limit: pageLimit,
-            fetchPage: (pageSize, sessionId) => api.executeMulti(executionConnectionId, executionDatabase, sqlToExecute, executionSchema, executionId, { ...executionOptions, pageSize, resultSessionId: sessionId }),
+            fetchPage: (pageSize, sessionId) => api.executeMulti(executionConnectionId, executionDatabase, sqlToExecute, executionSchema, executionId, { ...executionOptions, pageSize, resultSessionId: sessionId }).then((results) => bindLargeValueContext(results)),
             closeSession: (sessionId) => api.closeQuerySession(executionConnectionId, executionDatabase, sessionId, executionClientSessionId, executionCatalog),
+            releaseResults: (results) => releaseResultLargeValues(...results),
             isCancelled: isReplayCancelled,
           });
         }
-        return tab.batchSqlExecution && tab.batchSqlExecution.total > 1
-          ? api.executeMultiWithProgress(
-              executionConnectionId,
-              executionDatabase,
-              sqlToExecute,
-              (progress) => {
-                const current = findExecutionTab(id);
-                if (current?.executionId === executionId) {
-                  applyBatchSqlProgress(current, progress, continueOnBatchError, batchResume?.startStatementIndex ?? 0);
-                }
-              },
-              executionSchema,
-              { ...executionOptions, executionId },
-            )
-          : api.executeMulti(executionConnectionId, executionDatabase, sqlToExecute, executionSchema, executionId, executionOptions);
+        const request =
+          tab.batchSqlExecution && tab.batchSqlExecution.total > 1
+            ? api.executeMultiWithProgress(
+                executionConnectionId,
+                executionDatabase,
+                sqlToExecute,
+                (progress) => {
+                  const current = findExecutionTab(id);
+                  if (current?.executionId === executionId) {
+                    applyBatchSqlProgress(current, progress, continueOnBatchError, batchResume?.startStatementIndex ?? 0);
+                  }
+                },
+                executionSchema,
+                { ...executionOptions, executionId },
+              )
+            : api.executeMulti(executionConnectionId, executionDatabase, sqlToExecute, executionSchema, executionId, executionOptions);
+        return request.then((results) => bindLargeValueContext(results));
       };
 
       let executionPromise: Promise<QueryResult[]>;
@@ -9084,12 +9141,13 @@ export const useQueryStore = defineStore("query", () => {
                   executionDatabase,
                   executionSchema,
                   useAgentResultSession || batchPagination ? agentProtocolQueryResultMaxRows(queryResultMaxRows) : (pageProbeLimit ?? pageLimit ?? agentProtocolQueryResultMaxRows(queryResultMaxRows)),
-                  useLargeValuePreview,
+                  deferLobs ? useTableDataPreview : useLargeValuePreview,
                   useAgentResultSession ? pageSize : undefined,
                   useAgentResultSession ? resultSessionId : undefined,
                   resultSessionId ? undefined : classificationSql,
                 ] as const;
-                const results = await (effectiveDbType === "sqlserver" ? api.executeInManualTransaction(...args, executionId, frontendTimeoutSecs) : api.executeInManualTransaction(...args));
+                const results = await (effectiveDbType === "sqlserver" ? api.executeInManualTransaction(...args, executionId, frontendTimeoutSecs) : deferLobs ? api.executeInManualTransaction(...args, executionId, frontendTimeoutSecs, undefined, true) : api.executeInManualTransaction(...args));
+                bindLargeValueContext(results, sessionId);
                 for (const result of results) {
                   if (result.session_id) result.manual_transaction_session_id = sessionId;
                 }
@@ -9106,6 +9164,7 @@ export const useQueryStore = defineStore("query", () => {
                   limit: pageLimit,
                   fetchPage,
                   closeSession: (cursorId) => api.closeQuerySession(executionConnectionId, executionDatabase, cursorId, undefined, executionCatalog, sessionId),
+                  releaseResults: (results) => releaseResultLargeValues(...results),
                   isCancelled: () => isReplayCancelled() || tab.txnSessionId !== sessionId,
                 });
               }
@@ -9149,11 +9208,17 @@ export const useQueryStore = defineStore("query", () => {
       } else {
         executionPromise = executeWithoutManualTransaction();
       }
-      const responseResults = await withFrontendQueryTimeout(executionPromise, frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }), () => {
+      let responseWasAbandoned = false;
+      const observedExecution = executionPromise.then((results) => {
+        if (responseWasAbandoned) void releaseResultLargeValues(...results);
+        return results;
+      });
+      const responseResults = await withFrontendQueryTimeout(observedExecution, frontendTimeoutSecs, t("editor.queryTimeoutError", { seconds: frontendTimeoutSecs }), () => {
+        responseWasAbandoned = true;
         void api.cancelQuery(executionId).catch((error) => queryExecutionLog("warn", "frontend-timeout:cancel-failed", { traceId, error }));
       });
       for (const result of responseResults) {
-        if (effectiveDbType === "oceanbase-oracle" && !useLargeValuePreview && result.column_types?.some((type) => /^(N?CLOB|BLOB)$/i.test(type.trim()))) {
+        if (effectiveDbType === "oceanbase-oracle" && !useLargeValuePreview && !result.large_value_cells?.some((cell) => cell.value_ref) && result.column_types?.some((type) => /^(N?CLOB|BLOB)$/i.test(type.trim()))) {
           result.messages = [
             ...(result.messages ?? []),
             {
@@ -9163,18 +9228,11 @@ export const useQueryStore = defineStore("query", () => {
             },
           ];
         }
-        if (result.large_value_cells?.some((cell) => cell.value_ref)) {
-          result.large_value_refs = result.large_value_cells.flatMap((cell) => (cell.value_ref ? [cell.value_ref] : []));
-          result.large_value_context = {
-            connectionId: executionConnectionId,
-            database: executionDatabase,
-            clientSessionId: executionClientSessionId,
-            txnSessionId: tab.autoCommit === false ? tab.txnSessionId : undefined,
-            catalog: executionCatalog,
-          };
-        }
       }
-      if (findExecutionTab(id) !== tab || tab.executionId !== executionId || manualTransactionTargetEpoch(tab) !== executionTargetEpoch) return false;
+      if (findExecutionTab(id) !== tab || tab.executionId !== executionId || manualTransactionTargetEpoch(tab) !== executionTargetEpoch) {
+        void releaseResultLargeValues(...responseResults);
+        return false;
+      }
       // A single result has an unambiguous request boundary. This includes fetch and
       // transport, but excludes SQL preparation and the grid's later render work.
       if (clientRequestStartedAt !== undefined && responseResults.length === 1 && !responseResults[0]?.execution_error) {

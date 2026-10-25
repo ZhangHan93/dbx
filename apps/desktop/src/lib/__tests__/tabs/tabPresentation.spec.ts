@@ -1089,18 +1089,27 @@ describe("shared tab presentation helpers", () => {
     expect(tabConnectionColor("conn-2")).toBe("#abcdef");
   });
 
-  it("resolves MQ driver icons from the connection store", () => {
+  it.each(["query", "plugin-workbench", "plugin-filesystem"] as const)("does not use an MQ icon for a %s tab without a connection", (mode) => {
+    expect(tabDatabaseIconType(queryTab({ connectionId: "", mode }))).toBe("unknown");
+    expect(tabDatabaseIconType(queryTab({ connectionId: "deleted-connection", mode }))).toBe("unknown");
+  });
+
+  it("preserves the MQ fallback for an MQ tab without a connection", () => {
+    expect(tabDatabaseIconType(queryTab({ connectionId: "deleted-mq", mode: "mq" }))).toBe("mq");
+  });
+
+  it.each(["kafka", "rabbitmq", "rocketmq", "pulsar"])("resolves the %s MQ driver icon from the connection store", (driver) => {
     const connectionStore = useConnectionStore();
     connectionStore.connections = [
       {
         id: "mq-1",
         name: "MQ",
         db_type: "mq",
-        driver_profile: "kafka",
+        driver_profile: driver,
         color: "",
       } as ConnectionConfig,
     ];
-    expect(tabDatabaseIconType(queryTab({ connectionId: "mq-1", mode: "mq" }))).toBe("kafka");
+    expect(tabDatabaseIconType(queryTab({ connectionId: "mq-1", mode: "mq" }))).toBe(driver);
   });
 
   it("returns a dirty-title style only when the tab is dirty", () => {

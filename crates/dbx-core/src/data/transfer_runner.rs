@@ -32,6 +32,9 @@ where
     fn take_terminal(&self, transfer_id: &str, total_tables: usize) -> TransferProgress {
         self.terminal.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().unwrap_or_else(|| {
             TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: transfer_id.to_string(),
                 table: String::new(),
                 table_index: total_tables,
@@ -82,11 +85,34 @@ where
     let total_tables = request.tables.len();
     let app = ProgressEmitter::new(progress_callback);
 
-    let routine_context = match crate::schema::oracle_routines::capture_routine_transfer_context(
-        &state,
-        &request.source_connection_id,
-        &request.target_connection_id,
-    )
+    let (routine_context, package_transfer) = match async {
+        super::transfer::validate_transfer_database_pair(&request, &source_db_type, &target_db_type)?;
+        let routine = crate::schema::oracle_routines::capture_routine_transfer_context(
+            &state,
+            &request.source_connection_id,
+            &request.target_connection_id,
+        )
+        .await?;
+        let mut table_structure =
+            if request.oracle_packages.as_ref().is_some_and(|packages| packages.pending_tables.is_some()) {
+                Some(
+                    super::transfer::build_package_transfer_structure(
+                        &state,
+                        &request,
+                        &source_db_type,
+                        &target_db_type,
+                        &source_pool_key,
+                        &target_pool_key,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+        let packages =
+            crate::schema::oracle_routines::claim_transfer_packages(&state, &request, table_structure.as_mut()).await?;
+        Ok::<_, crate::schema::oracle_routines::PackageTransferPreflightError>((routine, packages))
+    }
     .await
     {
         Ok(context) => context,
@@ -95,17 +121,7 @@ where
                 journal.record_schema_objects_error(false).await;
             }
             super::transfer::clear_cancelled(&transfer_id).await;
-            return TransferProgress {
-                transfer_id,
-                table: "schema objects".into(),
-                table_index: 0,
-                total_tables,
-                rows_transferred: 0,
-                total_rows: None,
-                status: TransferStatus::Error,
-                error: Some(error),
-                terminal: true,
-            };
+            return error.into_progress(&request);
         }
     };
 
@@ -175,6 +191,9 @@ where
                         &app,
                         history.as_ref(),
                         TransferProgress {
+                            oracle_package_approval: None,
+                            oracle_package_preflight: None,
+                            oracle_routine_operation: None,
                             transfer_id: transfer_id.clone(),
                             table: "schema objects".into(),
                             table_index: 0,
@@ -244,6 +263,9 @@ where
                         &app,
                         history.as_ref(),
                         TransferProgress {
+                            oracle_package_approval: None,
+                            oracle_package_preflight: None,
+                            oracle_routine_operation: None,
                             transfer_id: transfer_id.clone(),
                             table: "rename pre-pass".to_string(),
                             table_index: 0,
@@ -264,6 +286,9 @@ where
                         &app,
                         history.as_ref(),
                         TransferProgress {
+                            oracle_package_approval: None,
+                            oracle_package_preflight: None,
+                            oracle_routine_operation: None,
                             transfer_id: transfer_id.clone(),
                             table: "rename pre-pass".to_string(),
                             table_index: 0,
@@ -304,6 +329,9 @@ where
                         &app,
                         history.as_ref(),
                         TransferProgress {
+                            oracle_package_approval: None,
+                            oracle_package_preflight: None,
+                            oracle_routine_operation: None,
                             transfer_id: transfer_id.clone(),
                             table: "schema dependencies".to_string(),
                             table_index: 0,
@@ -324,6 +352,9 @@ where
                         &app,
                         history.as_ref(),
                         TransferProgress {
+                            oracle_package_approval: None,
+                            oracle_package_preflight: None,
+                            oracle_routine_operation: None,
                             transfer_id: transfer_id.clone(),
                             table: "schema dependencies".to_string(),
                             table_index: 0,
@@ -358,6 +389,9 @@ where
                     &app,
                     history.as_ref(),
                     TransferProgress {
+                        oracle_package_approval: None,
+                        oracle_package_preflight: None,
+                        oracle_routine_operation: None,
                         transfer_id: transfer_id.clone(),
                         table: "overwrite pre-pass".to_string(),
                         table_index: 0,
@@ -381,6 +415,9 @@ where
                     &app,
                     history.as_ref(),
                     TransferProgress {
+                        oracle_package_approval: None,
+                        oracle_package_preflight: None,
+                        oracle_routine_operation: None,
                         transfer_id: transfer_id.clone(),
                         table: table.clone(),
                         table_index: i,
@@ -452,6 +489,9 @@ where
                     emit_progress(
                         &app,
                         TransferProgress {
+                            oracle_package_approval: None,
+                            oracle_package_preflight: None,
+                            oracle_routine_operation: None,
                             transfer_id: transfer_id.clone(),
                             table: table.clone(),
                             table_index: i,
@@ -480,6 +520,9 @@ where
                             &app,
                             history.as_ref(),
                             TransferProgress {
+                                oracle_package_approval: None,
+                                oracle_package_preflight: None,
+                                oracle_routine_operation: None,
                                 transfer_id: transfer_id.clone(),
                                 table: table.clone(),
                                 table_index: i,
@@ -504,6 +547,9 @@ where
                     emit_progress(
                         &app,
                         TransferProgress {
+                            oracle_package_approval: None,
+                            oracle_package_preflight: None,
+                            oracle_routine_operation: None,
                             transfer_id: transfer_id.clone(),
                             table: table.clone(),
                             table_index: i,
@@ -581,6 +627,9 @@ where
                     &app,
                     history.as_ref(),
                     TransferProgress {
+                        oracle_package_approval: None,
+                        oracle_package_preflight: None,
+                        oracle_routine_operation: None,
                         transfer_id: transfer_id.clone(),
                         table: "schema objects".to_string(),
                         table_index: total_tables,
@@ -604,6 +653,9 @@ where
                 emit_progress(
                     &app,
                     TransferProgress {
+                        oracle_package_approval: None,
+                        oracle_package_preflight: None,
+                        oracle_routine_operation: None,
                         transfer_id: transfer_id.clone(),
                         table: "schema objects".to_string(),
                         table_index: total_tables,
@@ -619,6 +671,52 @@ where
         }
         if !object_outcome.failed.is_empty() {
             failed_tables.push(format!("schema objects ({})", object_outcome.failed.len()));
+        }
+
+        if let Some(packages) = &package_transfer {
+            // A failed prerequisite leaves its actual table/object results intact;
+            // no package step is sent, and unsent steps are not counted as writes.
+            let (outcome, package_cancelled, preflight_error) = packages
+                .run(&state, &request, failed_tables.is_empty(), |progress| emit_progress(&app, progress))
+                .await;
+            if let Some(error) = preflight_error {
+                failed_tables.push(format!("package preflight: {error}"));
+            }
+            if !outcome.failed.is_empty() {
+                failed_tables.push("package objects".into());
+            }
+            if let Some(journal) = history.as_ref() {
+                journal.record_object_outcome(&outcome).await;
+            }
+            object_outcome.transferred.extend(outcome.transferred);
+            object_outcome.skipped.extend(outcome.skipped);
+            object_outcome.failed.extend(outcome.failed);
+            if package_cancelled {
+                if let Some(journal) = history.as_ref() {
+                    journal.record_schema_objects_error(true).await;
+                }
+                emit_terminal_progress(
+                    &app,
+                    history.as_ref(),
+                    TransferProgress {
+                        oracle_package_approval: None,
+                        oracle_package_preflight: None,
+                        oracle_routine_operation: None,
+                        transfer_id: transfer_id.clone(),
+                        table: "package objects".into(),
+                        table_index: total_tables,
+                        total_tables,
+                        rows_transferred: last_rows_transferred,
+                        total_rows: last_total_rows,
+                        status: TransferStatus::Cancelled,
+                        error: None,
+                        terminal: true,
+                    },
+                )
+                .await;
+                super::transfer::clear_cancelled(&transfer_id).await;
+                return;
+            }
         }
 
         // The rename pre-pass left one backup per rebuilt table. Drop them only now that
@@ -659,6 +757,9 @@ where
             &app,
             history.as_ref(),
             TransferProgress {
+                oracle_package_approval: None,
+                oracle_package_preflight: None,
+                oracle_routine_operation: None,
                 transfer_id: transfer_id.clone(),
                 table: String::new(),
                 table_index: total_tables,
@@ -697,6 +798,38 @@ mod tests {
     use super::*;
     use crate::models::connection::ConnectionConfig;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn unsupported_package_requests_stop_before_connection_capture_or_any_table_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = crate::persistence::test_storage::open(&directory.path().join("storage.db")).await.unwrap();
+        let state = Arc::new(AppState::new_with_plugin_dir(storage, directory.path().join("plugins")));
+        for content in ["structureOnly", "structureAndData", "dataOnly"] {
+            let request: TransferRequest = serde_json::from_value(json!({
+                "transferId": uuid::Uuid::new_v4().to_string(), "sourceConnectionId": "unconfigured-source",
+                "sourceDatabase": "tenant", "sourceSchema": "SOURCE", "targetConnectionId": "unconfigured-target",
+                "targetDatabase": "tenant", "targetSchema": "TARGET", "tables": ["must-not-write"],
+                "createTable": true, "content": content,
+                "objects": [{"objectType":"PACKAGE_BODY", "names":["Pkg.With.Dot😀"]}], "batchSize": 100,
+            }))
+            .unwrap();
+            let terminal = run_transfer(
+                state.clone(),
+                request,
+                DatabaseType::Dameng,
+                DatabaseType::Oracle,
+                "not-a-source-pool".into(),
+                "not-a-target-pool".into(),
+                None,
+                None,
+                |_| panic!("Unsupported package request must stop before progress or writes"),
+            )
+            .await;
+            assert!(terminal.terminal);
+            assert!(matches!(terminal.status, TransferStatus::Error));
+            assert!(terminal.error.unwrap().contains("actual Oracle or OceanBase Oracle"));
+        }
+    }
 
     #[tokio::test]
     async fn empty_data_only_transfer_completes_without_schema_object_progress() {

@@ -15,6 +15,8 @@ use dbx_core::query_cancel::RunningTaskMetadata;
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecuteQueryRequest {
+    #[serde(default)]
+    pub defer_lobs: bool,
     pub connection_id: String,
     pub database: String,
     pub sql: String,
@@ -480,6 +482,9 @@ pub async fn execute_query(
     headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    if req.defer_lobs {
+        return Err(AppError::bad_request("Deferred LOB results require the multi-result query endpoint"));
+    }
     let allow_database_switch = req.client_session_id.as_deref().is_some_and(|id| !id.trim().is_empty());
     let database = super::mcp_policy::ensure_sql(
         &state,
@@ -540,6 +545,9 @@ pub async fn execute_conditional_update(
     headers: HeaderMap,
     Json(req): Json<ExecuteQueryRequest>,
 ) -> Result<Json<dbx_core::db::QueryResult>, AppError> {
+    if req.defer_lobs {
+        return Err(AppError::bad_request("Deferred LOB results require the multi-result query endpoint"));
+    }
     let allow_database_switch = req.client_session_id.as_deref().is_some_and(|id| !id.trim().is_empty());
     let database = super::mcp_policy::ensure_sql(
         &state,
@@ -673,6 +681,7 @@ pub async fn execute_multi(
         req.schema.as_deref(),
         Some(cancel_token),
         dbx_core::query::QueryExecutionOptions {
+            defer_lobs: req.defer_lobs,
             max_rows: req.max_rows,
             fetch_size: req.fetch_size,
             page_size: req.page_size,
@@ -1893,6 +1902,7 @@ mod tests {
             result: dbx_core::db::QueryResult {
                 columns: vec!["Error".to_string()],
                 column_types: vec![],
+                deferred_large_value_cells: Vec::new(),
                 column_sortables: vec![],
                 spatial_columns: vec![],
                 spatial_values: vec![],

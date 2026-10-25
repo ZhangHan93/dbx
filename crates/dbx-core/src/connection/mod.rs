@@ -8514,6 +8514,7 @@ mod tests {
         let result = crate::types::QueryResult {
             columns: vec!["datcompatibility".to_string()],
             column_types: vec!["text".to_string()],
+            deferred_large_value_cells: Vec::new(),
             column_sortables: vec![true],
             spatial_columns: vec![],
             spatial_values: vec![],

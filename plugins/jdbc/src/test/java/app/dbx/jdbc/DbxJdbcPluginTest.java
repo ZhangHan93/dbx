@@ -2283,13 +2283,13 @@ final class DbxJdbcPluginTest {
         request("executeQuery", """
             {
               "connection": %s,
-              "sql": "CREATE SCHEMA IF NOT EXISTS app"
+              "sql": "CREATE SCHEMA IF NOT EXISTS catalog_fallback"
             }
             """.formatted(CONNECTION));
         request("executeQuery", """
             {
               "connection": %s,
-              "sql": "CREATE TABLE IF NOT EXISTS app.people (id INT PRIMARY KEY, name VARCHAR(30))"
+              "sql": "CREATE TABLE IF NOT EXISTS catalog_fallback.people (id INT PRIMARY KEY, name VARCHAR(30))"
             }
             """.formatted(CONNECTION));
 
@@ -2297,7 +2297,7 @@ final class DbxJdbcPluginTest {
             {
               "connection": %s,
               "database": "UNRELATED_CATALOG",
-              "schema": "APP"
+              "schema": "CATALOG_FALLBACK"
             }
             """.formatted(CONNECTION));
 
@@ -3777,6 +3777,43 @@ final class DbxJdbcPluginTest {
 
             assertEquals("mixed_owner", method.invoke(null, conn, "mixed_owner"));
             assertEquals("SYSDBA", method.invoke(null, conn, "sysdba"));
+        }
+    }
+
+    @Test
+    void strictOraclePackageSourceCarriesMetadataOriginWithoutChangingOrdinarySource() throws Exception {
+        List<String> metadataKinds = new ArrayList<>();
+        Connection conn = (Connection) Proxy.newProxyInstance(Connection.class.getClassLoader(), new Class<?>[]{Connection.class}, (proxy, method, args) -> {
+            if (method.getName().equals("getAutoCommit")) return true;
+            if (method.getName().equals("prepareStatement")) {
+                String sql = (String) args[0];
+                return Proxy.newProxyInstance(PreparedStatement.class.getClassLoader(), new Class<?>[]{PreparedStatement.class}, (statement, invoked, values) -> {
+                    if (invoked.getName().equals("setString") && sql.contains("GET_DDL") && values[0].equals(1)) metadataKinds.add((String) values[1]);
+                    if (invoked.getName().equals("executeQuery")) return rowsResultSet(new String[]{"VALUE"}, new Object[][]{{sql.contains("all_users") ? "APP" : "CREATE OR REPLACE PACKAGE APP.P AS END;"}});
+                    return defaultValue(invoked.getReturnType());
+                });
+            }
+            return defaultValue(method.getReturnType());
+        });
+        Driver driver = (Driver) Proxy.newProxyInstance(Driver.class.getClassLoader(), new Class<?>[]{Driver.class}, (proxy, method, args) -> {
+            if (method.getName().equals("acceptsURL")) return ((String) args[0]).startsWith("jdbc:oracle:dbx-package-source:");
+            if (method.getName().equals("connect")) return ((String) args[0]).startsWith("jdbc:oracle:dbx-package-source:") ? conn : null;
+            return defaultValue(method.getReturnType());
+        });
+        String connection = "{\"connection_string\":\"jdbc:oracle:dbx-package-source:test\",\"username\":\"APP\"}";
+        DriverManager.registerDriver(driver);
+        try {
+            for (boolean strict : new boolean[]{false, true}) {
+                JsonNode response = request("getObjectSource", "{\"connection\":" + connection + ",\"schema\":\"APP\",\"name\":\"P\",\"object_type\":\"PACKAGE\",\"include_source_origin\":" + strict + "}");
+                assertFalse(response.has("error"), response.toString());
+                JsonNode result = response.path("result");
+                assertEquals("PACKAGE", result.path("object_type").asText());
+                assertEquals(strict, result.has("source_origin"));
+                if (strict) assertEquals("oracle-metadata", result.path("source_origin").asText());
+            }
+            assertEquals(List.of("PACKAGE", "PACKAGE_SPEC"), metadataKinds);
+        } finally {
+            closeAndDeregister(connection, driver);
         }
     }
 
