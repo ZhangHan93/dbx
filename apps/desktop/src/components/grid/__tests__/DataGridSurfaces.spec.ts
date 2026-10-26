@@ -84,7 +84,7 @@ vi.mock("@/stores/settingsStore", async () => {
   };
   return { ...actual, useSettingsStore: () => settingsMock.store };
 });
-vi.mock("@/lib/dataGrid/geometryPreview", () => ({ isHexGeometry: () => false, renderWktOnCanvas: mocks.renderWkt }));
+vi.mock("@/lib/dataGrid/geometryPreview", () => ({ isHexGeometry: () => false, looksLikeWkt: () => false, parseWktGeometry: () => null, renderWktOnCanvas: mocks.renderWkt }));
 vi.mock("@/lib/common/clipboard", () => ({ copyToClipboard: mocks.copyToClipboard }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: mocks.toast }) }));
 vi.mock("@/composables/useDataGridCellDetail", async () => {

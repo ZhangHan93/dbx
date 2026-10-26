@@ -631,6 +631,47 @@ describe("ExportProgressPopover task duration", () => {
 });
 
 describe("ExportProgressPopover file name and reveal action", () => {
+  it("shows a queued saved file without running progress and cancels it from the task row", async () => {
+    const tracker = useExportTracker();
+    let finish!: (outcome: "settled") => void;
+    tracker.submitExportTask(
+      tracker.addTask("first", "csv", "/tmp/first.csv"),
+      "queued",
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const waiting = tracker.addTask("Query Result", "csv", "/tmp/waiting.csv");
+    const run = vi.fn(async () => "settled" as const);
+    tracker.submitExportTask(waiting, "queued", run);
+
+    await mountPopover();
+    const title = Array.from(document.body.querySelectorAll("span")).find((node) => node.textContent === "waiting.csv");
+    const row = title?.closest("div.flex.items-start");
+    expect(row?.textContent).toContain("Queued");
+    expect(row?.textContent).not.toContain("Elapsed:");
+    expect(row?.querySelector(".export-progress-indeterminate")).toBeNull();
+    row?.querySelector<HTMLButtonElement>('button[title="Cancel"]')?.click();
+    await nextTick();
+    expect(waiting.status).toBe("Cancelled");
+    finish("settled");
+    await Promise.resolve();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("does not offer deletion or animate progress for an unknown export", async () => {
+    const tracker = useExportTracker();
+    const task = tracker.addTask("Query Result", "csv", "/tmp/unknown.csv");
+    task.status = "Unknown";
+    task.errorMessage = "transport interrupted";
+    await mountPopover();
+    expect(document.body.textContent).toContain("Export status unknown; the queue is blocked");
+    expect(document.body.textContent).toContain("transport interrupted");
+    expect(document.body.querySelector('button[title="Delete"]')).toBeNull();
+    expect(document.body.querySelector(".export-progress-indeterminate")).toBeNull();
+  });
+
   it("shows the saved file name instead of the synthetic query-result label", async () => {
     const tracker = useExportTracker();
     tracker.addTask("Query Result", "sql", "C:\\exports\\自定义.sql");

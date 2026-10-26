@@ -134,7 +134,9 @@ export function useQueryEditorHover(options: QueryEditorHoverOptions) {
     const hoverTarget = completionMetadataTarget({
       name: lookup.tableName,
       catalog: props.catalog,
-      database: lookup.database !== props.database ? lookup.database : undefined,
+      // Keep the hovered table's own database so metadata/DDL requests never fall back
+      // to the tab's database (cross-database `b.orders` while tab database `a` is selected).
+      database: lookup.database,
       schema: lookup.schema,
     });
     if (!hoverTarget) return null;
@@ -143,7 +145,9 @@ export function useQueryEditorHover(options: QueryEditorHoverOptions) {
       database: hoverTarget.database,
       schema: hoverTarget.schema,
     };
-    const preferredSchema = props.schema;
+    // MySQL-family engines address `other_db.table` with the selected database
+    // cleared (no schema); the toolbar value must not leak into that lookup.
+    const preferredSchema = lookup.schemaFromQualifier ? hoverScope.schema : props.schema;
     const matchHoverTable = (tables: typeof completionMetadata.cachedTables) =>
       matchHoverTableCandidates(tables, {
         lookups: [qualifiedTableLookup, identifier],
@@ -160,7 +164,7 @@ export function useQueryEditorHover(options: QueryEditorHoverOptions) {
       };
       const searchRemote = async (schema: string | undefined, globalSearch: boolean) => {
         const loadedTables = await connectionStore.listCompletionTables(props.connectionId!, hoverScope.database, tableLookupName, MAX_COMPLETION_TABLES, schema, globalSearch, preferredSchema, hoverScope.catalog);
-        return schema ? scopeHoverTables(loadedTables, { ...hoverScope, schema }) : loadedTables;
+        return scopeHoverTables(loadedTables, schema ? { ...hoverScope, schema } : { ...hoverScope, schema: undefined });
       };
 
       let hoverTables = completionMetadata.cachedTables.filter((table) => (lookup.preferGlobalFirst || !hoverScope.schema ? hoverTableMatchesScope(table, { ...hoverScope, schema: undefined }) : hoverTableMatchesScope(table, hoverScope)));

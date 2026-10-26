@@ -338,6 +338,7 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
     case "dameng-roles":
       return { icon: ShieldCheck, colorClass: "text-primary" };
     case "dameng-job-admin":
+    case "database-job-admin":
       return { icon: CalendarClock, colorClass: "text-primary" };
     case "saved-sql-root":
       return { icon: node.isExpanded ? FolderOpen : FolderClosed, colorClass: "text-blue-500" };
@@ -434,6 +435,8 @@ function getIconInfo(node: TreeNode): { icon: any; colorClass: string } | null {
     case "group-jobs":
       return { icon: Clock, colorClass: "text-orange-400" };
     case "group-packages":
+      return { icon: Package, colorClass: "text-cyan-500" };
+    case "group-package-bodies":
       return { icon: Package, colorClass: "text-cyan-500" };
     case "group-types":
       return { icon: Braces, colorClass: "text-violet-500" };
@@ -1733,6 +1736,7 @@ function onKeydown(event: KeyboardEvent) {
                   node.type === 'group-synonyms' ||
                   node.type === 'group-jobs' ||
                   node.type === 'group-packages' ||
+                  node.type === 'group-package-bodies' ||
                   node.type === 'group-types' ||
                   node.type === 'group-partitions' ||
                   node.type === 'type-attributes' ||

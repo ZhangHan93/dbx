@@ -6,6 +6,7 @@ import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTy
 import type { DamengDumpKind, DamengDumpRequest, DamengDumpProgress } from "./damengDumpTypes";
 import type { UserSkillRootSettings, UserSkillsListResult, UserSkillsReadResult } from "@/types/userSkills";
 import type { DatabaseBackupCommand, DatabaseBackupBackgroundStatus } from "@/lib/backup/backgroundDatabaseBackup";
+import type { NativeJobContext, NativeJobDetails, NativeJobList, NativeJobListRequest, NativeJobRequest, NativeJobOperationStatus, NativeJobPreparedPlan, NativeJobRef, NativeJobReferenceCatalog, NativeJobReferenceListRequest } from "@/lib/database/nativeJobs";
 import type { PluginUiStorageItemRef, SqlFileFailureLogExportPayload, SqlFileFailureLogInfo, SqlFileFailureLogKey, SqlFileFailureLogTextPayload, SyncCatalogItem, SyncSelection, SyncSnapshotCatalog } from "@/lib/backend/tauri";
 import { FAILURE_LOG_TEXT_TOO_LARGE } from "@/lib/export/failureLogExport";
 import { saveTextFile } from "@/lib/export/saveTextFile";
@@ -261,6 +262,7 @@ import type { BuildTableSelectSqlOptions } from "@/lib/table/tableSelectSql";
 import type { DatabaseSearchSql, DatabaseSearchSqlOptions, SearchResultWhereOptions } from "@/lib/database/databaseSearch";
 import type { DatabaseStructureSearchSql, DatabaseStructureSearchSqlOptions } from "@/lib/database/databaseStructureSearch";
 import type { BuildEditableObjectSourceSqlInput, BuildRoutineRenameObjectSourceInput, FingerprintOracleRoutineObjectSourceInput, RewriteOracleRoutineReferencesInput, ValidateOracleExecutableObjectSourceInput } from "@/lib/table/objectSourceEditor";
+import type { OracleTriggerSqlInput, PreparedOracleTriggerSql } from "@/lib/database/oracleTriggerSql";
 import type { OracleTableReferenceRewriteInput, OracleViewRenameSource, OracleViewRenameSourceInput, OracleViewRenameSourceReview } from "@/types/database";
 import type { BuildViewDdlInput } from "@/lib/table/viewDdl";
 import type { BuildRenameObjectSqlOptions } from "@/lib/table/objectRenameSql";
@@ -1058,7 +1060,7 @@ export async function previewAgentOfflineExport(): Promise<AgentOfflineExportPre
   throw new Error("Offline Agent package export is only available in the desktop app.");
 }
 
-export async function exportAgentsOffline(_path: string, _driverKeys: string[]): Promise<AgentOfflineExportResult> {
+export async function exportAgentsOffline(_path: string, _driverKeys: string[], _includeJres = true): Promise<AgentOfflineExportResult> {
   throw new Error("Offline Agent package export is only available in the desktop app.");
 }
 
@@ -1271,8 +1273,9 @@ export async function listObjects(
   catalog?: string,
   tableNameFilter?: TableNameFilter,
   executionId?: string,
-  exactIdentity?: boolean,
+  options?: boolean | import("@/types/database").MetadataReadOptions,
 ): Promise<ObjectInfo[]> {
+  const readOptions = typeof options === "object" ? options : undefined;
   return get(
     `/api/schema/objects?${qs({
       connection_id: connectionId,
@@ -1282,10 +1285,11 @@ export async function listObjects(
       filter,
       limit,
       offset,
-      catalog,
+      catalog: readOptions?.catalog ?? catalog,
       table_name_filter: tableNameFilter ? JSON.stringify(tableNameFilter) : undefined,
       execution_id: executionId,
-      exact_identity: exactIdentity || undefined,
+      identity_mode: readOptions?.identityMode,
+      exact_identity: options === true || undefined,
     })}`,
   );
 }
@@ -1302,8 +1306,8 @@ export async function completionAssistantSearch(request: CompletionAssistantRequ
   return post("/api/schema/completion-assistant", request);
 }
 
-export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind, signature?: string, relationName?: string): Promise<ObjectSource> {
-  return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType, signature, relation_name: relationName })}`);
+export async function getObjectSource(connectionId: string, database: string, schema: string, name: string, objectType: ObjectSourceKind, signature?: string, relationName?: string, options?: import("@/types/database").MetadataReadOptions): Promise<ObjectSource> {
+  return get(`/api/schema/object-source?${qs({ connection_id: connectionId, database, schema, table: name, object_type: objectType, signature, relation_name: relationName, identity_mode: options?.identityMode, catalog: options?.catalog })}`);
 }
 
 export async function getEventInfo(connectionId: string, database: string, schema: string, name: string): Promise<MysqlEventInfo> {
@@ -1312,6 +1316,31 @@ export async function getEventInfo(connectionId: string, database: string, schem
 
 export async function getCustomTypeDetails(connectionId: string, database: string, schema: string, name: string): Promise<CustomTypeDetails> {
   return get(`/api/schema/custom-type-details?${qs({ connection_id: connectionId, database, schema, table: name })}`);
+}
+
+export function nativeJobOpenContext(connectionId: string, database: string): Promise<NativeJobContext> {
+  return post("/api/schema/native-jobs/context", { connectionId, database });
+}
+export function nativeJobList(request: NativeJobListRequest): Promise<NativeJobList> {
+  return post("/api/schema/native-jobs/list", request);
+}
+export function nativeJobReferences(request: NativeJobReferenceListRequest): Promise<NativeJobReferenceCatalog> {
+  return post("/api/schema/native-jobs/references", request);
+}
+export function nativeJobRead(target: NativeJobRef): Promise<NativeJobDetails> {
+  return post("/api/schema/native-jobs/read", target);
+}
+export function nativeJobPrepare(mutation: NativeJobRequest): Promise<NativeJobPreparedPlan> {
+  return post("/api/schema/native-jobs/prepare", mutation);
+}
+export function nativeJobApply(planId: string): Promise<NativeJobOperationStatus> {
+  return post("/api/schema/native-jobs/apply", { planId });
+}
+export function nativeJobStatus(operationId: string, observe?: boolean): Promise<NativeJobOperationStatus> {
+  return post("/api/schema/native-jobs/status", { operationId, ...(observe ? { observe: true } : {}) });
+}
+export function nativeJobCancel(operationId: string): Promise<NativeJobOperationStatus> {
+  return post("/api/schema/native-jobs/cancel", { operationId });
 }
 
 export async function getOracleTypeManagementSnapshot(connectionId: string, database: string, owner: string, name: string, knownObjects: OracleTypeManagementObjectKey[] = []): Promise<OracleTypeManagementSnapshot> {
@@ -1374,8 +1403,9 @@ export async function listForeignKeysForDatabase(connectionId: string, database:
   return get(`/api/schema/foreign-keys-for-database?${qs({ connection_id: connectionId, database, schema, catalog, execution_id: executionId })}`);
 }
 
-export async function listTriggers(connectionId: string, database: string, schema: string, table: string, catalog?: string, exactIdentity?: boolean): Promise<TriggerInfo[]> {
-  return get(`/api/schema/triggers?${qs({ connection_id: connectionId, database, schema, table, catalog, exact_identity: exactIdentity || undefined })}`);
+export async function listTriggers(connectionId: string, database: string, schema: string, table: string, catalog?: string, options?: boolean | import("@/types/database").MetadataReadOptions): Promise<TriggerInfo[]> {
+  const readOptions = typeof options === "object" ? options : undefined;
+  return get(`/api/schema/triggers?${qs({ connection_id: connectionId, database, schema, table, catalog: readOptions?.catalog ?? catalog, identity_mode: readOptions?.identityMode, exact_identity: options === true || undefined })}`);
 }
 
 export async function listConstraints(connectionId: string, database: string, schema: string, table: string, catalog?: string, exactIdentity?: boolean): Promise<ConstraintInfo[]> {
@@ -2079,6 +2109,10 @@ export async function buildExecutableObjectSourceStatements(input: BuildEditable
 
 export async function validateOracleExecutableObjectSource(input: ValidateOracleExecutableObjectSourceInput): Promise<void> {
   return post("/api/query/validate-oracle-executable-object-source", { input });
+}
+
+export async function prepareOracleTriggerSql(input: OracleTriggerSqlInput): Promise<PreparedOracleTriggerSql> {
+  return post("/api/query/prepare-oracle-trigger-sql", { input });
 }
 
 export async function fingerprintOracleRoutineObjectSource(input: FingerprintOracleRoutineObjectSourceInput): Promise<string> {

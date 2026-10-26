@@ -31,6 +31,13 @@ import { DATA_GRID_DEFAULT_VISIBLE_COPY_EXTRACTORS, DATA_GRID_EXTRACTOR_OPTIONS_
 import { DEFAULT_MONO_FONT_FAMILY } from "@/lib/app/appFonts";
 
 describe("normalizeEditorSettings", () => {
+  it("defaults query connection group paths to hidden and validates the toggle", () => {
+    expect(DEFAULT_EDITOR_SETTINGS.showConnectionGroupPath).toBe(false);
+    expect(normalizeEditorSettings({}).showConnectionGroupPath).toBe(false);
+    expect(normalizeEditorSettings({ showConnectionGroupPath: true }).showConnectionGroupPath).toBe(true);
+    expect(normalizeEditorSettings({ showConnectionGroupPath: "true" as any }).showConnectionGroupPath).toBe(false);
+  });
+
   it("migrates legacy partial DDL settings before applying and tracking the patch", async () => {
     setActivePinia(createPinia());
     const { useSettingsStore } = await import("@/stores/settingsStore");

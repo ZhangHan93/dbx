@@ -397,16 +397,22 @@ export interface GenerateSchemaSyncPlanOptions {
 
 const MYSQL_LIKE_SCHEMA_DIFF_TARGET_TYPES = new Set<DatabaseType>(["mysql", "doris", "starrocks", "goldendb", "sundb", "databend", "gbase"]);
 
-export function schemaDiffDeployTargetSchema(databaseType: DatabaseType | undefined, targetDatabase: string, targetSchema?: string): string | undefined {
-  const schema = targetSchema?.trim();
-  if (schema) return schema;
+/** Resolve the schema that qualifies an object: an explicit schema wins; engines without a
+ * separate schema namespace use the selected database as the schema. */
+export function schemaDiffEffectiveSchema(databaseType: DatabaseType | undefined, database: string, schema?: string): string | undefined {
+  const trimmedSchema = schema?.trim();
+  if (trimmedSchema) return trimmedSchema;
 
-  const database = targetDatabase.trim();
-  if (databaseType && MYSQL_LIKE_SCHEMA_DIFF_TARGET_TYPES.has(databaseType) && database) {
-    return database;
+  const trimmedDatabase = database.trim();
+  if (databaseType && MYSQL_LIKE_SCHEMA_DIFF_TARGET_TYPES.has(databaseType) && trimmedDatabase) {
+    return trimmedDatabase;
   }
 
   return undefined;
+}
+
+export function schemaDiffDeployTargetSchema(databaseType: DatabaseType | undefined, targetDatabase: string, targetSchema?: string): string | undefined {
+  return schemaDiffEffectiveSchema(databaseType, targetDatabase, targetSchema);
 }
 
 // Unified object type for UI display

@@ -6,6 +6,7 @@ import { canReloadUnavailableDataTab, restoredDataTabReloadFilters } from "@/lib
 import { defaultViewForResult } from "@/lib/query/queryResultDefaultView";
 import { extractNeo4jNodeCells, projectNeo4jNodeResult } from "@/lib/neo4j/neo4jNodeResult";
 import { useNeo4jNodeTableResult } from "@/composables/useNeo4jNodeTableResult";
+import type { DataGridExportSheet } from "@/composables/useDataGridExport";
 import { extractGraphCells, graphPropertyFromUpdateResult, type GraphEdge, type GraphNode, type GraphProperty, type GraphResult } from "@/lib/graph/graphResult";
 import { graphAdapterForDatabase } from "@/lib/graph/graphAdapters";
 import { queryResultMessages } from "@/lib/query/queryResultMessages";
@@ -82,7 +83,10 @@ import ResultSetNavigator from "@/components/layout/ResultSetNavigator.vue";
 import QueryResultViewSwitcher from "@/components/layout/QueryResultViewSwitcher.vue";
 import ProductionWatermark from "@/components/common/ProductionWatermark.vue";
 import ObjectDependenciesPanel from "@/components/objects/ObjectDependenciesPanel.vue";
-import { objectDependencyTarget, isObjectDependencySection, type ObjectDependencyTarget, type ObjectDetailsSection } from "@/lib/database/objectDependencyDetails";
+import OracleTriggerStatus from "@/components/objects/OracleTriggerStatus.vue";
+import type { OracleTriggerSnapshot, OracleTriggerTarget, OracleTriggerExecutionResult } from "@/lib/database/oracleTriggerPlan";
+const OracleInvalidObjectsDialog = defineAsyncComponent(() => import("@/components/objects/OracleInvalidObjectsDialog.vue"));
+import { objectDependencyTarget, type ObjectDependencyTarget, type ObjectDetailsSection } from "@/lib/database/objectDependencyDetails";
 import DataGridFreezeFirstColumnControl from "@/components/grid/DataGridFreezeFirstColumnControl.vue";
 import DataGridStatusSqlControl from "@/components/grid/DataGridStatusSqlControl.vue";
 import type { DataGridSqlPreview } from "@/components/grid/dataGridSqlPreview";
@@ -152,6 +156,7 @@ const MySqlDashboard = defineAsyncComponent(() => import("@/components/admin/MyS
 const PostgresDashboard = defineAsyncComponent(() => import("@/components/admin/PostgresDashboard.vue"));
 const XuguServerDashboard = defineAsyncComponent(() => import("@/components/admin/XuguServerDashboard.vue"));
 const DamengJobAdmin = defineAsyncComponent(() => import("@/components/admin/DamengJobAdmin.vue"));
+const DatabaseJobAdmin = defineAsyncComponent(() => import("@/components/admin/DatabaseJobAdmin.vue"));
 
 const DamengUserAdmin = defineAsyncComponent(() => import("@/components/admin/DamengUserAdmin.vue"));
 const DamengRoleAdmin = defineAsyncComponent(() => import("@/components/admin/DamengRoleAdmin.vue"));
@@ -199,6 +204,7 @@ import { chartableColumnIndexes } from "@/lib/dataGrid/chartData";
 import { elasticsearchJsonResponseForResult } from "@/lib/elasticsearch/elasticsearchJsonResponse";
 import { elasticsearchProfileBodyForResult, parseElasticsearchProfile } from "@/lib/elasticsearch/elasticsearchProfile";
 import * as api from "@/lib/backend/api";
+import type { ExportReadControl } from "@/lib/export/snapshotCompletion";
 import type { SqlInsertMode } from "@/lib/export/sqlInsertMode";
 import { promptExportSavePath } from "@/lib/export/exportPath";
 import { queryResultExportBaseName } from "@/lib/export/saveTextFile";
@@ -217,7 +223,7 @@ import { analyzeEditableQuery } from "@/lib/sql/sqlAnalysis";
 import { loadQueryResultTransferSourceDdl } from "@/components/transfer/queryResultTransferSource";
 import { sqlObjectNavigationTypeFromTableType } from "@/lib/sql/sqlNavigation";
 import type { CustomSaveHandler } from "@/composables/useDataGridEditor";
-import type { QueryMessage, QueryResult, QueryTab, RedisResultViewMode, TableInfoTab, TabOutputView, TreeNode, VectorCollectionMeta } from "@/types/database";
+import type { QueryMessage, QueryResult, QueryTab, RedisResultViewMode, TableInfoTab, TableStructureEditorDraft, TabOutputView, TreeNode, VectorCollectionMeta } from "@/types/database";
 import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { sqlFormatDialectForDbType, type SqlFormatDialect } from "@/lib/sql/sqlFormatter";
 import { productionContextForDatabase } from "@/lib/database/productionSafety";
@@ -255,7 +261,7 @@ type DataGridHandle = DataGridColumnLayoutHandle & {
   exportJson: () => Promise<void>;
   exportSql: () => Promise<void>;
   exportXlsx: () => Promise<void>;
-  exportResultSheetsXlsx: (sheets: Array<{ sheetName: string; result: QueryResult; sql?: string }>) => Promise<void>;
+  exportResultSheetsXlsx: (sheets: DataGridExportSheet[]) => Promise<void>;
   openXlsx: () => Promise<void>;
 };
 
@@ -293,6 +299,10 @@ const { t } = useI18n();
 const queryStore = useQueryStore();
 const connectionStore = useConnectionStore();
 const productionSafetyStore = useProductionSafetyStore();
+function updateStructureDraft(draft: TableStructureEditorDraft | undefined, originTabId?: string) {
+  const tab = originTabId === undefined ? props.activeTab : queryStore.tabs.find((item) => item.id === originTabId);
+  if (tab?.mode === "structure") tab.structureDraft = draft;
+}
 /** Clear a consumed editor reveal request so a later normal tab re-visit doesn't re-jump. */
 function clearEditorRevealRequest(tab: { editorRevealRequest?: unknown }): void {
   if (tab.editorRevealRequest !== undefined) {
@@ -339,6 +349,7 @@ onMounted(() => {
   window.addEventListener("resize", updateStandaloneResultToolbarDimensions);
   window.visualViewport?.addEventListener("resize", updateStandaloneResultToolbarDimensions);
   window.addEventListener("dbx:ui-scale-applied", updateStandaloneResultToolbarDimensions);
+  window.addEventListener("dbx:before-tab-switch", revokeExecutionErrorFocus);
   revealActiveResultRunAfterRender();
 });
 
@@ -448,12 +459,48 @@ const activeObjectDependencyTarget = computed(() => {
   const tab = props.activeTab;
   const details = tab.objectDetails;
   if (!details || details.connectionId !== tab.connectionId || details.database !== tab.database || details.schema !== (tab.schema || tab.database) || (details.catalog || "") !== (tab.catalog || "")) return undefined;
-  return objectDependencyTarget(details, effectiveDatabaseTypeForConnection(connectionStore.getConfig(details.connectionId)));
+  return objectDependencyTarget(details, effectiveDatabaseTypeForConnection(connectionStore.getConfig(details.connectionId)), queryStore.oracleTriggerSourceState(tab.id)?.profile);
 });
 const activeObjectSection = computed<ObjectDetailsSection>(() => (activeObjectDependencyTarget.value ? props.activeTab.objectDetails?.section || "source" : "source"));
-const sourceSectionActive = computed(() => !isObjectDependencySection(props.activeTab));
+const sourceSectionActive = computed(() => activeObjectSection.value === "source");
+const retainTriggerSourceEditor = computed(() => props.activeTab.objectSource?.objectType === "TRIGGER" && !!queryStore.oracleTriggerSourceState(props.activeTab.id));
+const triggerDiagnosticOpen = ref(false);
+const triggerDiagnosticContext = ref<{ target: Readonly<OracleTriggerTarget>; expectedObjectId?: string; originTabId: string; originRevision?: number }>();
+const triggerDiagnosticConnection = computed(() => (triggerDiagnosticContext.value ? connectionStore.getConfig(triggerDiagnosticContext.value.target.connectionId) : undefined));
+watch(
+  () => props.activeTab.id,
+  () => {
+    triggerDiagnosticOpen.value = false;
+  },
+);
+function openTriggerSourceDiagnostics() {
+  const snapshot = queryStore.oracleTriggerSourceState(props.activeTab.id)?.baseline;
+  if (!snapshot?.exists) return;
+  triggerDiagnosticContext.value = { target: snapshot.target, expectedObjectId: snapshot.metadata.objectId ?? undefined, originTabId: props.activeTab.id, originRevision: queryStore.oracleTriggerSourceState(props.activeTab.id)?.readVersion };
+  triggerDiagnosticOpen.value = true;
+}
+function returnFromTriggerSourceDiagnostics(object: { owner: string; name: string; objectId?: string }, location?: { line: number; position: number }) {
+  const context = triggerDiagnosticContext.value;
+  if (!context || context.originTabId !== props.activeTab.id || context.target.owner !== object.owner || context.target.name !== object.name) return;
+  triggerDiagnosticOpen.value = false;
+  setObjectSection("source");
+  if (location && !queryStore.revealOracleTriggerSourceError(context.originTabId, location, object.objectId)) toast(t("oracleTrigger.errorPositionUnavailable"), 3000);
+}
+function acceptTriggerSourceDiagnosticResult(_target: Readonly<OracleTriggerTarget>, result: OracleTriggerExecutionResult, before: OracleTriggerSnapshot, originTabId?: string, originRevision?: number) {
+  if (originTabId) queryStore.acceptOracleTriggerDiagnosticResult(originTabId, result, before, originRevision);
+}
 function setObjectSection(section: ObjectDetailsSection) {
   if (props.activeTab.objectDetails) props.activeTab.objectDetails.section = section;
+}
+function openTriggerSourceParent() {
+  const snapshot = queryStore.oracleTriggerSourceState(props.activeTab.id)?.baseline;
+  const parent = snapshot?.metadata.parent;
+  if (!snapshot || !parent) return;
+  emit(
+    "openDependencyObject",
+    { connectionId: snapshot.target.connectionId, database: snapshot.target.database, schema: snapshot.target.owner, catalog: snapshot.target.catalog, name: snapshot.target.name, objectType: "TRIGGER" },
+    { name: parent.name, schema: parent.owner, type: parent.objectType === "VIEW" ? "view" : "table", nameQuoted: true, schemaQuoted: true },
+  );
 }
 function viewObjectDependencySql(context: ObjectDependencyTarget, sql: string) {
   queryStore.createTab(context.connectionId, context.database, t("objectDependencies.viewSql"), "query", context.schema, sql, context.catalog, { forceNew: true });
@@ -647,13 +694,15 @@ const visibleResultItems = computed(() =>
   tabularResultItems(props.activeTab.results ?? (props.activeTab.result ? [props.activeTab.result] : undefined), { includeSourceDatabase: includeResultSourceDatabase.value, namingMode: resultTabNamingMode.value, preferComments: preferResultTabComments.value }),
 );
 const tabularResults = computed(() => tabularResultItems(props.activeTab.results, { includeSourceDatabase: includeResultSourceDatabase.value, namingMode: resultTabNamingMode.value, preferComments: preferResultTabComments.value }));
-const allResultExportSheets = computed(() =>
-  tabularResults.value.map((item) => ({
+const allResultExportSheets = computed(() => {
+  const tabId = props.activeTab.id;
+  return tabularResults.value.map((item) => ({
     sheetName: item.label || t("tabs.resultN", { n: item.n }),
     result: activeEffectiveDatabaseType.value === "neo4j" ? projectNeo4jNodeResult(item.result) : item.result,
     sql: item.index === props.activeTab.activeResultIndex ? queryResultExecutionSql(props.activeTab) : item.result.sourceStatement,
-  })),
-);
+    captureSourceValues: () => queryStore.captureResultLegacyValuesForExport(tabId, item.result),
+  }));
+});
 
 type ResultSetItem = (typeof visibleResultItems.value)[number];
 
@@ -701,7 +750,8 @@ async function exportSelectedResultSheets(items: ResultSetItem[]) {
   if (resultBatchBusy.value) return;
   const dataGrid = dataGridRef.value;
   if (!dataGrid) return;
-  const sheets = items.filter((item) => !item.result.execution_error && !item.result.server_message).map((item) => ({ sheetName: item.label || t("tabs.resultN", { n: item.n }), result: item.result }));
+  const tabId = props.activeTab.id;
+  const sheets = items.filter((item) => !item.result.execution_error && !item.result.server_message).map((item) => ({ sheetName: item.label || t("tabs.resultN", { n: item.n }), result: item.result, captureSourceValues: () => queryStore.captureResultLegacyValuesForExport(tabId, item.result) }));
   if (!sheets.length) return;
   resultBatchBusy.value = true;
   try {
@@ -764,6 +814,18 @@ async function fetchGridResultForExport(onProgress?: (info: { rowsExported: numb
   extractNeo4jNodeCells(result);
   extractGraphCells(result);
   return projectNeo4jNodeResult(result);
+}
+function captureGridResultForExport() {
+  const fetch = queryStore.captureTabResultForExport(props.activeTab.id);
+  const isNeo4j = activeEffectiveDatabaseType.value === "neo4j";
+  if (!fetch) return undefined;
+  return async (onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void, control?: ExportReadControl) => {
+    const result = await fetch(onProgress, control);
+    if (!result || !isNeo4j) return result;
+    extractNeo4jNodeCells(result);
+    extractGraphCells(result);
+    return projectNeo4jNodeResult(result);
+  };
 }
 async function loadQueryResultSourceDdl(): Promise<string | undefined> {
   if (props.activeTab.mode !== "query") return undefined;
@@ -1300,20 +1362,62 @@ watch(
   },
 );
 
+let executionCompletion: { tabId: string; sql: string; editor: typeof queryEditorRef.value; cancelCount: number; executionId?: string; revoked: boolean } | undefined;
+
+function revokeExecutionErrorFocus(event: Event) {
+  const detail = (event as CustomEvent<{ fromTabId?: string; tabId?: string }>).detail;
+  if (executionCompletion && (detail?.fromTabId === executionCompletion.tabId || (!detail?.fromTabId && detail?.tabId !== executionCompletion.tabId))) executionCompletion.revoked = true;
+}
+
+onUnmounted(() => {
+  executionCompletion = undefined;
+  window.removeEventListener("dbx:before-tab-switch", revokeExecutionErrorFocus);
+});
+
 watch(
-  () => props.activeTab.isExecuting,
-  (isExecuting, wasExecuting) => {
+  () => [props.activeTab.id, props.activeTab.isExecuting, props.activeTab.executionId, props.activeTab.cancelRequestCount ?? 0, props.activeTab.isCancelling] as const,
+  ([tabId, isExecuting, executionId, cancelCount, isCancelling], [previousTabId, wasExecuting]) => {
+    if (tabId !== previousTabId) {
+      executionCompletion = undefined;
+      return;
+    }
     if (isExecuting && !wasExecuting) {
-      queryEditorRef.value?.beginExecutionViewportTracking();
+      const editor = queryEditorRef.value;
+      executionCompletion = { tabId, sql: props.activeTab.sql, editor, cancelCount, executionId, revoked: false };
+      editor?.beginExecutionViewportTracking();
+    }
+    const completion = executionCompletion;
+    if (completion) {
+      if (isCancelling || cancelCount !== completion.cancelCount) completion.revoked = true;
+      if (isExecuting && executionId) completion.executionId = executionId;
     }
     if (!isExecuting && wasExecuting) {
+      const result = props.activeTab.result;
+      const error = result && isQueryExecutionErrorResult(result);
+      // Errors are only located for an execution tracked from its start; a plain
+      // success still restores the cursor for a completion observed mid-flight.
+      if (!completion && error) return;
       nextTick(() => {
         requestAnimationFrame(() => {
-          queryEditorRef.value?.scrollCursorIntoView();
+          if (props.activeTab.id !== tabId || props.activeTab.isExecuting) return;
+          if (completion) {
+            if (executionCompletion !== completion || queryEditorRef.value !== completion.editor) return;
+            executionCompletion = undefined;
+          } else if (executionCompletion) {
+            return;
+          }
+          if (error) {
+            if (!completion || completion.revoked || !completion.executionId || result.sourceExecutionId !== completion.executionId || props.activeTab.sql !== completion.sql || props.activeTab.result !== result) return;
+            const mapped = sqlErrorEditorOffset(activeResultErrorOffsetOptions());
+            if (mapped) completion.editor?.scrollCursorIntoView(mapped.offset);
+          } else {
+            (completion?.editor ?? queryEditorRef.value)?.scrollCursorIntoView();
+          }
         });
       });
     }
   },
+  { flush: "sync" },
 );
 
 // Table toolbox handlers
@@ -1684,6 +1788,7 @@ async function exportResultArchive() {
 }
 
 async function removeResultRun(runId: string) {
+  if (executionCompletion) executionCompletion.revoked = true;
   const removedActiveRun = props.activeTab.activeResultRunId === runId;
   const removed = await queryStore.removeResultRun(props.activeTab.id, runId);
   if (!removed) return;
@@ -2101,6 +2206,17 @@ defineExpose({
 
 <template>
   <div class="production-session-shell flex flex-col min-h-0" :class="[resultOnly ? 'h-full' : 'flex-1', { 'production-session-shell--active': activeProductionContext.active }]">
+    <OracleInvalidObjectsDialog
+      v-if="!resultOnly && triggerDiagnosticContext && triggerDiagnosticConnection"
+      :open="triggerDiagnosticOpen && triggerDiagnosticContext.originRevision === queryStore.oracleTriggerSourceState(triggerDiagnosticContext.originTabId)?.readVersion"
+      :connection="triggerDiagnosticConnection"
+      :database="triggerDiagnosticContext.target.database"
+      :schema="triggerDiagnosticContext.target.owner"
+      :trigger-context="triggerDiagnosticContext"
+      @update:open="triggerDiagnosticOpen = $event"
+      @open-source="returnFromTriggerSourceDiagnostics"
+      @trigger-result="acceptTriggerSourceDiagnosticResult"
+    />
     <div v-if="activeProductionContext.active" class="production-session-strip flex h-7 shrink-0 items-center gap-2 border-b border-red-500/35 bg-red-500/10 px-3 text-xs font-semibold text-red-800 shadow-[inset_0_1px_0_rgb(239_68_68_/_0.28)] dark:text-red-200">
       <ShieldAlert class="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
       <span class="font-mono uppercase tracking-normal">{{ t("production.title") }}</span>
@@ -2131,11 +2247,27 @@ defineExpose({
             </div>
             <ProductionWatermark v-if="activeProductionContext.active" />
             <ObjectDependenciesPanel :target="activeObjectDependencyTarget" :section="activeObjectSection" @update:section="setObjectSection" @view-sql="viewObjectDependencySql" @open-object="(context, target) => emit('openDependencyObject', context, target)">
+              <OracleTriggerStatus
+                v-if="queryStore.oracleTriggerSourceState(activeTab.id)"
+                :snapshot="queryStore.oracleTriggerSourceState(activeTab.id)?.baseline"
+                :result="queryStore.oracleTriggerSourceState(activeTab.id)?.result"
+                :source-issue="queryStore.oracleTriggerSourceState(activeTab.id)?.error"
+                :busy="queryStore.oracleTriggerSourceState(activeTab.id)?.busy"
+                @action="queryStore.runOracleTriggerSourceAction(activeTab.id, $event)"
+                @refresh="queryStore.refreshObjectSourceTab(activeTab.id)"
+                @parent="openTriggerSourceParent"
+                @diagnostics="openTriggerSourceDiagnostics"
+              />
               <!-- issue #9035：源码 tab 先出现再加载。pending 期间不挂载编辑器
                  （还没有内容可编辑，也省下一次 Monaco 初始化），失败则就地重试。
                  issue #9387：DDL 新标签同样先出 tab 再加载，失败就地显示错误。 -->
-              <QueryLoadingState v-if="activeTab.sourceLoad && !activeTab.sourceLoad.error" class="relative z-0 flex-1" :elapsed-seconds="sourceLoadElapsedSeconds" />
-              <div v-else-if="activeTab.sourceLoad?.error" class="relative z-0 flex flex-1 min-h-0 flex-col items-center justify-center gap-3 px-6 text-sm" data-object-source-load-error>
+              <div v-if="retainTriggerSourceEditor && activeTab.sourceLoad" class="flex shrink-0 items-center gap-2 px-3 py-2 text-sm" data-object-source-refresh-state>
+                <Loader2 v-if="!activeTab.sourceLoad.error" class="h-4 w-4 animate-spin" />
+                <p v-if="activeTab.sourceLoad.error" class="min-w-0 flex-1 break-words text-destructive">{{ activeTab.sourceLoad.error }}</p>
+                <Button v-if="activeTab.sourceLoad.error" variant="outline" size="sm" @click="queryStore.retryObjectSourceTab(activeTab.id)">{{ t("common.retry") }}</Button>
+              </div>
+              <QueryLoadingState v-if="activeTab.sourceLoad && !activeTab.sourceLoad.error && !retainTriggerSourceEditor" class="relative z-0 flex-1" :elapsed-seconds="sourceLoadElapsedSeconds" />
+              <div v-else-if="activeTab.sourceLoad?.error && !retainTriggerSourceEditor" class="relative z-0 flex flex-1 min-h-0 flex-col items-center justify-center gap-3 px-6 text-sm" data-object-source-load-error>
                 <p class="max-w-[80%] text-center break-words text-destructive">{{ activeTab.sourceLoad.error }}</p>
                 <Button variant="outline" size="sm" class="gap-1.5" @click="queryStore.retryObjectSourceTab(activeTab.id)">
                   <RotateCcw class="h-4 w-4" />
@@ -2929,6 +3061,8 @@ defineExpose({
                 :page-jump-progress="activeTab.resultPageJumpProgress"
                 :on-execute-sql="async (sql: string) => emit('executeSql', activeTab.id, sql)"
                 :full-export-result="fetchGridResultForExport"
+                :capture-full-export-result="captureGridResultForExport"
+                :capture-query-result-export-request="hasNeo4jNodes ? undefined : (queued: boolean) => queryStore.captureQueryResultExportRequest(activeTab.id, queued)"
                 :transfer-query-result="openQueryResultTransfer"
                 :query-result-export-request="
                   hasNeo4jNodes
@@ -3436,7 +3570,7 @@ defineExpose({
           :page-sql="activeTab.resultPageSql || activeTab.sql"
           :loading="activeTab.isExecuting"
           :busy-started-at="activeTab.isExecuting ? activeTab.queryExecutionStartedAt : undefined"
-          :editable="!activeTab.tableMetaPending && (isTableDataEditable(activeEffectiveDatabaseType, activeTableMeta?.primaryKeys ?? [], activeTableMeta?.tableType) || !!influxDbV1DeleteSaveHandler)"
+          :editable="!activeTab.tableMetaPending && (isTableDataEditable(activeEffectiveDatabaseType, activeDataTabTableMeta?.primaryKeys ?? [], activeDataTabTableMeta?.tableType) || !!influxDbV1DeleteSaveHandler)"
           :custom-save-handler="influxDbV1DeleteSaveHandler"
           :tab-id="activeTab.id"
           context="table-data"
@@ -3458,6 +3592,7 @@ defineExpose({
           :total-row-count-loading="activeTab.resultTotalRowCountLoading"
           :on-execute-sql="async (sql: string) => emit('executeSql', activeTab.id, sql)"
           :full-export-result="(onProgress?: (info: { rowsExported: number; totalRows: number | null }) => void) => queryStore.fetchTabResultForExport(activeTab.id, onProgress)"
+          :capture-full-export-result="() => queryStore.captureTabResultForExport(activeTab.id)"
           :export-file-base-name="activeTab.title"
           :show-cancel="shouldShowCancelAction(activeTab)"
           :cancelling="activeTab.isCancelling"
@@ -3743,8 +3878,8 @@ defineExpose({
               if (activeTab.objectPropertiesRequest?.requestId === id) activeTab.objectPropertiesRequest = undefined;
             }
           "
-          @open-dependency-object="(context, target) => emit('openDependencyObject', context, target)"
           @open-table="emit('openObjectTable', activeTab.id, $event)"
+          @open-dependency-object="(context, target) => emit('openDependencyObject', context, target)"
           @locate-table="onLocateObjectTable"
           @schema-change="emit('objectSchemaChange', activeTab.id, $event)"
           @viewport-change="emit('objectBrowserViewportChange', activeTab.id, $event)"
@@ -3766,14 +3901,15 @@ defineExpose({
           :catalog="activeTab.catalog"
           :schema="activeTab.schema"
           :table-name="activeTab.structureTableName || ''"
+          :origin-tab-id="activeTab.id"
           :table-type="activeTab.structureTableType"
           :exact-identity="activeTab.structureExactIdentity"
           :initial-tab="activeTab.structureInitialTab"
           :initial-tab-request-id="activeTab.structureInitialTabRequestId"
           :initial-target="activeTab.structureInitialTarget"
           :draft="activeTab.structureDraft"
-          @update:draft="(draft) => (activeTab.structureDraft = draft)"
-          @saved="(commentChanged, createdTableName) => emit('structureEditorSaved', activeTab.id, commentChanged, createdTableName)"
+          @update:draft="updateStructureDraft"
+          @saved="(commentChanged, createdTableName, originTabId) => emit('structureEditorSaved', originTabId || activeTab.id, commentChanged, createdTableName)"
           @close="emit('structureEditorClose', activeTab.id)"
           @open-settings="(initialTab, initialSection) => emit('openSettings', initialTab, initialSection)"
           @view-data="onHandleStructureViewData"
@@ -3834,7 +3970,10 @@ defineExpose({
     </template>
 
     <template v-else-if="activeTab.mode === 'dameng-jobs' && activeConnection">
-      <DamengJobAdmin :key="activeTab.id" :connection="activeConnection" />
+      <DamengJobAdmin :key="activeTab.id" :connection="activeConnection" :initial-selection="activeTab.nativeJobAdmin" />
+    </template>
+    <template v-else-if="activeTab.mode === 'database-jobs' && activeConnection">
+      <DatabaseJobAdmin :key="activeTab.id" :connection="activeConnection" :initial-selection="activeTab.nativeJobAdmin" />
     </template>
 
     <template v-else-if="activeTab.mode === 'dameng-users' && activeConnection">

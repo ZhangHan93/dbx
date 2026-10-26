@@ -409,6 +409,7 @@ fn import_request(
                 source_column: column.clone(),
                 target_column: column,
                 target_data_type: None,
+                generator: None,
             })
             .collect(),
         mode: TableImportMode::Append,

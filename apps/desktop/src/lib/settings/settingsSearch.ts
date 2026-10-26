@@ -157,6 +157,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "editor-line-numbers", category: "editor", titleKey: "settings.showLineNumbers", descriptionKey: "settings.showLineNumbersDescription", targetId: "editor" },
   { id: "editor-statement-frame", category: "editor", titleKey: "settings.showCurrentStatementFrame", descriptionKey: "settings.showCurrentStatementFrameDescription", targetId: "editor" },
   { id: "editor-value-hints", category: "editor", titleKey: "settings.showInsertValueHints", descriptionKey: "settings.showInsertValueHintsDescription", targetId: "editor" },
+  { id: "editor-connection-group-path", category: "editor", titleKey: "settings.showConnectionGroupPath", descriptionKey: "settings.showConnectionGroupPathDescription", targetId: "editor" },
   { id: "editor-show-whitespace", category: "editor", titleKey: "settings.showWhitespace", descriptionKey: "settings.showWhitespaceDescription", targetId: "editor" },
   { id: "editor-word-wrap", category: "editor", titleKey: "settings.wordWrap", descriptionKey: "settings.wordWrapDescription", targetId: "editor" },
   { id: "editor-vim", category: "editor", titleKey: "settings.vimMode", descriptionKey: "settings.vimModeDescription", targetId: "editor" },
@@ -361,6 +362,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   },
   { id: "navigation-reuse-data-tab", category: "navigation", titleKey: "settings.reuseDataTab", descriptionKey: "settings.reuseDataTabDescription", targetId: "navigation" },
   { id: "navigation-open-data-tabs-next-to-active", category: "navigation", titleKey: "settings.openDataTabsNextToActive", descriptionKey: "settings.openDataTabsNextToActiveDescription", targetId: "navigation" },
+  { id: "navigation-open-tables-in-detached-window", category: "navigation", titleKey: "settings.openTablesInDetachedWindow", descriptionKey: "settings.openTablesInDetachedWindowDescription", targetId: "navigation" },
   { id: "navigation-object-display", category: "navigation", titleKey: "settings.sidebarObjectDisplay", targetId: "navigation" },
   {
     id: "navigation-object-info",

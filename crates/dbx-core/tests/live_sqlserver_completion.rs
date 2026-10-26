@@ -114,6 +114,7 @@ fn live_sqlserver_import_mapping(source: &str, target: &str) -> TableImportColum
         source_column: source.to_string(),
         target_column: target.to_string(),
         target_data_type: None,
+        generator: None,
     }
 }
 

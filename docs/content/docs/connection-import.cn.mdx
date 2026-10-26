@@ -1,6 +1,6 @@
 ---
 title: 连接导入
-description: 从 Navicat、DBeaver 和 DataGrip 导入连接、分组和可识别的数据库类型。
+description: 从 Navicat、DBeaver、DataGrip 和 RedisDesktopManager 导入连接与分组。
 ---
 
 DBX 可以从其他数据库工具导入连接，在切换工具时无需手动重新创建大量连接。
@@ -12,6 +12,7 @@ DBX 可以从其他数据库工具导入连接，在切换工具时无需手动�
 | Navicat | `.ncx` 导出文件 | 主机、端口、用户名、数据库类型、连接名称 |
 | DBeaver | 连接配置文件    | 主机、端口、用户名、数据库类型、连接名称 |
 | DataGrip | `dataSources.xml` 等项目/全局配置 | JDBC URL、驱动、连接名称、分组和可读取凭据 |
+| RedisDesktopManager | JSON 导出文件 | Redis 连接、嵌套分组、认证、TLS 和 SSH 配置 |
 
 <Callout type="info">导入的连接保留原始连接名称和类型。其他工具以加密格式存储的密码无法解密——导入后需要重新输入密码。</Callout>
 
@@ -101,6 +102,14 @@ DBX 可以从其他数据库工具导入连接，在切换工具时无需手动�
 
   </Step>
 </Steps>
+
+## 导入 RedisDesktopManager 连接
+
+从 RedisDesktopManager 导出 JSON，在侧边栏或欢迎页的导入菜单选择 **导入 RedisDesktopManager**。检查连接选择预览，再选择需要迁移的连接并确认导入。连接和嵌套分组会一起迁移，原有连接不会被覆盖。
+
+支持普通 Redis 连接的主机、端口、ACL 用户名、`auth` 密码、键分隔符和过滤模式，以及 SSH 密码、私钥或 agent 配置。连接和执行超时会从毫秒转换为秒。
+
+TLS 的 CA、客户端证书和私钥路径会保留，但不会读取或复制文件，跨机器迁移后需要检查路径。不会继承 RDM 的忽略证书错误设置。导出文件可能含有明文密码，请妥善保管；导入不会自动连接数据库。
 
 ## 导入后
 

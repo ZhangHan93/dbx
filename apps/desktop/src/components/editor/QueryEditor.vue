@@ -3034,7 +3034,15 @@ function openReplace(): boolean {
   return searchPanelRef.value?.openReplace() ?? false;
 }
 
-function scrollCursorIntoView() {
+let executionDocument: import("@codemirror/state").Text | undefined;
+
+function scrollCursorIntoView(errorOffset?: number) {
+  if (errorOffset !== undefined) {
+    const canLocate = executionViewportOwnership.consumeErrorCompletion();
+    if (canLocate && editorIsActive && view.value?.state.doc === executionDocument) focusErrorPosition(errorOffset);
+    executionDocument = undefined;
+    return;
+  }
   const preserveViewport = executionViewportOwnership.consumeCompletionPreservation();
   const currentView = view.value;
   if (!currentView || !codeMirrorRuntime.editorViewModule || !editorIsActive || preserveViewport) return;
@@ -3057,6 +3065,7 @@ function beginExecutionViewportTracking() {
   // visible before execution must not be scrolled away by the shrink (#10480).
   const currentView = view.value;
   const cursorVisible = currentView ? isQueryEditorPositionVisible(currentView.state.selection.main.head, currentView.visibleRanges, currentView.viewport) : false;
+  executionDocument = currentView?.state.doc;
   executionViewportOwnership.beginExecution(cursorVisible);
 }
 
@@ -3140,6 +3149,8 @@ defineExpose({
     :data-large-document-mode="largeDocumentMode || undefined"
     @wheel="recordExecutionViewportInteraction"
     @pointerdown="recordExecutionViewportInteraction"
+    @keydown.capture="recordExecutionViewportInteraction"
+    @focusout="recordExecutionViewportInteraction"
     @gesturestart="onEditorGestureStart"
     @gesturechange="onEditorGestureChange"
     @gestureend="onEditorGestureEnd"

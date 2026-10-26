@@ -4,10 +4,11 @@ import { isTerminalTransferProgress } from "@/lib/backend/transferProgress";
 import { uuid } from "@/lib/common/utils";
 import { formatQueryDuration } from "@/lib/format/duration";
 import { autoRevealExportedPathIfConfigured } from "@/lib/export/exportPath";
+import { releaseManualExport, submitManualExport, type ManualExportMode } from "@/lib/export/manualExportQueue";
 import { acceptOraclePackageTransferApproval, acceptOraclePackageTransferPreflight, acceptOracleRoutineDeploymentOperation, type OracleRoutineDeployment } from "@/lib/schema/oracleRoutineDeploy";
 
 export type BackgroundTaskKind = "table-export" | "database-export" | "data-dictionary" | "sql-file" | "data-transfer" | "data-generation" | "multi-db-execution" | "schema-diff" | "data-compare";
-export type BackgroundTaskStatus = "Running" | "Writing" | "Cancelling" | "Done" | "Error" | "Cancelled";
+export type BackgroundTaskStatus = "Queued" | "Unknown" | "Running" | "Writing" | "Cancelling" | "Done" | "Error" | "Cancelled";
 export type DatabaseExportSource = "manual" | "scheduled";
 
 export interface DataTransferFailure {
@@ -401,9 +402,42 @@ function findActiveOverlappingTransfer(request: api.TransferRequest): string[] {
 export function useExportTracker() {
   const tasks = computed(() => Array.from(taskMap.values()));
 
-  const activeCount = computed(() => tasks.value.filter((t) => t.status === "Running" || t.status === "Writing" || t.status === "Cancelling").length);
+  const activeCount = computed(() => tasks.value.filter((t) => t.status === "Queued" || t.status === "Unknown" || t.status === "Running" || t.status === "Writing" || t.status === "Cancelling").length);
 
   const hasActive = computed(() => activeCount.value > 0);
+
+  function submitExportTask(task: ExportTask, mode: ManualExportMode, run: () => Promise<"settled" | "unknown">, onStateChange?: (task: ExportTask) => void) {
+    let handle: ReturnType<typeof submitManualExport>;
+    const cancelQueued = () => {
+      handle.cancelQueued();
+    };
+    handle = submitManualExport({
+      id: task.exportId,
+      mode,
+      run,
+      onStateChange(state, error) {
+        if (state === "queued") {
+          task.status = "Queued";
+          task.startedAt = undefined;
+          taskCancelHandlers.set(task.exportId, cancelQueued);
+        } else if (state === "running") {
+          if (taskCancelHandlers.get(task.exportId) === cancelQueued) taskCancelHandlers.delete(task.exportId);
+          task.status = "Running";
+          task.startedAt = Date.now();
+        } else if (state === "cancelled") {
+          task.status = "Cancelled";
+          task.finishedAt = Date.now();
+          taskCancelHandlers.delete(task.exportId);
+        } else if (state === "unknown") {
+          task.status = "Unknown";
+          task.finishedAt = undefined;
+          if (error !== undefined) task.errorMessage = error instanceof Error ? error.message : String(error);
+        }
+        onStateChange?.(task);
+      },
+    });
+    return handle;
+  }
 
   function addTask(tableName: string, format: string, filePath: string, exportId?: string): ExportTask {
     const id = exportId ?? uuid();
@@ -847,6 +881,7 @@ export function useExportTracker() {
 
   function removeTask(exportId: string) {
     const task = taskMap.get(exportId);
+    if (task?.status === "Unknown") releaseManualExport(exportId);
     if (task && (task.status === "Done" || task.status === "Error" || task.status === "Cancelled")) cleanupFinishedTask(task);
     taskMap.delete(exportId);
     taskCancelHandlers.delete(exportId);
@@ -877,6 +912,7 @@ export function useExportTracker() {
   async function cancelTask(exportId: string) {
     const task = taskMap.get(exportId);
     if (task?.canCancel === false) return;
+    if (task && (task.kind === "table-export" || task.kind === "database-export") && (task.status === "Done" || task.status === "Error" || task.status === "Cancelled" || task.status === "Unknown" || task.status === "Cancelling")) return;
     try {
       const customHandler = taskCancelHandlers.get(exportId);
       if (customHandler) {
@@ -900,6 +936,7 @@ export function useExportTracker() {
     tasks,
     activeCount,
     hasActive,
+    submitExportTask,
     addTask,
     addDatabaseExportTask,
     addDataDictionaryTask,

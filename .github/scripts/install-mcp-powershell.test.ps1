@@ -134,6 +134,13 @@ try {
     Remove-McpReplacementTempFiles (Join-Path $testRoot 'missing')
     $script:count++
     Write-Output 'PASS cleanup preserves active binary, marker, unrelated files and directories'
+    $readonlyPath = Join-Path $installDir 'dbx-mcp.exe~RF8c73e4f.TMP'
+    [IO.File]::WriteAllText($readonlyPath, 'readonly leftover')
+    [IO.File]::SetAttributes($readonlyPath, [IO.FileAttributes]::ReadOnly)
+    Remove-McpReplacementTempFiles $installDir
+    Assert-True (!(Test-Path -LiteralPath $readonlyPath)) 'Cleanup kept a read-only replacement temp file'
+    $script:count++
+    Write-Output 'PASS cleanup removes read-only replacement temp files'
     $linkTarget = Join-Path $testRoot 'linked-target'
     [IO.Directory]::CreateDirectory($linkTarget) | Out-Null
     $targetFile = Join-Path $linkTarget 'dbx-mcp.exe~RF789.TMP'

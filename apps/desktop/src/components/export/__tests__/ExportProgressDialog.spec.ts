@@ -106,3 +106,32 @@ describe("ExportProgressDialog query timeout action", () => {
     expect(document.body.textContent).not.toContain("Change query timeout");
   });
 });
+
+describe("ExportProgressDialog queued states", () => {
+  it("lets the user cancel or minimize a waiting export without showing active progress", async () => {
+    i18n.global.locale.value = "en";
+    const onCancel = vi.fn();
+    const onMinimize = vi.fn();
+    await mountDialog({ ...baseProps, status: "Queued", startedAt: undefined, canMinimize: true, onCancel, onMinimize });
+    expect(document.body.textContent).toContain("Queued");
+    expect(document.body.textContent).not.toContain("Elapsed:");
+    expect(document.body.querySelector(".export-progress-indeterminate")).toBeNull();
+    const buttons = [...document.body.querySelectorAll("button")];
+    buttons.find((button) => button.textContent?.trim() === "Cancel")?.click();
+    buttons.find((button) => button.textContent?.trim() === i18n.global.t("exportProgress.minimize"))?.click();
+    expect(onCancel).toHaveBeenCalledOnce();
+    expect(onMinimize).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an unknown export distinct from completion and allows closing its view", async () => {
+    i18n.global.locale.value = "en";
+    const onOpenChange = vi.fn();
+    await mountDialog({ ...baseProps, status: "Unknown", "onUpdate:open": onOpenChange });
+    expect(document.body.textContent).toContain("Export status unknown; the queue is blocked");
+    expect(document.body.textContent).not.toContain("Export completed!");
+    const close = [...document.body.querySelectorAll("button")].find((button) => button.textContent?.trim() === "Close");
+    expect(close).toBeTruthy();
+    close?.click();
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+});

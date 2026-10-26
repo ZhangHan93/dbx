@@ -50,6 +50,9 @@ function Remove-McpReplacementTempFiles([string]$Directory) {
             $_.Name -imatch '\Adbx-mcp\.exe~RF[0-9a-f]+\.TMP\z'
         } | ForEach-Object {
             # A running MCP process may still hold the old executable; retry on the next run.
+            # A READONLY attribute makes [IO.File]::Delete throw, so one read-only
+            # leftover would otherwise survive every install; clear it first.
+            try { $_.Attributes = $_.Attributes -band (-bnot [IO.FileAttributes]::ReadOnly) } catch {}
             try { [IO.File]::Delete($_.FullName) } catch {}
         }
     } catch {}

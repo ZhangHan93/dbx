@@ -128,6 +128,43 @@ describe("QueryEditor hover resolution", () => {
     expect(loadDdl).toHaveBeenCalledWith(expect.objectContaining({ schema: "archive" }));
   });
 
+  it.each([
+    ["starrocks", "fallback"],
+    ["mysql", "fallback"],
+    ["starrocks", "always"],
+  ] as const)("loads %s DDL for a qualified table in another database than the selected tab database (%s mode)", async (type, mode) => {
+    // Issue #13243: database b right-clicked while tab database a is selected must
+    // fetch b's metadata and DDL instead of silently falling back to a.
+    const modelValue = "SELECT * FROM b.orders";
+    const { store, settings, metadata, resolve, createHoverDom } = createHarness({ databaseType: type, dialect: "mysql", database: "a", schema: undefined, modelValue });
+    settings.editorSettings.tableHoverLookupMode = mode;
+    store.lookupLocalCompletionTables.mockReturnValue([{ name: "orders", database: "b" }]);
+    store.listCompletionTables.mockResolvedValue([{ name: "orders", database: "b" }]);
+    const tooltip = await resolve(modelValue.indexOf("b.orders") + 2);
+    expect(tooltip, "tooltip").not.toBeNull();
+    tooltip!.create();
+    // The hovered database b is pulled with no schema filter; tab database a never leaks in.
+    expect(store.listCompletionTables.mock.calls.every((call) => call[1] === "b" && call[6] === undefined)).toBe(true);
+    expect(loadDdl).toHaveBeenCalledWith(expect.objectContaining({ database: "b", schema: "", tableName: "orders" }));
+    expect(metadata.cachedTables).toEqual([{ name: "orders", database: "b" }]);
+    expect(createHoverDom).toHaveBeenCalledWith("orders", expect.any(String), expect.any(String), undefined);
+  });
+
+  it("resolves cross-database column metadata through the qualified database as source", async () => {
+    const sql = "SELECT o.total FROM b.orders o";
+    const { store, metadata, resolve, createHoverDom } = createHarness({ databaseType: "starrocks", dialect: "mysql", database: "a", schema: undefined, modelValue: sql }, true);
+    store.listCompletionTables.mockResolvedValue([{ name: "orders", database: "b" }]);
+    store.listCompletionColumns.mockResolvedValue([{ name: "total", table: "orders", database: "b", dataType: "decimal" }]);
+    const tooltip = await resolve(9);
+    expect(tooltip, JSON.stringify(store.listCompletionTables.mock.calls.map((c) => [c[1], c[4]]))).not.toBeNull();
+    tooltip!.create();
+    // Column metadata must resolve against the qualified database b, not the tab database a.
+    expect(store.listCompletionColumns).toHaveBeenCalledWith("connection", "b", "orders", undefined, expect.objectContaining({ tableQuoted: false }), undefined);
+    expect(store.listCompletionColumns.mock.calls.some((call) => call[1] === "a")).toBe(false);
+    expect(metadata.cachedColumnsByTable.get("b.orders")).toHaveLength(1);
+    expect(createHoverDom).toHaveBeenCalledWith("total", "decimal", undefined, ["orders"]);
+  });
+
   it("falls back to column metadata when DDL loading fails", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     loadDdl.mockRejectedValue(new Error("DDL unavailable"));

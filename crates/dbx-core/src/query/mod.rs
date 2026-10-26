@@ -2762,7 +2762,7 @@ fn external_driver_preview_fallback_sql(sql: &str) -> Option<String> {
     Some(format!("{}{}{}", &sql[..select_end], rewritten_projection, &sql[from_start..]))
 }
 
-fn is_external_driver_method_unsupported(error: &str, method: &str) -> bool {
+pub(crate) fn is_external_driver_method_unsupported(error: &str, method: &str) -> bool {
     let normalized = error.to_ascii_lowercase();
     let method = method.to_ascii_lowercase();
     normalized.contains(&method)
@@ -3237,6 +3237,82 @@ pub struct LargeValueRequest {
     pub download_encoding: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LargeValueCompletion {
+    Failed,
+    Cancelled,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct LargeValueOperationError {
+    pub status: LargeValueCompletion,
+    pub message: String,
+}
+
+impl std::fmt::Display for LargeValueOperationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LargeValueOperationError {}
+
+impl From<String> for LargeValueOperationError {
+    fn from(message: String) -> Self {
+        Self { status: LargeValueCompletion::Failed, message }
+    }
+}
+
+impl From<&str> for LargeValueOperationError {
+    fn from(message: &str) -> Self {
+        message.to_string().into()
+    }
+}
+
+impl LargeValueOperationError {
+    fn cancelled() -> Self {
+        Self { status: LargeValueCompletion::Cancelled, message: canceled_error() }
+    }
+
+    fn unknown(message: String) -> Self {
+        Self { status: LargeValueCompletion::Unknown, message }
+    }
+
+    fn from_agent(error: AgentCallError) -> Self {
+        use crate::db::agent_driver::AgentErrorCategory;
+        let status = match &error {
+            AgentCallError::Structured { context, .. } if context.category == AgentErrorCategory::Canceled => {
+                LargeValueCompletion::Cancelled
+            }
+            AgentCallError::Structured { .. } | AgentCallError::Legacy { .. } => LargeValueCompletion::Failed,
+            _ => LargeValueCompletion::Unknown,
+        };
+        Self { status, message: error.into_legacy_string() }
+    }
+}
+
+async fn wait_for_large_value_resource<T>(
+    cancel: Option<CancellationToken>,
+    timeout: Option<Duration>,
+    future: impl std::future::Future<Output = T>,
+    report_completion: bool,
+) -> Result<T, LargeValueOperationError> {
+    if !report_completion {
+        return wait_for_value_opt(cancel, timeout, future).await.map_err(Into::into);
+    }
+    if let Some(token) = cancel {
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err(LargeValueOperationError::cancelled()),
+            value = wait_for_value_opt(None, timeout, future) => value.map_err(Into::into),
+        }
+    } else {
+        wait_for_value_opt(None, timeout, future).await.map_err(Into::into)
+    }
+}
+
 /// Fetches only the original captured locator; never retries by selecting the current row.
 pub async fn request_large_value(
     state: &AppState,
@@ -3266,53 +3342,126 @@ async fn request_large_value_with_cancel(
     release: bool,
     cancel_token: Option<CancellationToken>,
 ) -> Result<serde_json::Value, String> {
+    request_large_value_internal(state, request, release, cancel_token, false).await.map_err(|error| error.message)
+}
+
+pub async fn request_large_value_reported(
+    state: &AppState,
+    request: LargeValueRequest,
+) -> Result<serde_json::Value, LargeValueOperationError> {
+    let registered = request.execution_id.as_ref().map(|id| {
+        state.running_queries.register_task(
+            id.clone(),
+            crate::query_cancel::RunningTaskMetadata::query(
+                request.connection_id.clone(),
+                request.database.clone(),
+                request.client_session_id.clone(),
+            ),
+        )
+    });
+    let cancel = registered.as_ref().map(|task| task.token());
+    request_large_value_internal(state, request, false, cancel, true).await
+}
+
+async fn request_large_value_internal(
+    state: &AppState,
+    request: LargeValueRequest,
+    release: bool,
+    cancel_token: Option<CancellationToken>,
+    report_completion: bool,
+) -> Result<serde_json::Value, LargeValueOperationError> {
     if request.value_ref.len() > 128 || (!release && (request.limit == 0 || request.limit > 4096)) {
-        return Err("Invalid LOB chunk request".to_string());
+        return Err("Invalid LOB chunk request".into());
     }
     let method = if release { "release_large_value" } else { "read_large_value_chunk" };
     let params = serde_json::json!({ "valueRef": request.value_ref, "offset": request.offset, "limit": request.limit });
     let timeout = Some(std::time::Duration::from_secs(30));
     if let Some(txn_id) = request.txn_session_id.as_deref() {
         let connection = {
-            let mut sessions =
-                wait_for_value_opt(cancel_token.clone(), timeout, state.transaction_sessions.write()).await?;
+            let mut sessions = wait_for_large_value_resource(
+                cancel_token.clone(),
+                timeout,
+                state.transaction_sessions.write(),
+                report_completion,
+            )
+            .await?;
             let session = sessions.get_mut(txn_id).ok_or(MANUAL_TRANSACTION_SESSION_NOT_FOUND_ERROR)?;
             if session.connection_id != request.connection_id
                 || session.busy
                 || session.last_activity.elapsed() >= session.idle_timeout
             {
-                return Err("LOB transaction context expired or busy".to_string());
+                return Err("LOB transaction context expired or busy".into());
             }
             session.last_activity = std::time::Instant::now();
             Arc::clone(&session.connection)
         };
-        let connection = wait_for_value_opt(cancel_token.clone(), timeout, connection.lock()).await?;
+        let connection =
+            wait_for_large_value_resource(cancel_token.clone(), timeout, connection.lock(), report_completion).await?;
         let result = match &*connection {
             TxnConnection::Agent { client, .. } => {
-                wait_for_value_opt(cancel_token.clone(), timeout, client.lock())
-                    .await?
-                    .call_with_timeout_and_cancel(method, params, timeout, cancel_token.clone())
-                    .await
+                let mut client =
+                    wait_for_large_value_resource(cancel_token.clone(), timeout, client.lock(), report_completion)
+                        .await?;
+                if report_completion {
+                    if is_canceled(&cancel_token) {
+                        return Err(LargeValueOperationError::cancelled());
+                    }
+                    client
+                        .call_typed_with_timeout_and_cancel(method, params, timeout, None)
+                        .await
+                        .map_err(LargeValueOperationError::from_agent)
+                } else {
+                    client
+                        .call_with_timeout_and_cancel(method, params, timeout, cancel_token.clone())
+                        .await
+                        .map_err(Into::into)
+                }
             }
             TxnConnection::ExternalDriver { session, config, .. } => {
                 let mut params = params;
                 params["connection"] = serde_json::json!(config.as_ref());
-                wait_for_value_opt(
-                    cancel_token.clone(),
-                    timeout,
-                    session.invoke_with_timeout::<serde_json::Value>(method, params, timeout),
-                )
-                .await?
+                if report_completion {
+                    if is_canceled(&cancel_token) {
+                        return Err(LargeValueOperationError::cancelled());
+                    }
+                    session
+                        .invoke_with_timeout::<serde_json::Value>(method, params, timeout)
+                        .await
+                        .map_err(LargeValueOperationError::unknown)
+                } else {
+                    wait_for_value_opt(
+                        cancel_token.clone(),
+                        timeout,
+                        session.invoke_with_timeout::<serde_json::Value>(method, params, timeout),
+                    )
+                    .await?
+                    .map_err(Into::into)
+                }
             }
-            _ => return Err("LOB snapshot chunks require a supported transaction".to_string()),
+            _ => return Err("LOB snapshot chunks require a supported transaction".into()),
         };
+        if report_completion {
+            // An unconfirmed RPC must not become a settled local error after a
+            // concurrent transaction removal or cancellation.
+            let value = result?;
+            if is_canceled(&cancel_token) {
+                return Err(LargeValueOperationError::cancelled());
+            }
+            if !wait_for_large_value_resource(cancel_token, timeout, state.transaction_sessions.read(), true)
+                .await?
+                .contains_key(txn_id)
+            {
+                return Err("LOB transaction context expired".into());
+            }
+            return Ok(value);
+        }
         if !wait_for_value_opt(cancel_token, timeout, state.transaction_sessions.read()).await?.contains_key(txn_id) {
-            return Err("LOB transaction context expired".to_string());
+            return Err("LOB transaction context expired".into());
         }
         return result;
     }
     let pool_database = query_pool_database(&request.database, request.catalog.as_deref());
-    let (pool_key, handle) = wait_for_value_opt(
+    let (pool_key, handle) = wait_for_large_value_resource(
         cancel_token.clone(),
         timeout,
         state.existing_workload_pool_for_session(
@@ -3320,26 +3469,57 @@ async fn request_large_value_with_cancel(
             pool_database,
             request.client_session_id.as_deref(),
         ),
+        report_completion,
     )
     .await?
     .ok_or_else(|| "LOB context has expired; rerun the query".to_string())?;
     let _activity = state.pool_activity_touch(pool_key.as_str());
     match handle {
         PoolKind::Agent(client) => {
-            let mut client = wait_for_value_opt(cancel_token.clone(), timeout, client.lock()).await?;
-            client.call_with_timeout_and_cancel(method, params, timeout, cancel_token).await
+            let mut client =
+                wait_for_large_value_resource(cancel_token.clone(), timeout, client.lock(), report_completion).await?;
+            if report_completion {
+                if is_canceled(&cancel_token) {
+                    return Err(LargeValueOperationError::cancelled());
+                }
+                let value = client
+                    .call_typed_with_timeout_and_cancel(method, params, timeout, None)
+                    .await
+                    .map_err(LargeValueOperationError::from_agent)?;
+                if is_canceled(&cancel_token) {
+                    return Err(LargeValueOperationError::cancelled());
+                }
+                Ok(value)
+            } else {
+                client.call_with_timeout_and_cancel(method, params, timeout, cancel_token).await.map_err(Into::into)
+            }
         }
         PoolKind::ExternalDriver { session, config, .. } => {
             let mut params = params;
             params["connection"] = serde_json::json!(config.as_ref());
-            wait_for_value_opt(
-                cancel_token,
-                timeout,
-                session.invoke_with_timeout::<serde_json::Value>(method, params, timeout),
-            )
-            .await?
+            if report_completion {
+                if is_canceled(&cancel_token) {
+                    return Err(LargeValueOperationError::cancelled());
+                }
+                let value = session
+                    .invoke_with_timeout::<serde_json::Value>(method, params, timeout)
+                    .await
+                    .map_err(LargeValueOperationError::unknown)?;
+                if is_canceled(&cancel_token) {
+                    return Err(LargeValueOperationError::cancelled());
+                }
+                Ok(value)
+            } else {
+                wait_for_value_opt(
+                    cancel_token,
+                    timeout,
+                    session.invoke_with_timeout::<serde_json::Value>(method, params, timeout),
+                )
+                .await?
+                .map_err(Into::into)
+            }
         }
-        _ => Err("LOB snapshot chunks require a supported connection".to_string()),
+        _ => Err("LOB snapshot chunks require a supported connection".into()),
     }
 }
 

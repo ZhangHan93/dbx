@@ -763,6 +763,7 @@ const editLocateCursorOnGutterExecute = ref(settingsStore.editorSettings.locateC
 const editShowLineNumbers = ref(settingsStore.editorSettings.showLineNumbers);
 const editShowCurrentStatementFrame = ref(settingsStore.editorSettings.showCurrentStatementFrame);
 const editShowInsertValueHints = ref(settingsStore.editorSettings.showInsertValueHints);
+const editShowConnectionGroupPath = ref(settingsStore.editorSettings.showConnectionGroupPath);
 const editAutoAliasTables = ref(settingsStore.editorSettings.autoAliasTables);
 const editTableCompletionSchemaQualification = ref<SqlTableCompletionSchemaQualification>(settingsStore.editorSettings.tableCompletionSchemaQualification);
 const tableCompletionSchemaQualificationDescription = computed(() => {
@@ -999,6 +1000,7 @@ function clearRememberedConnectionDatabases() {
 }
 const editDataTabReuseMode = ref<DataTabReuseMode>(settingsStore.editorSettings.dataTabReuseMode);
 const editOpenDataTabsNextToActive = ref(settingsStore.editorSettings.openDataTabsNextToActive);
+const editOpenTablesInDetachedWindow = ref(settingsStore.editorSettings.openTablesInDetachedWindow);
 const editPrefillNewQueryWithSelect = ref(settingsStore.editorSettings.prefillNewQueryWithSelect);
 const editOpenQueryOnConnectionOpen = ref(settingsStore.editorSettings.openQueryOnConnectionOpen);
 const editGenerateSqlIncludeDatabaseName = ref(settingsStore.editorSettings.generateSqlIncludeDatabaseName);
@@ -1223,6 +1225,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     showLineNumbers: editShowLineNumbers.value,
     showCurrentStatementFrame: editShowCurrentStatementFrame.value,
     showInsertValueHints: editShowInsertValueHints.value,
+    showConnectionGroupPath: editShowConnectionGroupPath.value,
     autoAliasTables: editAutoAliasTables.value,
     tableCompletionSchemaQualification: editTableCompletionSchemaQualification.value,
     insertSpaceAfterCompletion: editInsertSpaceAfterCompletion.value,
@@ -1323,6 +1326,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     deepLinkConnectionConfirmMode: editDeepLinkConnectionConfirmMode.value,
     dataTabReuseMode: editDataTabReuseMode.value,
     openDataTabsNextToActive: editOpenDataTabsNextToActive.value,
+    openTablesInDetachedWindow: editOpenTablesInDetachedWindow.value,
     prefillNewQueryWithSelect: editPrefillNewQueryWithSelect.value,
     openQueryOnConnectionOpen: editOpenQueryOnConnectionOpen.value,
     generateSqlIncludeDatabaseName: editGenerateSqlIncludeDatabaseName.value,
@@ -1926,6 +1930,7 @@ function syncEditorSettingsDraftFromStore() {
   editShowLineNumbers.value = settingsStore.editorSettings.showLineNumbers;
   editShowCurrentStatementFrame.value = settingsStore.editorSettings.showCurrentStatementFrame;
   editShowInsertValueHints.value = settingsStore.editorSettings.showInsertValueHints;
+  editShowConnectionGroupPath.value = settingsStore.editorSettings.showConnectionGroupPath;
   editAutoAliasTables.value = settingsStore.editorSettings.autoAliasTables;
   editTableCompletionSchemaQualification.value = settingsStore.editorSettings.tableCompletionSchemaQualification;
   editInsertSpaceAfterCompletion.value = settingsStore.editorSettings.insertSpaceAfterCompletion;
@@ -2028,6 +2033,7 @@ function syncEditorSettingsDraftFromStore() {
   editDeepLinkConnectionConfirmMode.value = settingsStore.editorSettings.deepLinkConnectionConfirmMode;
   editDataTabReuseMode.value = settingsStore.editorSettings.dataTabReuseMode;
   editOpenDataTabsNextToActive.value = settingsStore.editorSettings.openDataTabsNextToActive;
+  editOpenTablesInDetachedWindow.value = settingsStore.editorSettings.openTablesInDetachedWindow;
   editPrefillNewQueryWithSelect.value = settingsStore.editorSettings.prefillNewQueryWithSelect;
   editOpenQueryOnConnectionOpen.value = settingsStore.editorSettings.openQueryOnConnectionOpen;
   editGenerateSqlIncludeDatabaseName.value = settingsStore.editorSettings.generateSqlIncludeDatabaseName;
@@ -2106,6 +2112,7 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   showLineNumbers: editShowLineNumbers,
   showCurrentStatementFrame: editShowCurrentStatementFrame,
   showInsertValueHints: editShowInsertValueHints,
+  showConnectionGroupPath: editShowConnectionGroupPath,
   autoAliasTables: editAutoAliasTables,
   tableCompletionSchemaQualification: editTableCompletionSchemaQualification,
   insertSpaceAfterCompletion: editInsertSpaceAfterCompletion,
@@ -2201,6 +2208,7 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   deepLinkConnectionConfirmMode: editDeepLinkConnectionConfirmMode,
   dataTabReuseMode: editDataTabReuseMode,
   openDataTabsNextToActive: editOpenDataTabsNextToActive,
+  openTablesInDetachedWindow: editOpenTablesInDetachedWindow,
   prefillNewQueryWithSelect: editPrefillNewQueryWithSelect,
   openQueryOnConnectionOpen: editOpenQueryOnConnectionOpen,
   generateSqlIncludeDatabaseName: editGenerateSqlIncludeDatabaseName,
@@ -2713,6 +2721,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editShowLineNumbers.value = DEFAULT_EDITOR_SETTINGS.showLineNumbers;
     editShowCurrentStatementFrame.value = DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame;
     editShowInsertValueHints.value = DEFAULT_EDITOR_SETTINGS.showInsertValueHints;
+    editShowConnectionGroupPath.value = DEFAULT_EDITOR_SETTINGS.showConnectionGroupPath;
     editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
     editTableCompletionSchemaQualification.value = DEFAULT_EDITOR_SETTINGS.tableCompletionSchemaQualification;
     editInsertSpaceAfterCompletion.value = DEFAULT_EDITOR_SETTINGS.insertSpaceAfterCompletion;
@@ -2791,6 +2800,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editDeepLinkConnectionConfirmMode.value = DEFAULT_EDITOR_SETTINGS.deepLinkConnectionConfirmMode;
     editDataTabReuseMode.value = DEFAULT_EDITOR_SETTINGS.dataTabReuseMode;
     editOpenDataTabsNextToActive.value = DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive;
+    editOpenTablesInDetachedWindow.value = DEFAULT_EDITOR_SETTINGS.openTablesInDetachedWindow;
     editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
     editOpenQueryOnConnectionOpen.value = DEFAULT_EDITOR_SETTINGS.openQueryOnConnectionOpen;
     editGenerateSqlIncludeDatabaseName.value = DEFAULT_EDITOR_SETTINGS.generateSqlIncludeDatabaseName;
@@ -2916,6 +2926,7 @@ function resetAllDefaults() {
   editShowLineNumbers.value = DEFAULT_EDITOR_SETTINGS.showLineNumbers;
   editShowCurrentStatementFrame.value = DEFAULT_EDITOR_SETTINGS.showCurrentStatementFrame;
   editShowInsertValueHints.value = DEFAULT_EDITOR_SETTINGS.showInsertValueHints;
+  editShowConnectionGroupPath.value = DEFAULT_EDITOR_SETTINGS.showConnectionGroupPath;
   editAutoAliasTables.value = DEFAULT_EDITOR_SETTINGS.autoAliasTables;
   editTableCompletionSchemaQualification.value = DEFAULT_EDITOR_SETTINGS.tableCompletionSchemaQualification;
   editInsertSpaceAfterCompletion.value = DEFAULT_EDITOR_SETTINGS.insertSpaceAfterCompletion;
@@ -3016,6 +3027,7 @@ function resetAllDefaults() {
   editDeepLinkConnectionConfirmMode.value = DEFAULT_EDITOR_SETTINGS.deepLinkConnectionConfirmMode;
   editDataTabReuseMode.value = DEFAULT_EDITOR_SETTINGS.dataTabReuseMode;
   editOpenDataTabsNextToActive.value = DEFAULT_EDITOR_SETTINGS.openDataTabsNextToActive;
+  editOpenTablesInDetachedWindow.value = DEFAULT_EDITOR_SETTINGS.openTablesInDetachedWindow;
   editPrefillNewQueryWithSelect.value = DEFAULT_EDITOR_SETTINGS.prefillNewQueryWithSelect;
   editOpenQueryOnConnectionOpen.value = DEFAULT_EDITOR_SETTINGS.openQueryOnConnectionOpen;
   editGenerateSqlIncludeDatabaseName.value = DEFAULT_EDITOR_SETTINGS.generateSqlIncludeDatabaseName;
@@ -8129,6 +8141,16 @@ onUnmounted(() => {
 
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="space-y-1">
+                    <Label for="editor-show-connection-group-path">{{ t("settings.showConnectionGroupPath") }}</Label>
+                    <p class="text-xs text-muted-foreground">
+                      {{ t("settings.showConnectionGroupPathDescription") }}
+                    </p>
+                  </div>
+                  <Switch id="editor-show-connection-group-path" v-model="editShowConnectionGroupPath" class="mt-0.5" />
+                </div>
+
+                <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                  <div class="space-y-1">
                     <Label for="editor-show-whitespace">{{ t("settings.showWhitespace") }}</Label>
                     <p class="text-xs text-muted-foreground">
                       {{ t("settings.showWhitespaceDescription") }}
@@ -9178,6 +9200,15 @@ onUnmounted(() => {
                 </div>
                 <Switch id="open-data-tabs-next-to-active" v-model="editOpenDataTabsNextToActive" />
               </div>
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <Label for="open-tables-in-detached-window">{{ t("settings.openTablesInDetachedWindow") }}</Label>
+                  <HelpTooltip :label="t('settings.openTablesInDetachedWindow')">
+                    {{ t("settings.openTablesInDetachedWindowDescription") }}
+                  </HelpTooltip>
+                </div>
+                <Switch id="open-tables-in-detached-window" v-model="editOpenTablesInDetachedWindow" />
+              </div>
               <div class="space-y-2">
                 <Label>{{ t("settings.sidebarObjectDisplay") }}</Label>
                 <div class="grid grid-cols-2 gap-2">
@@ -10032,7 +10063,7 @@ onUnmounted(() => {
                       {{ t("settings.showColumnCommentsInHeaderDescription") }}
                     </p>
                   </div>
-                  <Switch id="show-column-comments-in-header" v-model="editShowColumnCommentsInHeader" :disabled="editDataGridColumnCommentsInInfoArea" />
+                  <Switch id="show-column-comments-in-header" v-model="editShowColumnCommentsInHeader" />
                 </div>
                 <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
                   <div class="min-w-0 space-y-1">

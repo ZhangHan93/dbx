@@ -3131,6 +3131,9 @@ function applyRequestedPluginProvider(target: PluginCenterFocus | null | undefin
 }
 
 function switchOceanbaseMode(mode: "mysql" | "oracle") {
+  const port = form.value.port;
+  const sourceProfile = oceanbaseSubMode.value === "mysql" ? "oceanbase" : "oceanbase-oracle";
+  const preservePort = port !== driverProfiles[sourceProfile].port;
   oceanbaseSubMode.value = mode;
   if (mode === "mysql") {
     applyProfile("oceanbase", false);
@@ -3138,6 +3141,7 @@ function switchOceanbaseMode(mode: "mysql" | "oracle") {
     applyProfile("oceanbase-oracle", false);
     selectedType.value = "oceanbase";
   }
+  if (preservePort) form.value.port = port;
   resetTestState();
 }
 

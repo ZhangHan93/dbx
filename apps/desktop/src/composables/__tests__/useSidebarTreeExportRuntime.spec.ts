@@ -534,6 +534,7 @@ describe("useSidebarTreeExportRuntime", () => {
     activeNode.value = { id: "table-2", type: "table", label: "orders", connectionId: "conn-2", database: "db-b", schema: "sales", children: [] } as TreeNode;
     settingsStore.editorSettings.exportBatchSize = 16;
     settingsStore.editorSettings.exportRowLimit = 10;
+    settingsStore.editorSettings.dataGridExtractorOptions = { ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS, sql: { ...DEFAULT_DATA_GRID_EXTRACTOR_OPTIONS.sql, primaryKeyMode: "exclude-all" } };
     metadata.resolve([column("name")]);
 
     await exportPromise;
@@ -549,6 +550,7 @@ describe("useSidebarTreeExportRuntime", () => {
         columns: ["name"],
         batchSize: 128,
         rowLimit: 500,
+        primaryKeyMode: "include",
       }),
       expect.any(Function),
     );

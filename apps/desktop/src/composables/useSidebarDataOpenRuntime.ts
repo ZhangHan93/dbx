@@ -2,6 +2,7 @@ import { nextTick } from "vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
 import { useSettingsStore } from "@/stores/settingsStore";
+import { requestDetachedTableOpen } from "@/lib/tabs/detachedTableOpen";
 import { useTunnelProfileStore } from "@/stores/tunnelProfileStore";
 import type { TreeNode } from "@/types/database";
 import { uuid } from "@/lib/common/utils";
@@ -334,6 +335,13 @@ export function useSidebarDataOpenRuntime() {
       if (pendingTab) pendingTab.tableMetaPending = true;
     }
     queryStore.setExecutingWithId(tabId, openDataId);
+    // #13308: with the detached-open setting on, the freshly opened table moves
+    // into its own window once the first load settles. Ask only after the reused
+    // tab's previous result is cleared and this load is scheduled, so a stale
+    // errored result cannot satisfy the settle check before the reload starts.
+    if (settingsStore.editorSettings.openTablesInDetachedWindow) {
+      requestDetachedTableOpen(() => queryStore.tabs.find((entry) => entry.id === tabId));
+    }
     request?.registerCancel(async () => {
       const current = queryStore.tabs.find((item) => item.id === tabId);
       if (current?.isExecuting && current.executionId === openDataId) {

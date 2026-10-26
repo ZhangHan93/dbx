@@ -8909,6 +8909,7 @@ mod tests {
         }];
         let trigger = TriggerInfo {
             name: "trg_events_insert".into(),
+            oracle_metadata: None,
             event: "INSERT".into(),
             timing: "AFTER".into(),
             level: None,
@@ -11691,6 +11692,7 @@ mod tests {
                     valid: None,
                     comment: None,
                     created_at: None,
+                    oracle_metadata: None,
                     statement: None,
                 }],
                 ddl: None,
