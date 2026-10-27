@@ -11,6 +11,52 @@ import type { DatabaseBackupCommand, DatabaseBackupBackgroundStatus } from "@/li
 import type { NativeJobContext, NativeJobDetails, NativeJobList, NativeJobListRequest, NativeJobRequest, NativeJobOperationStatus, NativeJobPreparedPlan, NativeJobRef, NativeJobReferenceCatalog, NativeJobReferenceListRequest } from "@/lib/database/nativeJobs";
 import { functionDiffsToWire, functionInfoFromWire, schemaDiffPreparationFromWire, schemaDiffPreparationToWire, type FunctionInfoWire, type SchemaDiffPreparationWire } from "./functionInfoTransport";
 import type { OracleRoutineSnapshot, OracleRoutineOperation, OracleRoutineOperationObservation, OracleRoutineSaveInput, OracleRoutinePlanInput, OracleRoutinePlan, OracleRoutineReadOptions, OracleRoutineIdentity } from "@/types/schemaDiff";
+import type { PlDebugBootstrap, PlDebugSessionRef, PlDebugStartIntent, PlDebugOperationRequest, PlDebugReadRequest, PlDebugReceipt, PlDebugSnapshot } from "@/lib/debug/plDebugProtocol";
+import type { PlDebugInspectRequest, PlDebugInspectResult, PlDebugCompileIntent, PlDebugCompileRef, PlDebugCompileReceipt } from "@/lib/debug/plDebugProtocol";
+
+export function plDebugBootstrap(): Promise<PlDebugBootstrap> {
+  return invoke("pl_debug_bootstrap");
+}
+
+export function plDebugInspect(request: PlDebugInspectRequest): Promise<PlDebugInspectResult> {
+  return invoke("pl_debug_inspect", { request });
+}
+
+export function plDebugCompile(request: PlDebugCompileIntent): Promise<PlDebugCompileReceipt> {
+  return invokeBackend("pl_debug_compile", { request });
+}
+
+export function plDebugCompileStatus(reference: PlDebugCompileRef): Promise<PlDebugCompileReceipt> {
+  return invoke("pl_debug_compile_status", { reference });
+}
+
+export function plDebugList(serverEpoch: string, connectionId: string): Promise<PlDebugSnapshot[]> {
+  return invoke("pl_debug_list", { serverEpoch, connectionId });
+}
+
+export function plDebugStart(request: PlDebugStartIntent): Promise<PlDebugReceipt> {
+  return invokeBackend("pl_debug_start", { request });
+}
+
+export function plDebugStatus(reference: PlDebugSessionRef, refresh = false): Promise<PlDebugSnapshot> {
+  return invoke("pl_debug_status", { reference, refresh });
+}
+
+export function plDebugHeartbeat(reference: PlDebugSessionRef): Promise<PlDebugSnapshot> {
+  return invoke("pl_debug_heartbeat", { reference });
+}
+
+export function plDebugOperation(reference: PlDebugSessionRef, operationId: string): Promise<PlDebugReceipt> {
+  return invoke("pl_debug_operation", { reference, operationId });
+}
+
+export function plDebugOperate(request: PlDebugOperationRequest): Promise<PlDebugReceipt> {
+  return invokeBackend("pl_debug_operate", { request });
+}
+
+export function plDebugRead(request: PlDebugReadRequest): Promise<Record<string, unknown> | unknown[]> {
+  return invoke("pl_debug_read", { request });
+}
 
 export function databaseBackupCommand<T = unknown>(command: DatabaseBackupCommand): Promise<T> {
   return invoke("database_backup_command", { command });
@@ -2884,7 +2930,7 @@ export async function listSubpartitions(connectionId: string, database: string, 
   });
 }
 
-export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, portable = false, exactIdentity?: boolean, separateIndexes?: boolean): Promise<string> {
+export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, portable = false, exactIdentity?: boolean, separateIndexes?: boolean, explicitOwner?: string): Promise<string> {
   return invoke("get_table_ddl", {
     connectionId,
     database,
@@ -2895,10 +2941,11 @@ export async function getTableDdl(connectionId: string, database: string, schema
     portable,
     ...(exactIdentity ? { exactIdentity: true } : {}),
     ...(separateIndexes ? { separateIndexes: true } : {}),
+    ...(explicitOwner !== undefined ? { explicitOwner } : {}),
   });
 }
 
-export async function getTableDisplayDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, separateIndexes?: boolean): Promise<string> {
+export async function getTableDisplayDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, separateIndexes?: boolean, explicitOwner?: string): Promise<string> {
   return invoke("get_table_ddl", {
     connectionId,
     database,
@@ -2908,6 +2955,7 @@ export async function getTableDisplayDdl(connectionId: string, database: string,
     catalog,
     includePostgresAccess: true,
     ...(separateIndexes ? { separateIndexes: true } : {}),
+    ...(explicitOwner !== undefined ? { explicitOwner } : {}),
     portable: false,
   });
 }
@@ -5905,6 +5953,7 @@ export type SqlFileStatus = "started" | "running" | "statementDone" | "statement
 export type SqlFileEncoding = "auto" | "utf8" | "gbk" | "utf16Le" | "utf16Be";
 
 export interface SqlFileRequest {
+  resolveIncludes?: boolean;
   encoding?: SqlFileEncoding;
   executionId: string;
   connectionId: string;

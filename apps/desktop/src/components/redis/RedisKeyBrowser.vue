@@ -16,6 +16,7 @@ import { OptionHelpPanel } from "@/components/ui/option-help-panel";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Switch } from "@/components/ui/switch";
 import DateTimePicker from "@/components/ui/date-time-picker/DateTimePicker.vue";
+import KeyCap from "@/components/ui/KeyCap.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import { redisDeleteGroupPreview, redisDeleteKeysPreview } from "@/lib/redis/redisCommandPreview";
@@ -3960,6 +3961,10 @@ defineExpose({ focusSearch, insertCommand, executeCommand: executeAiCommand });
                             <span v-if="item.apply && item.apply !== item.label" class="block truncate text-[11px] text-slate-500">{{ item.apply }}</span>
                           </span>
                           <span v-if="item.detail" class="shrink-0 text-slate-400">{{ item.detail }}</span>
+                          <!-- The slot keeps its width on every row so the hint never shifts the text. -->
+                          <span class="flex w-7 shrink-0 justify-end">
+                            <KeyCap v-if="commandCompletionSelectedIndex === index" label="Tab" />
+                          </span>
                         </button>
                       </div>
                     </div>

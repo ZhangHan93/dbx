@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use dbx_core::connection::{AppState, PoolKind};
 use dbx_core::db::postgres;
 use dbx_core::models::connection::{ConnectionConfig, DatabaseType};

@@ -10,7 +10,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { TabsContent } from "@/components/ui/tabs";
 import TemporalCellEditor from "@/components/grid/TemporalCellEditor.vue";
 import { useDataGridCellDetail } from "@/composables/useDataGridCellDetail";
-import { BINARY_CELL_DOWNLOAD_MODES, isBinaryCellColumnType, binaryCellUtf8Text, isBlobCellColumnType, type BinaryCellDownloadMode } from "@/lib/dataGrid/binaryCellDownload";
+import { BINARY_CELL_DOWNLOAD_MODES, isBinaryCellColumnType, binaryCellUtf8Text, isBinaryCellTextEditable, type BinaryCellDownloadMode } from "@/lib/dataGrid/binaryCellDownload";
 import { canPreviewCellGeometry, cellDetailPreviewText } from "@/lib/dataGrid/cellDetailPresentation";
 import type { DataGridCellDetail } from "@/lib/dataGrid/dataGridDetail";
 import type { TemporalCellEditorConfig } from "@/lib/dataGrid/dataGridTemporalEditor";
@@ -38,7 +38,7 @@ const props = defineProps<{
   importBinaryValue: (detail: DataGridCellDetail | null) => void | Promise<void>;
   openImagePreview: (src: string, title: string) => void;
   canCopySqlCondition: () => boolean;
-  /** BLOB 文本预览与编辑写回一致，在 MySQL / Oracle（含 OceanBase-Oracle）连接开启。 */
+  /** BLOB / BYTEA 文本预览与编辑写回一致，在 MySQL / Oracle（含 OceanBase-Oracle）或 PostgreSQL 连接开启。 */
   databaseType?: DatabaseType;
 }>();
 
@@ -76,7 +76,7 @@ void geometryCanvas;
 void detailsEditorContainer;
 void sideJsonPreviewContainer;
 
-const binaryTextPreview = computed(() => (isBlobCellColumnType(props.detail.type) ? binaryCellUtf8Text(props.detail.value, props.detail.type, props.databaseType) : null));
+const binaryTextPreview = computed(() => (isBinaryCellTextEditable(props.detail.type, props.databaseType) ? binaryCellUtf8Text(props.detail.value, props.detail.type, props.databaseType) : null));
 const presentedValuePreview = computed(() => (binaryTextPreview.value === null ? cellDetailPreviewText(props.detail, props.databaseType) : props.detail.displayValuePreview));
 const transformOpen = ref(false);
 // 底部面板横向空间充足：有图片预览时与值文本左右并排，侧栏窄面板保持上下堆叠。

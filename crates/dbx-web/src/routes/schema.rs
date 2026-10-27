@@ -35,6 +35,7 @@ pub struct SchemaQuery {
     pub identity_mode: Option<dbx_core::schema::MetadataIdentityMode>,
     pub exact_identity: Option<bool>,
     pub separate_indexes: Option<bool>,
+    pub explicit_owner: Option<String>,
 }
 
 async fn run_cancellable<T, F>(state: &Arc<WebState>, execution_id: Option<String>, future: F) -> Result<T, AppError>
@@ -998,6 +999,7 @@ pub async fn get_ddl(
             schema,
             table,
             &result,
+            q.explicit_owner.as_deref().or_else(|| q.exact_identity.unwrap_or(false).then_some(schema)),
         )
         .await
         .map_err(AppError::from)?

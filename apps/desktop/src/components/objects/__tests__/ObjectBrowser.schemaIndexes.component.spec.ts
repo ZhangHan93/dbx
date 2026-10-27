@@ -150,7 +150,7 @@ describe("schema index browsing and draft navigation", () => {
       });
       action.click();
       await vi.waitFor(() => expect(mocks.getTableDdl).toHaveBeenCalledOnce());
-      expect(mocks.getTableDdl.mock.calls[0]).toEqual([connection.id, "service", "Mixed", "EXPORT_TARGET", objectType === "VIEW" ? "VIEW" : undefined, undefined, true, ...(objectType === "TABLE" ? [undefined, true] : [])]);
+      expect(mocks.getTableDdl.mock.calls[0]).toEqual([connection.id, "service", "Mixed", "EXPORT_TARGET", objectType === "VIEW" ? "VIEW" : undefined, undefined, true, ...(objectType === "TABLE" ? [undefined, true, "Mixed"] : [])]);
     } finally {
       createUrl.mockRestore();
       revokeUrl.mockRestore();
@@ -177,7 +177,7 @@ describe("schema index browsing and draft navigation", () => {
     option.click();
     await vi.waitFor(() => expect(mocks.getTableDdl).toHaveBeenCalledTimes(2));
     expect(mocks.getTableDdl.mock.calls[1].slice(0, 6)).toEqual(mocks.getTableDdl.mock.calls[0].slice(0, 6));
-    expect(mocks.getTableDdl.mock.calls[1].slice(7)).toEqual([true, true]);
+    expect(mocks.getTableDdl.mock.calls[1].slice(7)).toEqual([true, true, " Other Owner "]);
     await vi.waitFor(() => expect(host.textContent).toContain("CREATE INDEX detached"));
   });
 

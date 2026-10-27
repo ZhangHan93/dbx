@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { createApp, defineComponent, h, nextTick, provide, ref, type App } from "vue";
+import { computed, createApp, defineComponent, h, nextTick, provide, reactive, ref, type App } from "vue";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import i18n from "@/i18n";
 import type { TreeNode } from "@/types/database";
@@ -9,6 +9,7 @@ import { sidebarTreeContextKey } from "@/lib/sidebar/sidebarTreeContext";
 import { filterSidebarTree } from "@/lib/sidebar/sidebarSearchTree";
 import { OBJECT_BROWSER_SEARCH_FOCUS_EVENT } from "@/lib/tabs/objectBrowserSearchFocus";
 import SidebarTreeRuntimeHost from "@/components/sidebar/SidebarTreeRuntimeHost.vue";
+import { compileConnectionTreeTestScript } from "./connectionTreeTestScript";
 
 const connectionStore = {
   treeNodes: [] as TreeNode[],
@@ -90,6 +91,15 @@ vi.mock("@/lib/backend/api", async (importOriginal) => {
 });
 
 const mountedApps: App[] = [];
+const compiledSearchHandlers = compileConnectionTreeTestScript(["onSearchToggle", "onNodeToggled"]);
+
+function searchHandlers(searchCollapsedIds: { value: Set<string> }) {
+  const bindings = { searchCollapsedIds, isTreeSearchFiltering: ref(true), store: connectionStore, syncSidebarTreeNodeExpansion, sidebarLayoutMonitor: { recordEvent: vi.fn() } };
+  return new Function(...Object.keys(bindings), `${compiledSearchHandlers}; return { onSearchToggle, onNodeToggled };`)(...Object.values(bindings)) as {
+    onSearchToggle: (node: TreeNode) => void;
+    onNodeToggled: (node: TreeNode, expanded: boolean) => void;
+  };
+}
 
 afterEach(() => {
   for (const app of mountedApps.splice(0)) app.unmount();
@@ -842,15 +852,18 @@ describe("SidebarTreeRuntimeHost expansion", () => {
       children: [tableGroup],
     };
     connectionStore.sidebarSearchQuery = "json";
-    const searchToggle = vi.fn();
-    const nodeToggled = vi.fn();
+    const collapsedIds = ref(new Set([database.id]));
+    const projection = computed(() => filterSidebarTree([database], "json", collapsedIds.value));
+    const handlers = searchHandlers(collapsedIds);
+    const searchToggle = vi.fn(handlers.onSearchToggle);
+    const nodeToggled = vi.fn(handlers.onNodeToggled);
 
     const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
     const app = createApp(
       defineComponent({
         setup() {
           provide(sidebarTreeContextKey, {
-            getVisibleNodes: () => [database],
+            getVisibleNodes: () => projection.value,
             getVisibleNodeIndex: () => 0,
             isSearchProjectionActive: () => true,
           });
@@ -868,9 +881,169 @@ describe("SidebarTreeRuntimeHost expansion", () => {
     await nextTick();
 
     expect(searchToggle).toHaveBeenCalledWith(database);
+    expect(projection.value[0].isExpanded).toBe(true);
+    expect(database.isExpanded).toBe(false);
     expect(nodeToggled).not.toHaveBeenCalled();
     expect(connectionStore.loadTables).not.toHaveBeenCalled();
     expect(connectionStore.releaseCollapsedTreeNodeChildren).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { loaded: false, query: "north" },
+    { loaded: true, query: "north" },
+    { loaded: false, query: "basic" },
+  ])("expands a database during search ($query, loaded: $loaded)", async ({ loaded, query }) => {
+    const tableGroup: TreeNode = {
+      id: "mysql:basic:__tables",
+      label: "tree.tables",
+      type: "group-tables",
+      connectionId: "mysql",
+      database: "basic",
+      isExpanded: false,
+      children: [
+        { id: "mysql:basic:orders", label: "orders", type: "table", connectionId: "mysql", database: "basic" },
+        { id: "mysql:basic:customers", label: "customers", type: "table", connectionId: "mysql", database: "basic" },
+      ],
+    };
+    const database = reactive<TreeNode>({
+      id: "mysql:basic",
+      label: "basic",
+      type: "database",
+      connectionId: "mysql",
+      database: "basic",
+      isExpanded: false,
+      // Unopened databases can already contain their saved-SQL shortcut.
+      children: loaded ? [tableGroup] : [{ id: "mysql:basic:queries", label: "tree.queries", type: "saved-sql-root", connectionId: "mysql", database: "basic", children: [] }],
+    });
+    const otherDatabase: TreeNode = { id: "mysql:other", label: "other", type: "database", connectionId: "mysql", database: "other", isExpanded: false, children: [] };
+    const root: TreeNode = { id: "mysql", label: "north", type: "connection", connectionId: "mysql", isExpanded: true, children: [database, otherDatabase] };
+    connectionStore.treeNodes = [root];
+    connectionStore.connectedIds.add("mysql");
+    connectionStore.loadTables.mockImplementation(async () => {
+      if (!loaded) database.children = [tableGroup];
+      database.isExpanded = true;
+    });
+    const collapsedIds = ref(new Set(query === "basic" ? [database.id] : []));
+    const projectedDatabase = computed(() => filterSidebarTree([root], query, collapsedIds.value)[0].children![0]);
+    const handlers = searchHandlers(collapsedIds);
+    const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
+    const app = createApp(
+      defineComponent({
+        setup() {
+          provide(sidebarTreeContextKey, {
+            getVisibleNodes: () => [projectedDatabase.value],
+            getVisibleNodeIndex: () => 0,
+            isSearchProjectionActive: () => true,
+            getTreeLoadSearchOptions: () => ({ searchFilter: "", allowGlobalSearchMismatch: true, expectedSidebarSearchQuery: "" }),
+          });
+          return () => h(SidebarTreeRuntimeHost, { ref: host, node: projectedDatabase.value, depth: 1, onSearchToggle: handlers.onSearchToggle, onNodeToggled: handlers.onNodeToggled });
+        },
+      }),
+    );
+    mountedApps.push(app);
+    const container = document.createElement("div");
+    document.body.append(container);
+    app.use(i18n);
+    app.mount(container);
+
+    host.value!.toggleNode(projectedDatabase.value);
+    await vi.waitFor(() => expect(projectedDatabase.value.isExpanded).toBe(true));
+    expect(connectionStore.loadTables).toHaveBeenCalledExactlyOnceWith("mysql", "basic", undefined, { searchFilter: "", allowGlobalSearchMismatch: true, expectedSidebarSearchQuery: "" });
+    expect(database.children?.[0].children?.map((node) => node.label)).toEqual(["orders", "customers"]);
+    expect(otherDatabase.isExpanded).toBe(false);
+
+    host.value!.toggleNode(projectedDatabase.value);
+    await nextTick();
+    expect(projectedDatabase.value.isExpanded).toBe(false);
+    host.value!.toggleNode(projectedDatabase.value);
+    await vi.waitFor(() => expect(projectedDatabase.value.isExpanded).toBe(true));
+    expect(connectionStore.loadTables).toHaveBeenCalledTimes(query === "basic" ? 1 : 2);
+    expect(connectionStore.releaseCollapsedTreeNodeChildren).not.toHaveBeenCalled();
+  });
+
+  it("reopens a cached table group below a matching connection without replacing its children", async () => {
+    const group = reactive<TreeNode>({
+      id: "mysql:basic:__tables",
+      label: "tree.tables",
+      type: "group-tables",
+      connectionId: "mysql",
+      database: "basic",
+      isExpanded: true,
+      children: [
+        { id: "mysql:basic:orders", label: "orders", type: "table", connectionId: "mysql", database: "basic" },
+        { id: "mysql:basic:customers", label: "customers", type: "table", connectionId: "mysql", database: "basic" },
+      ],
+    });
+    const root: TreeNode = { id: "mysql", label: "north", type: "connection", connectionId: "mysql", isExpanded: true, children: [{ id: "mysql:basic", label: "basic", type: "database", connectionId: "mysql", database: "basic", isExpanded: true, children: [group] }] };
+    connectionStore.treeNodes = [root];
+    connectionStore.connectedIds.add("mysql");
+    const collapsedIds = ref(new Set<string>());
+    const projectedGroup = computed(() => filterSidebarTree([root], "north", collapsedIds.value)[0].children![0].children![0]);
+    const handlers = searchHandlers(collapsedIds);
+    const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
+    const app = createApp(
+      defineComponent({
+        setup() {
+          provide(sidebarTreeContextKey, { getVisibleNodes: () => [projectedGroup.value], getVisibleNodeIndex: () => 0, isSearchProjectionActive: () => true });
+          return () => h(SidebarTreeRuntimeHost, { ref: host, node: projectedGroup.value, depth: 2, onSearchToggle: handlers.onSearchToggle, onNodeToggled: handlers.onNodeToggled });
+        },
+      }),
+    );
+    mountedApps.push(app);
+    const container = document.createElement("div");
+    document.body.append(container);
+    app.use(i18n);
+    app.mount(container);
+    const children = group.children;
+
+    for (let cycle = 0; cycle < 2; cycle++) {
+      host.value!.toggleNode(projectedGroup.value);
+      await nextTick();
+      expect(projectedGroup.value.isExpanded).toBe(false);
+      expect(collapsedIds.value.has("mysql:basic:orders")).toBe(true);
+      host.value!.toggleNode(projectedGroup.value);
+      await nextTick();
+      expect(projectedGroup.value.isExpanded).toBe(true);
+      expect(group.isExpanded).toBe(true);
+      expect(group.children).toBe(children);
+    }
+    expect(connectionStore.loadObjectGroupChildren).not.toHaveBeenCalled();
+    expect(connectionStore.releaseCollapsedTreeNodeChildren).not.toHaveBeenCalled();
+  });
+
+  it("does not skip schema expansion when another visible database has the same node id", async () => {
+    const schema = reactive<TreeNode>({ id: "pg:a:b", label: "b", type: "schema", connectionId: "pg", database: "a", schema: "b", isExpanded: false, children: [{ id: "pg:a:b:tables", label: "Tables", type: "group-tables", connectionId: "pg", database: "a", schema: "b", children: [] }] });
+    const otherDatabase: TreeNode = { id: "pg:a:b", label: "a:b", type: "database", connectionId: "pg", database: "a:b", isExpanded: true, children: [] };
+    const root: TreeNode = { id: "pg", label: "north", type: "connection", connectionId: "pg", isExpanded: true, children: [{ id: "pg:a", label: "a", type: "database", connectionId: "pg", database: "a", isExpanded: true, children: [schema] }, otherDatabase] };
+    connectionStore.treeNodes = [root];
+    connectionStore.connectedIds.add("pg");
+    connectionStore.getConfig.mockReturnValue({ db_type: "postgres", name: "north" });
+    connectionStore.loadTables.mockImplementation(async () => {
+      schema.isExpanded = true;
+    });
+    const collapsedIds = ref(new Set<string>());
+    const projection = computed(() => filterSidebarTree([root], "north", collapsedIds.value)[0]);
+    const visible = computed(() => [projection.value.children![0].children![0], projection.value.children![1]]);
+    const handlers = searchHandlers(collapsedIds);
+    const host = ref<InstanceType<typeof SidebarTreeRuntimeHost> | null>(null);
+    const app = createApp(
+      defineComponent({
+        setup() {
+          provide(sidebarTreeContextKey, { getVisibleNodes: () => visible.value, getVisibleNodeIndex: () => 1, isSearchProjectionActive: () => true });
+          return () => h(SidebarTreeRuntimeHost, { ref: host, node: visible.value[0], depth: 2, onSearchToggle: handlers.onSearchToggle, onNodeToggled: handlers.onNodeToggled });
+        },
+      }),
+    );
+    mountedApps.push(app);
+    const container = document.createElement("div");
+    document.body.append(container);
+    app.use(i18n);
+    app.mount(container);
+
+    host.value!.toggleNode(visible.value[0]);
+    await vi.waitFor(() => expect(schema.isExpanded).toBe(true));
+    expect(connectionStore.loadTables).toHaveBeenCalledExactlyOnceWith("pg", "a", "b", undefined);
+    expect(otherDatabase.isExpanded).toBe(true);
   });
 
   it("expands an unloaded object group without leaking a matching connection name", async () => {

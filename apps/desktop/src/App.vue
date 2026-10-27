@@ -25,6 +25,8 @@ import WelcomeScreen from "@/components/layout/WelcomeScreen.vue";
 import type { ConfigTab } from "@/components/connection/ConnectionDialog.vue";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useQueryStore } from "@/stores/queryStore";
+import { usePlDebugStore } from "@/stores/plDebugStore";
+import { dispatchPlDebugStepShortcut } from "@/lib/editor/plDebugStepShortcut";
 import { useNavigationStore } from "@/stores/navigationStore";
 import { useSqlExecutionDangerStore } from "@/stores/sqlExecutionDangerStore";
 import type { MultiDbExecutionContext } from "@/composables/useMultiDbExecution";
@@ -249,6 +251,7 @@ const EditorSettingsPage = defineAsyncComponent(() => import("@/components/edito
 const UpdateDialog = defineAsyncComponent(() => import("@/components/layout/UpdateDialog.vue"));
 const CloseActionPromptDialog = defineAsyncComponent(() => import("@/components/layout/CloseActionPromptDialog.vue"));
 const AiRunsClosePromptDialog = defineAsyncComponent(() => import("@/components/layout/AiRunsClosePromptDialog.vue"));
+const BackgroundTasksClosePromptDialog = defineAsyncComponent(() => import("@/components/layout/BackgroundTasksClosePromptDialog.vue"));
 const LoginPage = defineAsyncComponent(() => import("@/components/auth/LoginPage.vue"));
 const QuickOpenDialog = defineAsyncComponent(() => import("@/components/quick-open/QuickOpenDialog.vue"));
 const TabSwitcherDialog = defineAsyncComponent(() => import("@/components/tabs/TabSwitcherDialog.vue"));
@@ -320,7 +323,7 @@ connectionStore.setBeforeConnectHandler(async (config) => {
 });
 const { message: toastMessage, visible: toastVisible, action: toastAction, toast } = useToast();
 const { isDark, themeMode, applyTheme, setThemeMode, writeRootToken } = useTheme();
-const { activeCount: activeBackgroundTaskCount } = useExportTracker();
+const { activeCount: activeBackgroundTaskCount, tasks: backgroundTasks, cancelTask: cancelBackgroundTask } = useExportTracker();
 const trackedUpdateTaskCount = computed(() => countActiveUpdateBlockingTasks(activeBackgroundTaskCount.value, queryStore.tabs));
 const {
   initialize: initializeUpdater,
@@ -446,6 +449,11 @@ const drawLinuxFloatingFrame = computed(() =>
   }),
 );
 watch(drawLinuxFloatingFrame, (enabled) => document.documentElement.classList.toggle("dbx-linux-floating", enabled), { immediate: true });
+watch(
+  () => settingsStore.editorSettings.fontSmoothing,
+  (enabled) => document.documentElement.classList.toggle("dbx-font-smoothing", enabled),
+  { immediate: true },
+);
 // Mirrors the template gate above the app shell. The backend liveness stream is registered
 // against it so the web runtime only opens an authenticated subscription.
 const appReady = computed(() => !setupRequired.value && (!needsAuth.value || authenticated.value));
@@ -596,6 +604,9 @@ const pendingSaveShouldCloseTab = ref(true);
 const pendingAppCloseAction = ref<AppCloseAction | null>(null);
 const pendingCloseActionChoice = ref(false);
 const showAiRunsClosePrompt = ref(false);
+// 后台任务运行中退出的确认框（#13281）：仅 quit 需要确认，hide（最小化到托盘）不中断任务。
+const showBackgroundTasksClosePrompt = ref(false);
+let backgroundTasksQuitConfirmed = false;
 const blockingAiRunCount = computed(() => (isDesktop ? blockingDesktopAiRunsForQuit().length : 0));
 let aiRunsQuitConfirmed = false;
 
@@ -1057,6 +1068,7 @@ async function resolveActiveExecutableSql(snapshot?: SqlExecutionSnapshot, execu
     mode: settingsStore.editorSettings.executeMode,
     cursorPos: snapshot?.cursorPos ?? (tab.id === activeTab.value?.id ? cursorPos.value : (selection?.head ?? 0)),
     databaseType: connection?.db_type,
+    mongoQueryLanguage: tab.mongoQueryLanguage,
   });
 }
 
@@ -2398,6 +2410,8 @@ function cancelPendingAppClose() {
   pendingCloseActionChoice.value = false;
   showAiRunsClosePrompt.value = false;
   aiRunsQuitConfirmed = false;
+  showBackgroundTasksClosePrompt.value = false;
+  backgroundTasksQuitConfirmed = false;
   pendingSaveShouldCloseTab.value = true;
 }
 
@@ -2408,7 +2422,15 @@ async function finishPendingAppClose(action: AppCloseAction) {
     showAiRunsClosePrompt.value = true;
     return;
   }
+  // 后台任务（传输/导出等）运行中：退出会硬切断任务且无法恢复，先确认（#13281）。
+  // 两个确认都通过后再重置标志，否则确认完后台任务会再次弹出 AI 运行确认。
+  if (action === "quit" && !backgroundTasksQuitConfirmed && activeBackgroundTaskCount.value > 0) {
+    pendingAppCloseAction.value = action;
+    showBackgroundTasksClosePrompt.value = true;
+    return;
+  }
   aiRunsQuitConfirmed = false;
+  backgroundTasksQuitConfirmed = false;
   if (pendingCloseActionChoice.value) {
     pendingCloseActionChoice.value = false;
     showCloseActionPrompt.value = true;
@@ -2442,6 +2464,26 @@ function confirmQuitWithActiveAiRuns() {
   showAiRunsClosePrompt.value = false;
   aiRunsQuitConfirmed = true;
   void finishPendingAppClose(action);
+}
+
+// 用户确认退出后：尽力给每个运行中的任务发取消通知（后端有机会清理连接/事务），
+// 随后照常走退出流程——进程终止前收不到回应也不再等待。
+function confirmQuitWithActiveBackgroundTasks() {
+  const action = pendingAppCloseAction.value ?? "quit";
+  showBackgroundTasksClosePrompt.value = false;
+  backgroundTasksQuitConfirmed = true;
+  for (const task of backgroundTasks.value) {
+    if (task.status === "Running" || task.status === "Writing") void cancelBackgroundTask(task.exportId);
+  }
+  void finishPendingAppClose(action);
+}
+
+// Web 版：后台任务运行中时关闭标签页/刷新前弹浏览器原生确认（文案不可自定义，
+// 但能阻止误关闭导致任务静默中断）。
+function handleWebBeforeUnload(event: BeforeUnloadEvent) {
+  if (activeBackgroundTaskCount.value <= 0) return;
+  event.preventDefault();
+  event.returnValue = "";
 }
 
 function continuePendingAppCloseAfterSave() {
@@ -4690,6 +4732,20 @@ async function handleKeydown(e: KeyboardEvent) {
     openSettings();
     return;
   }
+  if (workspaceRendered() && activeTab.value?.mode === "pl-debug") {
+    const debug = usePlDebugStore();
+    if (
+      dispatchPlDebugStepShortcut(e, {
+        isDebugTab: true,
+        canStep: debug.hasSession && !debug.busy && !debug.recoveryRequired && debug.publicSnapshot?.state === "paused",
+        shortcuts,
+        run: (command) => {
+          void (command === "stepInto" ? debug.stepIn() : command === "stepOut" ? debug.stepOut() : debug.stepOver()).catch(() => undefined);
+        },
+      })
+    )
+      return;
+  }
   if (isQuickOpenShortcut(e, shortcuts)) {
     e.preventDefault();
     e.stopPropagation();
@@ -5235,6 +5291,8 @@ onMounted(async () => {
     true,
   );
   if (!isDesktop) {
+    // Web 版没有原生关闭事件拦截，用浏览器 beforeunload 原生确认兜底（#13281）。
+    window.addEventListener("beforeunload", handleWebBeforeUnload);
     if (!startupProps.startupAuthentication) {
       try {
         const data = await checkStartupAuthentication();
@@ -5319,6 +5377,7 @@ onUnmounted(() => {
   window.removeEventListener(OBJECT_BROWSER_SEARCH_FOCUS_EVENT, focusRequestedObjectBrowserSearch);
   window.removeEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);
   window.removeEventListener("dbx:ai-run-notify", handleAiRunNotify);
+  window.removeEventListener("beforeunload", handleWebBeforeUnload);
   document.removeEventListener("contextmenu", handleContextMenu);
   window.clearTimeout(sqlLibraryFlyAnimationTimer);
 });
@@ -5892,6 +5951,7 @@ onUnmounted(() => {
         <ExternalSqlFileChangeDialog :prompt="externalSqlFilePrompt" @decide="externalSqlFileChanges.resolvePrompt" />
         <CloseActionPromptDialog v-if="isDesktop && showCloseActionPrompt" :open="showCloseActionPrompt" @update:open="handleCloseActionPromptOpenChange" @quit="chooseQuit" @minimize="chooseMinimize" />
         <AiRunsClosePromptDialog v-if="isDesktop && showAiRunsClosePrompt" v-model:open="showAiRunsClosePrompt" :count="blockingAiRunCount" @cancel="cancelPendingAppClose" @quit="confirmQuitWithActiveAiRuns" />
+        <BackgroundTasksClosePromptDialog v-if="isDesktop && showBackgroundTasksClosePrompt" v-model:open="showBackgroundTasksClosePrompt" :count="activeBackgroundTaskCount" @cancel="cancelPendingAppClose" @quit="confirmQuitWithActiveBackgroundTasks" />
         <QuickOpenDialog :open="showQuickOpen" :initial-content-mode="quickOpenForceContent" @update:open="showQuickOpen = $event" @select="handleQuickOpenSelect" />
         <OracleTypeManagementDialog v-if="oracleTypeManagementRequest" />
         <TabSwitcherDialog :open="showTabSwitcher" :tabs="tabSwitcherTabs" :selected-index="tabSwitcherIndex" :shortcut-hint="tabSwitcherShortcutHint" @update:open="handleTabSwitcherOpenChange" @update:selected-index="tabSwitcherIndex = $event" @select="handleTabSwitcherSelect" />

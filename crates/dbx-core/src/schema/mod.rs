@@ -7947,7 +7947,18 @@ async fn list_objects_once(
             } else if db_config.as_ref().is_some_and(db::starrocks::is_config) {
                 db::starrocks::list_table_objects(p, database).await.map(unpaged_object_list)
             } else if db_config.as_ref().is_some_and(db::oceanbase_mysql::is_config) {
-                db::oceanbase_mysql::list_objects(p, database).await.map(unpaged_object_list)
+                let mut objects = db::oceanbase_mysql::list_objects(p, database).await?;
+                // The OceanBase MySQL branch only lists tables/materialized views and
+                // routines; reuse the generic MySQL trigger/event queries so the object
+                // browser counts match SHOW TRIGGERS / information_schema.EVENTS.
+                let supplemental_types = vec!["TRIGGER".to_string(), "EVENT".to_string()];
+                match db::mysql::list_objects(p, database, Some(&supplemental_types), None, None).await {
+                    Ok(supplemental) => objects.extend(supplemental.objects),
+                    Err(error) => log::warn!(
+                        "Skipping triggers/events for OceanBase database `{database}` in object browser: {error}"
+                    ),
+                }
+                Ok(unpaged_object_list(objects))
             } else if db_config.as_ref().is_some_and(db::mysql_compatible::uses_show_metadata) {
                 db::mysql::list_table_objects_show(p, database).await.map(unpaged_object_list)
             } else if mysql_table_list_source_for_config(db_config.as_ref()) == MysqlTableListSource::ShowFullTables {
@@ -8232,7 +8243,7 @@ where
     retry_metadata_connection_for_session(state, connection_id, database, None, operation).await
 }
 
-async fn retry_metadata_connection_for_session<T, F, Fut>(
+pub(crate) async fn retry_metadata_connection_for_session<T, F, Fut>(
     state: &AppState,
     connection_id: &str,
     database: Option<&str>,
@@ -8247,7 +8258,7 @@ where
         .await
 }
 
-async fn run_metadata_connection_for_session<T, F, Fut>(
+pub(crate) async fn run_metadata_connection_for_session<T, F, Fut>(
     state: &AppState,
     connection_id: &str,
     database: Option<&str>,
@@ -12614,7 +12625,6 @@ fn oracle_list_objects_sql_for_owner(owner: &str, type_owner: &str) -> String {
          FROM all_objects o LEFT JOIN all_indexes i ON o.object_type = 'INDEX' AND i.owner = o.owner AND i.index_name = o.object_name \
          WHERE ((o.owner = {owner} AND o.object_type IN ('TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'TRIGGER', 'SEQUENCE', 'PACKAGE', 'PACKAGE BODY', 'INDEX')) \
             OR (o.owner = {type_owner} AND o.object_type IN ('TYPE', 'TYPE BODY'))) \
-         AND (o.object_type <> 'INDEX' OR i.generated = 'N' OR i.generated IS NULL) \
          ORDER BY CASE o.object_type WHEN 'TABLE' THEN 0 WHEN 'VIEW' THEN 1 WHEN 'PROCEDURE' THEN 2 WHEN 'FUNCTION' THEN 3 WHEN 'SEQUENCE' THEN 4 WHEN 'PACKAGE' THEN 5 WHEN 'PACKAGE BODY' THEN 6 ELSE 7 END, o.object_name, o.object_type"
     )
 }

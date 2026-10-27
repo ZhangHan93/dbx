@@ -135,7 +135,7 @@ describe("useSidebarTreeExportRuntime", () => {
       activeNode.value = secondNode;
       settingsStore.editorSettings.separateDdlIndexes = true;
       await vi.waitFor(() => expect(apiMock.getTableDdl).toHaveBeenCalledTimes(2));
-      expect(apiMock.getTableDdl.mock.calls[1]).toEqual(["conn-1", "db", "app", "A", undefined, undefined, true, undefined, true]);
+      expect(apiMock.getTableDdl.mock.calls[1]).toEqual(["conn-1", "db", "app", "A", undefined, undefined, true, undefined, true, "app"]);
       await vi.waitFor(() => expect(isLoadingStructurePreview.value).toBe(false));
       expect(structurePreviewSql.value).toContain("CREATE INDEX ix");
       expect(structurePreviewDefaultFileName.value).toBe("A.sql");

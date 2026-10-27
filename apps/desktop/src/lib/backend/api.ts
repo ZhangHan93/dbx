@@ -21,7 +21,7 @@ async function getBackend(): Promise<Backend> {
 // Helper: create a forwarding function that lazily resolves the backend
 // ---------------------------------------------------------------------------
 
-function forward<K extends keyof Backend>(name: K): Backend[K] {
+function forward<K extends keyof Backend>(name: K, logErrorDetails = true): Backend[K] {
   // SAFETY: the resolved module is one of exactly two implementations of the same
   // surface — `http.ts` imports its request/response types from `tauri.ts` on
   // purpose, so both transports are kept signature-compatible by construction.
@@ -42,7 +42,7 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
       appendDebugLog("error", "[DBX][api:error]", {
         operation,
         elapsedMs: Math.round(performance.now() - startedAt),
-        error,
+        ...(logErrorDetails ? { error } : {}),
       });
       throw error;
     }
@@ -52,6 +52,19 @@ function forward<K extends keyof Backend>(name: K): Backend[K] {
 // ---------------------------------------------------------------------------
 // Re-export all functions via lazy forwarding
 // ---------------------------------------------------------------------------
+
+// PL/SQL debugger
+export const plDebugBootstrap = forward("plDebugBootstrap", false);
+export const plDebugInspect = forward("plDebugInspect", false);
+export const plDebugCompile = forward("plDebugCompile", false);
+export const plDebugCompileStatus = forward("plDebugCompileStatus", false);
+export const plDebugList = forward("plDebugList", false);
+export const plDebugStart = forward("plDebugStart", false);
+export const plDebugStatus = forward("plDebugStatus", false);
+export const plDebugHeartbeat = forward("plDebugHeartbeat", false);
+export const plDebugOperation = forward("plDebugOperation", false);
+export const plDebugOperate = forward("plDebugOperate", false);
+export const plDebugRead = forward("plDebugRead", false);
 
 // Connection
 export const testConnection = forward("testConnection");

@@ -831,6 +831,7 @@ pub async fn get_table_ddl(
     portable: Option<bool>,
     exact_identity: Option<bool>,
     separate_indexes: Option<bool>,
+    explicit_owner: Option<String>,
 ) -> Result<String, String> {
     let separate_indexes = separate_indexes.unwrap_or(false) && object_type.is_none();
     let result = if exact_identity.unwrap_or(false) {
@@ -856,8 +857,16 @@ pub async fn get_table_ddl(
         dbx_core::schema::get_table_ddl_core(&state, &connection_id, &database, &schema, &table, object_type).await?
     };
     if separate_indexes {
-        dbx_core::schema::separate_table_ddl_indexes_core(&state, &connection_id, &database, &schema, &table, &result)
-            .await
+        dbx_core::schema::separate_table_ddl_indexes_core(
+            &state,
+            &connection_id,
+            &database,
+            &schema,
+            &table,
+            &result,
+            explicit_owner.as_deref().or_else(|| exact_identity.unwrap_or(false).then_some(schema.as_str())),
+        )
+        .await
     } else {
         Ok(result)
     }

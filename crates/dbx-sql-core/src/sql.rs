@@ -91,6 +91,9 @@ pub struct SqlFileRequest {
     /// BOM/UTF-8/GBK detection behavior.
     #[serde(default)]
     pub encoding: SqlFileEncoding,
+    /// Explicitly allow desktop scripts to include SQL below the entry file's directory.
+    #[serde(default)]
+    pub resolve_includes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -714,6 +717,22 @@ pub struct SqlStatementWithControl {
 impl SqlStatementSplitter {
     pub fn with_options(options: SqlParsingOptions) -> Self {
         Self { options, ..Self::default() }
+    }
+
+    /// A whole-line file directive must not be interpreted inside SQL text.
+    pub fn can_start_file_directive(&self) -> bool {
+        !self.in_single_quote
+            && !self.in_double_quote
+            && !self.in_backtick
+            && !self.in_line_comment
+            && self.block_comment_depth == 0
+            && self.dollar_quote_tag.is_none()
+            && !self.oracle_q_quote.is_open()
+            && self.pending_psql_command.is_none()
+    }
+
+    pub fn is_at_file_directive_boundary(&self) -> bool {
+        self.can_start_file_directive() && !has_executable_sql_with_options(&self.buffer, self.options)
     }
 
     pub fn push_chunk(&mut self, chunk: &str) -> Vec<String> {
@@ -2637,6 +2656,7 @@ pub fn optimize_sql_file_import_statements_with_max_insert_batch_statements(
     let mut pending_insert: Option<PendingInsertBatch> = None;
     let merge_adjacent_inserts =
         db_type.as_ref().is_none_or(|db_type| !is_mysql_compatible_import_target(db_type, driver_profile));
+    let insert_batch_syntax = insert_batch_syntax(db_type.as_ref());
 
     for statement in statements {
         let action = db_type
@@ -2669,10 +2689,10 @@ pub fn optimize_sql_file_import_statements_with_max_insert_batch_statements(
                         Some(batch) if batch.can_accept(&insert, max_insert_batch_statements) => batch.push(insert),
                         Some(_) => {
                             flush_pending_insert(&mut optimized, &mut pending_insert);
-                            pending_insert = Some(PendingInsertBatch::new(insert));
+                            pending_insert = Some(PendingInsertBatch::new(insert, insert_batch_syntax));
                         }
                         None => {
-                            pending_insert = Some(PendingInsertBatch::new(insert));
+                            pending_insert = Some(PendingInsertBatch::new(insert, insert_batch_syntax));
                         }
                     }
                 } else {
@@ -2706,6 +2726,23 @@ fn flush_pending_insert(optimized: &mut Vec<SqlFileImportStatement>, pending_ins
 const SQL_FILE_INSERT_BATCH_MAX_STATEMENTS: usize = 500;
 const SQL_FILE_INSERT_BATCH_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// How a merged insert batch must be spelled for its target dialect.
+///
+/// Oracle-family servers reject the MySQL multi-row `VALUES (…), (…)` form, so
+/// merging there has to produce `INSERT ALL … SELECT 1 FROM dual` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InsertBatchSyntax {
+    MultiRowValues,
+    OracleInsertAll,
+}
+
+fn insert_batch_syntax(db_type: Option<&DatabaseType>) -> InsertBatchSyntax {
+    match db_type {
+        Some(DatabaseType::Oracle | DatabaseType::OceanbaseOracle) => InsertBatchSyntax::OracleInsertAll,
+        _ => InsertBatchSyntax::MultiRowValues,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MergeableInsert {
     prefix: String,
@@ -2722,12 +2759,14 @@ struct PendingInsertBatch {
     source_sqls: Vec<String>,
     source_statement_count: usize,
     byte_len: usize,
+    syntax: InsertBatchSyntax,
 }
 
 impl PendingInsertBatch {
-    fn new(insert: MergeableInsert) -> Self {
+    fn new(insert: MergeableInsert, syntax: InsertBatchSyntax) -> Self {
         let byte_len = insert.prefix.len() + insert.values.len() + 16;
         Self {
+            syntax,
             prefix: insert.prefix,
             prefix_key: insert.prefix_key,
             values: vec![insert.values],
@@ -2754,8 +2793,47 @@ impl PendingInsertBatch {
         if self.source_statement_count == 1 {
             return self.source_sqls.first().cloned().unwrap_or_default();
         }
+        if self.syntax == InsertBatchSyntax::OracleInsertAll {
+            if let Some(target) = oracle_insert_all_target(&self.prefix) {
+                let mut sql = String::with_capacity(
+                    self.byte_len + "INSERT ALL\n".len() + "SELECT 1 FROM dual".len() + target.len() + 14,
+                );
+                sql.push_str("INSERT ALL\n");
+                for values in &self.values {
+                    sql.push_str("INTO ");
+                    sql.push_str(target);
+                    sql.push_str(" VALUES ");
+                    sql.push_str(values);
+                    sql.push('\n');
+                }
+                sql.push_str("SELECT 1 FROM dual");
+                return sql;
+            }
+        }
         format!("{} VALUES\n{}", self.prefix, self.values.join(",\n"))
     }
+}
+
+/// The `table (columns)` part of `INSERT INTO table (columns) VALUES …`, used
+/// as the repeated `INTO` clause of an `INSERT ALL` batch.
+fn oracle_insert_all_target(prefix: &str) -> Option<&str> {
+    let mut scanner = SqlScanner::default();
+    let mut seen_insert = false;
+    for (idx, ch) in prefix.char_indices() {
+        scanner.step(prefix, idx, ch);
+        if scanner.is_masked() {
+            continue;
+        }
+        if !seen_insert {
+            seen_insert = keyword_at(prefix, idx, "insert");
+            continue;
+        }
+        if keyword_at(prefix, idx, "into") {
+            let target = prefix[idx + "into".len()..].trim();
+            return (!target.is_empty()).then_some(target);
+        }
+    }
+    None
 }
 
 fn parse_mergeable_insert(sql: &str, options: SqlParsingOptions) -> Option<MergeableInsert> {
@@ -4119,7 +4197,7 @@ fn has_executable_sql_with_options(statement: &str, options: SqlParsingOptions) 
             continue;
         }
 
-        if ch == '-' && next == Some('-') {
+        if ch == '-' && next == Some('-') && dash_dash_starts_line_comment(options.profile, chars.get(i + 2).copied()) {
             in_line_comment = true;
             previous = Some(ch);
             i += 1;
@@ -4179,6 +4257,20 @@ mod tests {
         starts_with_executable_sql_keyword_for_database, starts_with_oracle_style_routine_body, SqlDialectProfile,
         SqlFileRequest, SqlFileStatementAction, SqlParsingOptions, SqlStatementSplitter,
     };
+
+    #[test]
+    fn file_directive_boundaries_use_the_dialect_line_comment_rule() {
+        let mut mysql = SqlStatementSplitter::with_options(SqlParsingOptions::for_database_type(DatabaseType::Mysql));
+        mysql.push_chunk("--foo\n");
+        assert!(!mysql.is_at_file_directive_boundary());
+        let mut sqlite = SqlStatementSplitter::with_options(SqlParsingOptions::for_database_type(DatabaseType::Sqlite));
+        sqlite.push_chunk("--foo\n");
+        assert!(sqlite.is_at_file_directive_boundary());
+        let mut mysql_comment =
+            SqlStatementSplitter::with_options(SqlParsingOptions::for_database_type(DatabaseType::Mysql));
+        mysql_comment.push_chunk("-- real comment\n");
+        assert!(mysql_comment.is_at_file_directive_boundary());
+    }
 
     #[test]
     fn sql_file_request_keeps_failure_logging_on_when_the_field_is_absent() {
@@ -5109,6 +5201,39 @@ mod tests {
         assert_eq!(optimized[0].source_statement_count, 2);
         assert_eq!(optimized[0].sql, "INSERT INTO users (id, name) VALUES\n(1, 'Ada'),\n(2, 'Linus')");
         assert_eq!(optimized[1].sql, "SELECT 1");
+    }
+
+    #[test]
+    fn optimizes_adjacent_oracle_family_inserts_into_insert_all() {
+        let statements = vec![
+            "Insert into SYS_QUESTION (ID, NAME) values ('001', '市场监管')".to_string(),
+            "Insert into SYS_QUESTION (ID, NAME) values ('002', '网络交易')".to_string(),
+        ];
+
+        for db_type in [DatabaseType::Oracle, DatabaseType::OceanbaseOracle] {
+            let optimized = optimize_sql_file_import_statements(&statements, Some(db_type), None);
+
+            assert_eq!(optimized.len(), 1, "{db_type:?}");
+            assert_eq!(optimized[0].source_statement_count, 2, "{db_type:?}");
+            assert_eq!(
+                optimized[0].sql,
+                "INSERT ALL\n\
+                 INTO SYS_QUESTION (ID, NAME) VALUES ('001', '市场监管')\n\
+                 INTO SYS_QUESTION (ID, NAME) VALUES ('002', '网络交易')\n\
+                 SELECT 1 FROM dual",
+                "{db_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_single_oracle_insert_as_written() {
+        let statements = vec!["INSERT INTO users (id) VALUES (1)".to_string()];
+
+        let optimized = optimize_sql_file_import_statements(&statements, Some(DatabaseType::OceanbaseOracle), None);
+
+        assert_eq!(optimized.len(), 1);
+        assert_eq!(optimized[0].sql, statements[0]);
     }
 
     #[test]

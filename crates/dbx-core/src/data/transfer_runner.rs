@@ -66,6 +66,22 @@ async fn emit_terminal_progress<F>(
     emitter.emit_terminal(progress);
 }
 
+fn cancelled_table_counts(
+    source: &DatabaseType,
+    target: &DatabaseType,
+    moved_rows: Option<u64>,
+    source_rows: Option<u64>,
+) -> (u64, Option<u64>) {
+    // Cancellation does not roll back batches already committed to Xugu. Keep
+    // the current table's acknowledged writes, never a previous table's count.
+    // Preserve the existing terminal-event contract for every other DB pair.
+    if super::transfer::mysql_xugu::is_pair(source, target) {
+        (moved_rows.unwrap_or(0), source_rows)
+    } else {
+        (0, None)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_transfer<F>(
     state: Arc<AppState>,
@@ -87,6 +103,9 @@ where
 
     let (routine_context, package_transfer) = match async {
         super::transfer::validate_transfer_database_pair(&request, &source_db_type, &target_db_type)?;
+        if super::transfer::mysql_xugu::is_pair(&source_db_type, &target_db_type) {
+            super::transfer::mysql_xugu::preflight(&state, &request, &source_pool_key, &target_pool_key).await?;
+        }
         let routine = crate::schema::oracle_routines::capture_routine_transfer_context(
             &state,
             &request.source_connection_id,
@@ -506,6 +525,8 @@ where
                 }
                 Err(e) => {
                     if e == "Cancelled" {
+                        let (rows_transferred, total_rows) =
+                            cancelled_table_counts(&source_db_type, &target_db_type, moved_row_count, source_row_count);
                         if let Some(journal) = history.as_ref() {
                             journal
                                 .finish_table(
@@ -527,8 +548,8 @@ where
                                 table: table.clone(),
                                 table_index: i,
                                 total_tables,
-                                rows_transferred: 0,
-                                total_rows: None,
+                                rows_transferred,
+                                total_rows,
                                 status: TransferStatus::Cancelled,
                                 error: None,
                                 terminal: true,
@@ -798,6 +819,26 @@ mod tests {
     use super::*;
     use crate::models::connection::ConnectionConfig;
     use serde_json::json;
+
+    #[test]
+    fn mysql_xugu_cancellation_preserves_only_current_table_acknowledged_rows() {
+        assert_eq!(
+            cancelled_table_counts(&DatabaseType::Mysql, &DatabaseType::Xugu, Some(413), Some(10_000)),
+            (413, Some(10_000))
+        );
+        assert_eq!(
+            cancelled_table_counts(&DatabaseType::Mysql, &DatabaseType::Xugu, None, Some(10_000)),
+            (0, Some(10_000))
+        );
+        assert_eq!(cancelled_table_counts(&DatabaseType::Mysql, &DatabaseType::Xugu, None, None), (0, None));
+        for (source, target) in [
+            (DatabaseType::Mysql, DatabaseType::Mysql),
+            (DatabaseType::Xugu, DatabaseType::Xugu),
+            (DatabaseType::Postgres, DatabaseType::Xugu),
+        ] {
+            assert_eq!(cancelled_table_counts(&source, &target, Some(413), Some(10_000)), (0, None));
+        }
+    }
 
     #[tokio::test]
     async fn unsupported_package_requests_stop_before_connection_capture_or_any_table_work() {

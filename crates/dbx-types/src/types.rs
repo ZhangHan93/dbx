@@ -595,6 +595,7 @@ impl QueryMessage {
 pub struct LargeValueCell {
     pub row_index: usize,
     pub column_index: usize,
+    /// With `value_ref`, zero can mean an unknown byte size, not an empty value.
     pub original_bytes: usize,
     /// Opaque original-result locator. Absent for legacy preview/re-query drivers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2011,16 +2012,19 @@ mod tests {
 
     #[test]
     fn query_result_receives_deferred_cells_without_serializing_a_second_metadata_field() {
-        let mut wire = serde_json::to_value(bigint_result_sample()).unwrap();
-        wire["large_value_cells"] = serde_json::json!([{
-            "row_index": 0, "column_index": 0, "original_bytes": 67108864, "value_ref": "original-lob"
-        }]);
-        let result: super::QueryResult = serde_json::from_value(wire).unwrap();
-        assert_eq!(result.deferred_large_value_cells.len(), 1);
-        assert_eq!(result.deferred_large_value_cells[0].value_ref.as_deref(), Some("original-lob"));
-        let serialized = serde_json::to_value(&result).unwrap();
-        assert!(serialized.get("large_value_cells").is_none());
-        assert!(serialized.get("deferred_large_value_cells").is_none());
+        for original_bytes in [0, 67108864] {
+            let mut wire = serde_json::to_value(bigint_result_sample()).unwrap();
+            wire["large_value_cells"] = serde_json::json!([{
+                "row_index": 0, "column_index": 0, "original_bytes": original_bytes, "value_ref": "original-lob"
+            }]);
+            let result: super::QueryResult = serde_json::from_value(wire).unwrap();
+            assert_eq!(result.deferred_large_value_cells.len(), 1);
+            assert_eq!(result.deferred_large_value_cells[0].value_ref.as_deref(), Some("original-lob"));
+            assert_eq!(result.deferred_large_value_cells[0].original_bytes, original_bytes);
+            let serialized = serde_json::to_value(&result).unwrap();
+            assert!(serialized.get("large_value_cells").is_none());
+            assert!(serialized.get("deferred_large_value_cells").is_none());
+        }
     }
 
     fn bigint_result_sample() -> super::QueryResult {

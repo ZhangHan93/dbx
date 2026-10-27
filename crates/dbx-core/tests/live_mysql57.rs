@@ -1380,6 +1380,7 @@ INSERT INTO install_check (id) VALUES (1), (2);
         part_cooldown_ms: 0,
         skip_relational_constraints: false,
         failure_log_enabled: true,
+        resolve_includes: false,
         encoding: Default::default(),
     };
 
@@ -1472,6 +1473,7 @@ INSERT INTO children (parent_id) VALUES (LAST_INSERT_ID());
         part_cooldown_ms: 0,
         skip_relational_constraints: false,
         failure_log_enabled: true,
+        resolve_includes: false,
         encoding: Default::default(),
     };
 
@@ -1548,6 +1550,7 @@ async fn live_sql_file_import_preserves_raw_mysql_binary_literal_bytes() {
         part_cooldown_ms: 0,
         skip_relational_constraints: false,
         failure_log_enabled: true,
+        resolve_includes: false,
         encoding: Default::default(),
     };
 

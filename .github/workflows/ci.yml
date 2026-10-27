@@ -1479,6 +1479,8 @@ jobs:
         run: sudo python3 ../.github/scripts/ci-install-system-deps.py --group packaging
       - name: Java agent tests and packages
         run: python3 ../.github/scripts/ci-gradle.py agents -- ./gradlew test shadowJar --continue
+      - name: Gradle repository authentication tests
+        run: python3 ../.github/scripts/ci-gradle-repositories.test.py
       - name: Agent jar validation
         run: python3 scripts/validate_agent_jars.py
   agent-rust:

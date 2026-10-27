@@ -307,6 +307,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "appearance-theme", category: "appearance", titleKey: "settings.theme", targetId: "appearance" },
   { id: "appearance-color-theme", category: "appearance", titleKey: "settings.colorTheme", targetId: "appearance", keywordKeys: APP_CUSTOM_UI_COLOR_DEFS.map((item) => item.labelKey) },
   { id: "appearance-ui-scale", category: "appearance", titleKey: "settings.uiScale", descriptionKey: "settings.uiScaleDescription", targetId: "appearance" },
+  { id: "appearance-font-smoothing", category: "appearance", titleKey: "settings.fontSmoothing", descriptionKey: "settings.fontSmoothingDescription", targetId: "appearance" },
   { id: "appearance-ui-font", category: "appearance", titleKey: "settings.uiFontFamily", descriptionKey: "settings.uiFontFamilyDescription", targetId: "appearance" },
   { id: "appearance-grid-font", category: "appearance", titleKey: "settings.dataGridFontFamily", descriptionKey: "settings.dataGridFontFamilyDescription", targetId: "appearance" },
   { id: "appearance-corners", category: "appearance", titleKey: "settings.cornerStyle", targetId: "appearance" },
@@ -377,6 +378,7 @@ export const SETTINGS_SEARCH_DEFINITIONS: readonly SettingsSearchDefinition[] = 
   { id: "navigation-active-node", category: "navigation", titleKey: "settings.autoSelectActiveSidebarNode", descriptionKey: "settings.autoSelectActiveSidebarNodeDescription", targetId: "navigation" },
   { id: "navigation-sidebar-pin-default-database", category: "navigation", titleKey: "settings.sidebarPinDefaultDatabase", descriptionKey: "settings.sidebarPinDefaultDatabaseDescription", targetId: "navigation" },
   { id: "navigation-browse-objects-on-database-activation", category: "navigation", titleKey: "settings.sidebarBrowseObjectsOnDatabaseActivation", descriptionKey: "settings.sidebarBrowseObjectsOnDatabaseActivationDescription", targetId: "navigation" },
+  { id: "navigation-expand-tree-on-connect", category: "navigation", titleKey: "settings.sidebarExpandTreeOnConnect", descriptionKey: "settings.sidebarExpandTreeOnConnectDescription", targetId: "navigation" },
   {
     id: "navigation-tabs-restore",
     category: "navigation",

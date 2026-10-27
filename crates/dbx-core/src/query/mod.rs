@@ -4,6 +4,7 @@ pub mod document_ops;
 pub mod hbase_ops;
 pub mod mongo_ops;
 pub mod object_cache;
+pub mod pl_debug;
 pub mod plugin_data;
 pub mod plugin_plan;
 pub mod query_cancel;
@@ -12874,6 +12875,7 @@ for line in sys.stdin:
             part_cooldown_ms: 0,
             skip_relational_constraints: false,
             failure_log_enabled: true,
+            resolve_includes: false,
             encoding: Default::default(),
         }
     }

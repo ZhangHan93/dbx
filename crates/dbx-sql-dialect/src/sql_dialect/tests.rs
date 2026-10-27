@@ -246,7 +246,7 @@ fn maps_table_pagination_strategy_by_database_type() {
     assert_eq!(table_pagination_strategy(Some(DatabaseType::OceanbaseOracle)), TablePaginationStrategy::Rownum);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Questdb)), TablePaginationStrategy::QuestDbLimit);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Oracle)), TablePaginationStrategy::Rownum);
-    assert_eq!(table_pagination_strategy(Some(DatabaseType::Oscar)), TablePaginationStrategy::Rownum);
+    assert_eq!(table_pagination_strategy(Some(DatabaseType::Oscar)), TablePaginationStrategy::LimitOffset);
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Cassandra)), TablePaginationStrategy::AgentMaxRows);
     assert_eq!(
         pagination_strategy(Some(DatabaseType::Cassandra), PaginationContext::BoundedRead),
@@ -276,6 +276,38 @@ fn maps_table_pagination_strategy_by_database_type() {
     // Both Spanner dialects support `LIMIT n OFFSET m`; pin the fallback.
     assert_eq!(table_pagination_strategy(Some(DatabaseType::Spanner)), TablePaginationStrategy::LimitOffset);
     assert_eq!(table_pagination_strategy(None), TablePaginationStrategy::LimitOffset);
+}
+
+#[test]
+fn oscar_table_data_pages_use_one_limit_pagination_form_without_rownum() {
+    let options = TableDataSelectSqlOptions {
+        database_type: Some(DatabaseType::Oscar),
+        schema: Some("SYSDBA".to_string()),
+        table_name: "USERS".to_string(),
+        table_type: Some("TABLE".to_string()),
+        primary_keys: vec!["ID".to_string()],
+        columns: vec!["ID".to_string(), "NAME".to_string()],
+        order_by: Some("\"ID\" ASC".to_string()),
+        limit: Some(100),
+        offset: Some(0),
+        ..Default::default()
+    };
+
+    // OSCAR rejects a statement that combines ROWNUM with a LIMIT. The JDBC
+    // agent always caps table-data statements with setMaxRows(), so table
+    // previews must not also wrap the statement in ROWNUM: a later page's
+    // ROWNUM bound (offset + limit) exceeds the driver cap and the server
+    // reports "rownum and limit cannot be mixed" (#13515).
+    let first_page = build_table_data_select_sql(options.clone());
+    assert_eq!(first_page, "SELECT \"ID\", \"NAME\" FROM \"SYSDBA\".\"USERS\" ORDER BY \"ID\" ASC LIMIT 100;");
+    assert!(!first_page.to_ascii_uppercase().contains("ROWNUM"), "{first_page}");
+
+    let second_page = build_table_data_select_sql(TableDataSelectSqlOptions { offset: Some(100), ..options });
+    assert_eq!(
+        second_page,
+        "SELECT \"ID\", \"NAME\" FROM \"SYSDBA\".\"USERS\" ORDER BY \"ID\" ASC LIMIT 100 OFFSET 100;"
+    );
+    assert!(!second_page.to_ascii_uppercase().contains("ROWNUM"), "{second_page}");
 }
 
 #[test]

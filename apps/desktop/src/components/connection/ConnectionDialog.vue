@@ -145,7 +145,7 @@ import { assertCompleteDatabaseCategories, databaseSelectionForCategory } from "
 import { loadConnectionPickerView, saveConnectionPickerView, type DbPickerView } from "@/lib/connection/connectionPickerViewPreference";
 import { buildRocketMqConfig, hydrateRocketMqConfig, isRocketMqConfigValid, rocketMqConnectionTarget } from "@/lib/connection/rocketmqConfig";
 import { normalizeRabbitmqAddresses, parseRabbitmqAddress } from "@/lib/connection/rabbitmqAddresses";
-import { pluginFieldIsRequired, pluginFieldIsVisible } from "@/lib/plugins/pluginFieldConditions";
+import { pluginFieldHasValue as pluginFieldHasValueOf, pluginFieldIsRequired, pluginFieldIsVisible } from "@/lib/plugins/pluginFieldConditions";
 import { detectMqUiAuthKind, isMqAuthKindAllowedForSystem, type MqUiAuthKind } from "@/lib/connection/mqAuth";
 import { driverInstallProgressChannel, driverInstallProgressPercent, isDriverInstallProgressForOperation, requestAgentInstallCancellation, resolveAgentInstallOutcome, type DriverInstallProgress } from "@/lib/connection/driverInstallProgressUi";
 import { requiresSqlServerLegacyCompatibilityComponent, setSqlServerLegacyCompatibilityConfig, sqlServerUsesLegacyCompatibility, SQLSERVER_LEGACY_COMPATIBILITY_DRIVER_KEY } from "@/lib/connection/sqlServerLegacyCompatibility";
@@ -4478,8 +4478,7 @@ function pluginFieldValue(field: PluginFormField): PluginFormFieldValue {
 }
 
 function pluginFieldHasValue(field: PluginFormField): boolean {
-  const value = pluginFieldValue(field);
-  return typeof value === "string" ? value.trim().length > 0 : value !== undefined;
+  return pluginFieldHasValueOf(field, pluginFieldValue(field));
 }
 
 function pluginFieldValueByKey(key: string): PluginFormFieldValue {

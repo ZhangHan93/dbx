@@ -870,6 +870,7 @@ async fn serve() -> Result<(), String> {
         .route("/tab-runtime-cache/prune", post(routes::tab_runtime_cache::prune_tab_runtime_cache))
         .route("/tab-runtime-cache/owner", delete(routes::tab_runtime_cache::delete_tab_runtime_cache_owner))
         // Query
+        .merge(routes::pl_debug::router())
         .route("/query/execute", post(routes::query::execute_query))
         .route("/query/execute-conditional-update", post(routes::query::execute_conditional_update))
         .route("/query/execute-multi", post(routes::query::execute_multi))

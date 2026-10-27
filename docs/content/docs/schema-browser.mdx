@@ -61,7 +61,7 @@ Object-tree search can match:
 - Object paths, column comments, and table comments
 - Loaded metadata and complete cached table/view indexes
 
-The main sidebar search reuses table/view indexes from memory or the persisted schema cache. When an index is missing, the first search builds it for the eligible scopes in the active, connected datasource. Further edits filter the index locally without reloading the datasource tree. The “Search only opened databases” setting controls which databases are indexed; when none are open, all visible databases are eligible.
+The main sidebar search reuses table/view indexes from memory or the persisted schema cache. When an index is missing, the first search builds it for the eligible scopes in the active, connected datasource. Further edits filter the index locally without reloading the datasource tree. With “Search only opened databases” enabled, search does not load objects from unopened databases, even when none are open. Connection and database names remain searchable, and you can expand a database to load its objects. Turn the setting off to search every visible database in the active connection.
 
 Other supported object types (including procedures, functions, triggers, sequences, and packages) use debounced, on-demand remote search, even when their group has never been expanded or the object is beyond its first page. Matching pages are cached in memory by keyword and full scope; filtered results are not treated as a complete schema index. Changing the input cancels the previous remote request and discards late results. Search results do not replace the loaded browsing tree.
 

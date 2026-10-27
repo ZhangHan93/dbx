@@ -4,11 +4,17 @@ import { createApp, h, nextTick, reactive, type App } from "vue";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import DdlViewDialog from "../DdlViewDialog.vue";
 
-const calls = vi.hoisted(() => ({ load: vi.fn(), copy: vi.fn(), format: vi.fn(), settings: { ddlOpenMode: "dialog", refreshDdlOnOpen: false, includeDdlStorage: true, compactDdlSql: false, separateDdlIndexes: false } }));
+const calls = vi.hoisted(() => ({
+  load: vi.fn(),
+  copy: vi.fn(),
+  format: vi.fn(),
+  queryStore: { tabs: [] as any[], createTab: vi.fn(), loadDdlViewerTab: vi.fn() },
+  settings: { ddlOpenMode: "dialog", refreshDdlOnOpen: false, includeDdlStorage: true, compactDdlSql: false, separateDdlIndexes: false },
+}));
 vi.mock("vue-i18n", () => ({ useI18n: () => ({ t: (key: string) => key }) }));
 vi.mock("@/stores/settingsStore", () => ({ useSettingsStore: () => ({ editorSettings: reactive(calls.settings), updateEditorSettings: (patch: object) => Object.assign(reactive(calls.settings), patch) }) }));
 vi.mock("@/stores/connectionStore", () => ({ useConnectionStore: () => ({ getConfig: () => ({ query_timeout_secs: 20 }) }) }));
-vi.mock("@/stores/queryStore", () => ({ useQueryStore: () => ({}) }));
+vi.mock("@/stores/queryStore", () => ({ useQueryStore: () => calls.queryStore }));
 vi.mock("@/composables/useToast", () => ({ useToast: () => ({ toast: vi.fn() }) }));
 vi.mock("@/composables/useTheme", () => ({ useTheme: () => ({ isDark: { value: false }, themePalette: { value: undefined } }) }));
 vi.mock("@/lib/metadata/objectDdlCache", () => ({ loadObjectDdl: calls.load }));
@@ -74,8 +80,8 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
-function mountDialog() {
-  const props = reactive({ open: true, connectionId: "oracle-connection", database: "service", schema: "Owner", tableName: "First", databaseType: "oracle" as const, dialect: "mysql" as const });
+function mountDialog(schema = "Owner") {
+  const props = reactive({ open: true, connectionId: "oracle-connection", database: "service", schema, tableName: "First", databaseType: "oracle" as const, dialect: "mysql" as const });
   const container = document.createElement("div");
   document.body.append(container);
   app = createApp({ render: () => h(DdlViewDialog, props) });
@@ -90,7 +96,8 @@ async function copyDdl() {
 }
 beforeEach(() => {
   vi.clearAllMocks();
-  Object.assign(reactive(calls.settings), { separateDdlIndexes: false, includeDdlStorage: true, compactDdlSql: false });
+  Object.assign(reactive(calls.settings), { ddlOpenMode: "dialog", separateDdlIndexes: false, includeDdlStorage: true, compactDdlSql: false });
+  calls.queryStore.tabs.length = 0;
   calls.format.mockImplementation(async (sql: string) => sql);
 });
 afterEach(() => {
@@ -103,7 +110,7 @@ it("loads independent indexes only when selected, and copies the selected result
   calls.load.mockResolvedValueOnce({ ddl: "CREATE TABLE First (id NUMBER);" }).mockResolvedValueOnce({ ddl: "CREATE TABLE First (id NUMBER);\nCREATE INDEX ix ON First(id);" });
   mountDialog();
   await vi.waitFor(() => expect(document.querySelector("textarea")?.value).toContain("CREATE TABLE"));
-  expect(calls.load.mock.calls[0][0]).toMatchObject({ schema: "Owner", tableName: "First", separateIndexes: false });
+  expect(calls.load.mock.calls[0][0]).toMatchObject({ schema: "Owner", explicitOwner: "Owner", tableName: "First", separateIndexes: false });
   reactive(calls.settings).separateDdlIndexes = true;
   await vi.waitFor(() => expect(document.querySelector("textarea")?.value).toContain("CREATE INDEX"));
   expect(calls.load.mock.calls[1][0]).toMatchObject({ separateIndexes: true });
@@ -175,4 +182,15 @@ it("blocks stale copying on failure and lets the user turn independent indexes o
   expect(calls.load.mock.calls[2][0].separateIndexes).toBe(false);
   await copyDdl();
   expect(calls.copy).toHaveBeenLastCalledWith("RECOVERED");
+});
+
+it.each(["service", ""])("keeps explicit owner provenance when opening schema '%s' in a new tab", async (schema) => {
+  reactive(calls.settings).ddlOpenMode = "tab";
+  calls.queryStore.createTab.mockImplementation(() => {
+    calls.queryStore.tabs.push({ id: "ddl" });
+    return "ddl";
+  });
+  mountDialog(schema);
+  await vi.waitFor(() => expect(calls.queryStore.loadDdlViewerTab).toHaveBeenCalledWith("ddl"));
+  expect(calls.queryStore.tabs[0].ddlViewer).toMatchObject({ schema: "service", explicitOwner: schema || undefined });
 });

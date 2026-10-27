@@ -105,6 +105,12 @@ async function mountContentArea(options: { result?: QueryResult; isExecuting?: b
 }
 
 describe("ContentArea query loading state on error re-execute", () => {
+  const noRowResult: QueryResult = {
+    columns: [],
+    rows: [],
+    affected_rows: 0,
+    execution_time_ms: 1,
+  };
   const errorResult: QueryResult = {
     columns: ["Error"],
     execution_error: true,
@@ -135,6 +141,39 @@ describe("ContentArea query loading state on error re-execute", () => {
       columns: ["id"],
       rows: [[1]],
       affected_rows: 1,
+      execution_time_ms: 12,
+      client_request_wait_ms: 12,
+    };
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await nextTick();
+
+    expect(host.querySelector('[data-test="data-grid"]')).not.toBeNull();
+    expect(host.textContent).not.toContain("正在执行");
+  });
+
+  it("shows QueryLoadingState with elapsed time for the next query after a no-row result", async () => {
+    const startedAt = Date.now() - 1500;
+    // A statement such as `set statement_timeout to '100s'` has no columns, so
+    // the retained result cannot mount DataGrid. The next query still needs the
+    // live elapsed time and stop action while it runs (issue #13508).
+    const { host, tab } = await mountContentArea({
+      result: noRowResult,
+      isExecuting: true,
+      queryExecutionStartedAt: startedAt,
+    });
+
+    expect(host.querySelector('[data-test="data-grid"]')).toBeNull();
+    expect(host.textContent).toContain("正在执行");
+    expect(host.textContent).toMatch(/· \d+\.\d+s/);
+    expect(host.textContent).toContain("停止执行");
+
+    // Once the next query returns rows, the result grid takes over again.
+    tab.isExecuting = false;
+    tab.queryExecutionStartedAt = undefined;
+    tab.result = {
+      columns: ["pg_sleep"],
+      rows: [[""]],
+      affected_rows: 0,
       execution_time_ms: 12,
       client_request_wait_ms: 12,
     };

@@ -76,6 +76,7 @@ import LightTooltip from "@/components/ui/LightTooltip.vue";
 import HelpTooltip from "@/components/ui/tooltip/HelpTooltip.vue";
 import ColumnInfoPanel from "@/components/editor/ColumnInfoPanel.vue";
 import QueryLoadingState from "@/components/common/QueryLoadingState.vue";
+const PlDebugPanel = defineAsyncComponent(() => import("@/components/debug/PlDebugPanel.vue"));
 import QueryErrorActions from "@/components/common/QueryErrorActions.vue";
 import QueryMessagesView from "@/components/layout/QueryMessagesView.vue";
 import QueryResultToolbarActions from "@/components/layout/QueryResultToolbarActions.vue";
@@ -2290,12 +2291,14 @@ defineExpose({
                 :model-value="activeTab.sql"
                 :tab-id="activeTab.id"
                 :connection-id="activeTab.connectionId"
+                :prefetch-completion="activeTab.mode === 'query' && !activeTab.sourceView"
                 :catalog="activeTab.catalog"
                 :database="activeTab.database"
                 :schema="activeTab.schema"
                 :client-session-id="activeTab.id"
                 :completion-context-version="activeTab.completionContextVersion"
                 :database-type="activeEffectiveDatabaseType"
+                :mongo-query-language="activeTab.mongoQueryLanguage"
                 :dialect="editorDialect"
                 :syntax-dialect="editorSyntaxDialect"
                 :format-dialect="activeSqlFormatDialect"
@@ -3162,7 +3165,7 @@ defineExpose({
                 </template>
               </DataGrid>
               <QueryLoadingState
-                v-else-if="(!activeTab.result || isQueryExecutionErrorResult(activeTab.result)) && activeTab.isExecuting"
+                v-else-if="activeTab.isExecuting && (!activeTab.result || !hasTabularResult || isQueryExecutionErrorResult(activeTab.result))"
                 class="flex-1 min-h-0"
                 :label-key="queryExecutionLabelKey(activeTab)"
                 :elapsed-seconds="queryRunningElapsedSeconds"
@@ -3915,6 +3918,10 @@ defineExpose({
           @view-data="onHandleStructureViewData"
         />
       </div>
+    </template>
+
+    <template v-else-if="activeTab.mode === 'pl-debug'">
+      <PlDebugPanel :key="activeTab.id" class="min-h-0 flex-1" />
     </template>
 
     <template v-else-if="activeTab.mode === 'users' && activeConnection">

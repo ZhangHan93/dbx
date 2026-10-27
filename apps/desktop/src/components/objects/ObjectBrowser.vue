@@ -78,6 +78,8 @@ import { useToolbarOverflow } from "@/composables/useToolbarOverflow";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import DangerConfirmDialog from "@/components/editor/DangerConfirmDialog.vue";
 import ProcedureExecutionDialog from "@/components/objects/ProcedureExecutionDialog.vue";
+import { launchPlDebug } from "@/components/debug/plDebugLaunch";
+import { supportsPlDebugRoutine } from "@/lib/database/databaseFeatureSupport";
 import CustomTypeInfoPanel from "@/components/objects/CustomTypeInfoPanel.vue";
 import TablePartitionsPanel from "@/components/structure/TablePartitionsPanel.vue";
 import XlsxHeaderDialog from "@/components/export/XlsxHeaderDialog.vue";
@@ -1672,6 +1674,7 @@ function tableMetadataRequest(row: ObjectBrowserRow): ObjectDdlRequest {
     queryTimeoutSecs: props.connection.query_timeout_secs,
     database: props.database || "",
     schema: index ? index.parentSchema : row.schema || selectedSchema.value || props.database,
+    explicitOwner: index ? index.parentSchema : row.schema || selectedSchema.value || undefined,
     tableName: index ? index.parentName : row.name,
     objectType: index ? undefined : tableDdlObjectType(row.type),
     catalog: props.catalog,
@@ -3754,16 +3757,9 @@ async function confirmBatchEmptyTables() {
 async function exportStructure(row: ObjectBrowserRow) {
   try {
     const schema = row.schema || selectedSchema.value || props.database;
-    const ddl = await api.getTableDdl(
-      props.connection.id,
-      props.database,
-      schema,
-      row.name,
-      tableDdlObjectType(row.type),
-      props.catalog,
-      true,
-      ...((effectiveDatabaseType.value === "oracle" || effectiveDatabaseType.value === "oceanbase-oracle") && row.type === "TABLE" && settingsStore.editorSettings.separateDdlIndexes ? ([undefined, true] as const) : []),
-    );
+    const indexOptions: [boolean?, boolean?, string?] =
+      (effectiveDatabaseType.value === "oracle" || effectiveDatabaseType.value === "oceanbase-oracle") && row.type === "TABLE" && settingsStore.editorSettings.separateDdlIndexes ? [undefined, true, row.schema || selectedSchema.value || undefined] : [];
+    const ddl = await api.getTableDdl(props.connection.id, props.database, schema, row.name, tableDdlObjectType(row.type), props.catalog, true, ...indexOptions);
     await saveFileContent(buildSingleDdlExportFileContent(applyDdlTextPreferences(ddl, effectiveDatabaseType.value, settingsStore.editorSettings)), `${row.name}.sql`, "SQL", "sql");
   } catch (e: any) {
     console.error("Export structure failed:", e);
@@ -5736,6 +5732,17 @@ function getViewMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
 
 function getProcFuncMenuItems(item: ObjectBrowserRow): ContextMenuItem[] {
   return [
+    ...(supportsPlDebugRoutine(effectiveDatabaseType.value)
+      ? [
+          {
+            label: t("plDebug.start.title"),
+            icon: Play,
+            action: () => {
+              void launchPlDebug({ connectionId: props.connection.id, database: props.database, databaseType: effectiveDatabaseType.value, schema: item.schema ?? selectedSchema.value, objectType: item.type, objectName: item.name, valid: item.valid });
+            },
+          },
+        ]
+      : []),
     ...(item.type === "PROCEDURE" ? [{ label: t("contextMenu.executeProcedure"), action: () => openProcedureExecution(item), icon: Play }] : []),
     ...(effectiveDatabaseType.value === "xugu" && buildXuguCompileSql({ objectType: item.type, schema: item.schema || selectedSchema.value, name: item.name }) ? [{ label: t("contextMenu.compileObject"), action: () => compileXuguObject(item), icon: Wrench }] : []),
     { sidebarActionId: "contextMenu.editObject", label: t("contextMenu.editObject"), action: () => openSource(item), icon: PencilLine },

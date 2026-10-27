@@ -7,6 +7,52 @@ import type { DamengDumpKind, DamengDumpRequest, DamengDumpProgress } from "./da
 import type { UserSkillRootSettings, UserSkillsListResult, UserSkillsReadResult } from "@/types/userSkills";
 import type { DatabaseBackupCommand, DatabaseBackupBackgroundStatus } from "@/lib/backup/backgroundDatabaseBackup";
 import type { NativeJobContext, NativeJobDetails, NativeJobList, NativeJobListRequest, NativeJobRequest, NativeJobOperationStatus, NativeJobPreparedPlan, NativeJobRef, NativeJobReferenceCatalog, NativeJobReferenceListRequest } from "@/lib/database/nativeJobs";
+import type { PlDebugBootstrap, PlDebugSessionRef, PlDebugStartIntent, PlDebugOperationRequest, PlDebugReadRequest, PlDebugReceipt, PlDebugSnapshot } from "@/lib/debug/plDebugProtocol";
+import type { PlDebugInspectRequest, PlDebugInspectResult, PlDebugCompileIntent, PlDebugCompileRef, PlDebugCompileReceipt } from "@/lib/debug/plDebugProtocol";
+
+export function plDebugBootstrap(): Promise<PlDebugBootstrap> {
+  return post("/api/pl-debug/bootstrap", {});
+}
+
+export function plDebugInspect(request: PlDebugInspectRequest): Promise<PlDebugInspectResult> {
+  return post("/api/pl-debug/inspect", request);
+}
+
+export function plDebugCompile(request: PlDebugCompileIntent): Promise<PlDebugCompileReceipt> {
+  return post("/api/pl-debug/compile", request);
+}
+
+export function plDebugCompileStatus(reference: PlDebugCompileRef): Promise<PlDebugCompileReceipt> {
+  return post("/api/pl-debug/compile-status", reference);
+}
+
+export function plDebugList(serverEpoch: string, connectionId: string): Promise<PlDebugSnapshot[]> {
+  return post("/api/pl-debug/list", { serverEpoch, connectionId });
+}
+
+export function plDebugStart(request: PlDebugStartIntent): Promise<PlDebugReceipt> {
+  return post("/api/pl-debug/start", request);
+}
+
+export function plDebugStatus(reference: PlDebugSessionRef, refresh = false): Promise<PlDebugSnapshot> {
+  return post("/api/pl-debug/status", { reference, refresh });
+}
+
+export function plDebugHeartbeat(reference: PlDebugSessionRef): Promise<PlDebugSnapshot> {
+  return post("/api/pl-debug/heartbeat", reference);
+}
+
+export function plDebugOperation(reference: PlDebugSessionRef, operationId: string): Promise<PlDebugReceipt> {
+  return post("/api/pl-debug/operation", { reference, operationId });
+}
+
+export function plDebugOperate(request: PlDebugOperationRequest): Promise<PlDebugReceipt> {
+  return post("/api/pl-debug/operate", request);
+}
+
+export function plDebugRead(request: PlDebugReadRequest): Promise<Record<string, unknown> | unknown[]> {
+  return post("/api/pl-debug/read", request);
+}
 import type { PluginUiStorageItemRef, SqlFileFailureLogExportPayload, SqlFileFailureLogInfo, SqlFileFailureLogKey, SqlFileFailureLogTextPayload, SyncCatalogItem, SyncSelection, SyncSnapshotCatalog } from "@/lib/backend/tauri";
 import { FAILURE_LOG_TEXT_TOO_LARGE } from "@/lib/export/failureLogExport";
 import { saveTextFile } from "@/lib/export/saveTextFile";
@@ -1438,12 +1484,12 @@ export async function listSubpartitions(connectionId: string, database: string, 
   return get(`/api/schema/subpartitions?${qs({ connection_id: connectionId, database, schema, table, catalog })}`);
 }
 
-export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, portable = false, exactIdentity?: boolean, separateIndexes?: boolean): Promise<string> {
-  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table, object_type: objectType, catalog, portable, exact_identity: exactIdentity || undefined, separate_indexes: separateIndexes || undefined })}`);
+export async function getTableDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, portable = false, exactIdentity?: boolean, separateIndexes?: boolean, explicitOwner?: string): Promise<string> {
+  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table, object_type: objectType, catalog, portable, exact_identity: exactIdentity || undefined, separate_indexes: separateIndexes || undefined, explicit_owner: explicitOwner })}`);
 }
 
-export async function getTableDisplayDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, separateIndexes?: boolean): Promise<string> {
-  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table, object_type: objectType, catalog, include_postgres_access: true, separate_indexes: separateIndexes || undefined })}`);
+export async function getTableDisplayDdl(connectionId: string, database: string, schema: string, table: string, objectType?: ObjectSourceKind, catalog?: string, separateIndexes?: boolean, explicitOwner?: string): Promise<string> {
+  return get(`/api/schema/ddl?${qs({ connection_id: connectionId, database, schema, table, object_type: objectType, catalog, include_postgres_access: true, separate_indexes: separateIndexes || undefined, explicit_owner: explicitOwner })}`);
 }
 
 export async function prepareSchemaDiff(options: SchemaDiffPreparationOptions): Promise<SchemaDiffPreparation> {

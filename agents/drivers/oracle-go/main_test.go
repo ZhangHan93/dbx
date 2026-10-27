@@ -2379,6 +2379,34 @@ func TestListObjectsSQLUsesSplitDictionaryQuery(t *testing.T) {
 	}
 }
 
+func TestTableIndexDDLExclusionBindsConstraintIndexOwner(t *testing.T) {
+	for _, fromConnection := range []bool{false, true} {
+		t.Run(fmt.Sprint(fromConnection), func(t *testing.T) {
+			ddl := `CREATE INDEX OTHER.IX ON APP.T(ID)`
+			db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
+				{queryContains: "c.INDEX_OWNER = i.OWNER", args: []driver.Value{"APP", "T", "APP", "T"}, columns: []string{"DDL"}, rows: [][]driver.Value{{ddl}}},
+			})
+			var result []string
+			var err error
+			if fromConnection {
+				conn, connectErr := db.Conn(context.Background())
+				if connectErr != nil {
+					t.Fatal(connectErr)
+				}
+				defer conn.Close()
+				result, err = loadTableIndexDDLsFromConn(conn, "APP", "T")
+			} else {
+				s := newServer()
+				s.db = db
+				result, err = s.loadTableIndexDDLs("APP", "T")
+			}
+			if err != nil || len(result) != 1 || result[0] != ddl || scripted.next != len(scripted.steps) {
+				t.Fatalf("exact owner query failed: result=%v error=%v queries=%d", result, err, scripted.next)
+			}
+		})
+	}
+}
+
 func TestSchemaIndexObjectsPreserveBothOwnersThroughRPC(t *testing.T) {
 	db, scripted := openOracleViewSourceTestDB(t, []oracleViewSourceQueryStep{
 		{queryContains: "SYS_CONTEXT('USERENV', 'SESSION_USER')", args: []driver.Value{}, rows: [][]driver.Value{{"APP"}}},
@@ -3953,6 +3981,9 @@ func (c *oracleViewSourceConn) ExecContext(
 	query string,
 	args []driver.NamedValue,
 ) (driver.Result, error) {
+	if query == dbmsOutputEnableSQL || query == dbmsOutputDisableSQL {
+		return driver.RowsAffected(0), nil
+	}
 	if c.driver.next >= len(c.driver.steps) {
 		return nil, errors.New("unexpected extra exec: " + query)
 	}

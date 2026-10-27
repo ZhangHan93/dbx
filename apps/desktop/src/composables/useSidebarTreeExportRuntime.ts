@@ -225,7 +225,8 @@ export function useSidebarTreeExportRuntime(options: SidebarTreeExportRuntimeOpt
         await connectionStore.ensureConnected(target.connectionId);
         if (requestId !== structureRequestId) return;
         const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(target.connectionId));
-        const ddl = await api.getTableDdl(target.connectionId, target.database, target.schema || target.database, target.label, tableDdlObjectTypeForNode(target.type), target.catalog, true, ...(supportsDdlStoragePreference(databaseType) && separateIndexes ? ([undefined, true] as const) : []));
+        const indexOptions: [boolean?, boolean?, string?] = supportsDdlStoragePreference(databaseType) && separateIndexes ? [undefined, true, target.schema || undefined] : [];
+        const ddl = await api.getTableDdl(target.connectionId, target.database, target.schema || target.database, target.label, tableDdlObjectTypeForNode(target.type), target.catalog, true, ...indexOptions);
         if (requestId !== structureRequestId) return;
         requestSource.push({ ddl, databaseType });
       }

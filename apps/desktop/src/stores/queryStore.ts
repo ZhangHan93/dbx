@@ -6,6 +6,7 @@ import { mergeQueryMessages, queryResultMessages } from "@/lib/query/queryResult
 import { appendNeo4jNodeCells, extractNeo4jNodeCells } from "@/lib/neo4j/neo4jNodeResult";
 import { UPDATE_RESTORE_KEY, assertUpdateAllowsInteraction } from "@/lib/app/updatePreparation";
 import { defineStore } from "pinia";
+import { usePlDebugStore } from "@/stores/plDebugStore";
 import { isRedisMonitorCommand, startRedisMonitor } from "@/lib/redis/redisMonitor";
 import { uuid } from "@/lib/common/utils";
 import { computed, markRaw, nextTick, onScopeDispose, reactive, ref, toRaw, watch } from "vue";
@@ -78,6 +79,7 @@ import {
   splitSiblingDbPrefix,
   type MongoAggregateSafetyOptions,
 } from "@/lib/mongo/mongoShellCommand";
+import { prepareMongoQueryText, type MongoQueryLanguage } from "@/lib/mongo/mongoSql";
 import { refreshLoadedMongoIndexes } from "@/lib/mongo/mongoIndexMetadata";
 import { redisCommandResultToQueryResult } from "@/lib/redis/redisQueryResult";
 import { nextRedisCommandDb } from "@/lib/redis/redisCommandSession";
@@ -3626,13 +3628,24 @@ export const useQueryStore = defineStore("query", () => {
     const { database } = tab;
     const catalog = tab.catalog;
     const schema = ddlViewer.schema;
+    const explicitOwner = ddlViewer.explicitOwner;
     const tableName = ddlViewer.tableName;
     const objectType = ddlViewer.objectType;
     const settingsStore = useSettingsStore();
     const connectionStore = useConnectionStore();
     const isCurrent = () => {
       const current = tabs.value.find((candidate) => candidate.id === id);
-      return current?.ddlLoad === request && current.ddlViewer === ddlViewer && current.connectionId === connectionId && current.database === database && current.catalog === catalog && ddlViewer.schema === schema && ddlViewer.tableName === tableName && ddlViewer.objectType === objectType;
+      return (
+        current?.ddlLoad === request &&
+        current.ddlViewer === ddlViewer &&
+        current.connectionId === connectionId &&
+        current.database === database &&
+        current.catalog === catalog &&
+        ddlViewer.schema === schema &&
+        ddlViewer.explicitOwner === explicitOwner &&
+        ddlViewer.tableName === tableName &&
+        ddlViewer.objectType === objectType
+      );
     };
     const currentSeparateIndexes = () => {
       const databaseType = effectiveDatabaseTypeForConnection(connectionStore.getConfig(connectionId));
@@ -3657,6 +3670,7 @@ export const useQueryStore = defineStore("query", () => {
             queryTimeoutSecs: connectionStore.getConfig(connectionId)?.query_timeout_secs,
             database,
             schema: ddlViewer.schema || database,
+            explicitOwner,
             tableName: ddlViewer.tableName,
             objectType: ddlViewer.objectType,
             catalog: tab.catalog,
@@ -4054,6 +4068,20 @@ export const useQueryStore = defineStore("query", () => {
       mode: "sqlserver-trace",
     };
     return registerOpenTab(tab);
+  }
+
+  function openPlDebugTab(options: { connectionId: string; database: string; schema?: string; title: string }): string {
+    const existing = tabs.value.find((tab) => tab.mode === "pl-debug");
+    const debug = usePlDebugStore();
+    const original = debug.publicSnapshot ?? debug.pendingStart;
+    const context = original ? { connectionId: original.connectionId, database: original.database, schema: debug.target?.schema ?? options.schema } : options;
+    const title = debug.target ? (debug.target.objectType === "ANONYMOUS" ? t("plDebug.launch.anonymousTitle") : `${debug.target.packageName ? `${debug.target.packageName}.` : ""}${debug.target.objectName ?? ""}`) : options.title;
+    if (existing) {
+      Object.assign(existing, context, { title });
+      switchTab(existing.id);
+      return existing.id;
+    }
+    return registerOpenTab({ id: uuid(), title, connectionId: context.connectionId, database: context.database, schema: context.schema, sql: "", isExecuting: false, isCancelling: false, isExplaining: false, mode: "pl-debug" });
   }
 
   function openMysqlDashboard(connectionId: string) {
@@ -5025,9 +5053,36 @@ export const useQueryStore = defineStore("query", () => {
       return;
     }
 
+    const debugTab = remainingIds.map((id) => tabs.value.find((tab) => tab.id === id)).find((tab) => tab?.mode === "pl-debug");
+    if (debugTab && waitForPlDebugRelease(debugTab, continuePendingBatchClose)) return;
+
     const onComplete = finishPendingBatchClose();
     for (const id of remainingIds) closeTab(id, { force: true });
     onComplete?.();
+  }
+
+  let debugTabRelease: Promise<void> | null = null;
+  function waitForPlDebugRelease(tab: QueryTab, onReleased: () => void): boolean {
+    if (tab.mode !== "pl-debug") return false;
+    const debug = usePlDebugStore();
+    if (!debug.sessionRef && !debug.pendingStart && !debug.pendingClose) return false;
+    if (debug.publicSnapshot?.releaseState === "released" && debug.publicSnapshot.runtimeExited && !debug.recoveryRequired && !debug.pendingStart && !debug.pendingClose) return false;
+    if (!debugTabRelease) {
+      debugTabRelease = debug
+        .close()
+        .then(() => {
+          if (debug.recoveryRequired || debug.publicSnapshot?.releaseState !== "released" || !debug.publicSnapshot.runtimeExited) throw new Error(debug.error || "The original debugger has not confirmed resource release");
+        })
+        .finally(() => {
+          debugTabRelease = null;
+        });
+    }
+    void debugTabRelease.then(onReleased).catch((error) => {
+      cancelClosePendingTab();
+      activateTab(tab.id);
+      useToast().toast(String(error), 5000);
+    });
+    return true;
   }
 
   function beginBatchClose(ids: string[], finalActiveTabId?: string | null, onComplete?: () => void) {
@@ -5142,6 +5197,7 @@ export const useQueryStore = defineStore("query", () => {
       useToast().toast(t("objects.typeManagementRunningClose"), 5000);
       return;
     }
+    if (waitForPlDebugRelease(tab, () => closeTab(id, { force, skipHistory }))) return;
     if (needsDefaultQuerySave(tab) || (tab.isDefaultQuery && defaultQuerySaves.has(id))) {
       void flushDefaultQuery(tab)
         .then(() => closeTab(id, { force, skipHistory }))
@@ -5164,8 +5220,10 @@ export const useQueryStore = defineStore("query", () => {
     if (tabs.value[idx].txnSessionId) void rollbackTransaction(id);
     if (tabs.value[idx].isExecuting) void cancelTabExecution(id);
     if (tabs.value[idx].isExplaining) void cancelTabExplain(id);
-    void closeResultSession(tabs.value[idx]);
-    void closeClientConnectionSession(tabs.value[idx]);
+    if (tab.mode !== "pl-debug") {
+      void closeResultSession(tabs.value[idx]);
+      void closeClientConnectionSession(tabs.value[idx]);
+    }
     clearResultRunSnapshots(tabs.value[idx]);
     void deleteTabResultSnapshot(tabResultCacheKey(id));
     releaseTabResultObjectPayloads(tabs.value[idx]);
@@ -5432,6 +5490,10 @@ export const useQueryStore = defineStore("query", () => {
     const idx = tabs.value.findIndex((t) => t.id === id);
     if (idx < 0) return;
     const original = tabs.value[idx];
+    if (original.mode === "pl-debug") {
+      switchTab(id);
+      return;
+    }
     const newId = uuid();
     const newTab: QueryTab = {
       id: newId,
@@ -5550,6 +5612,7 @@ export const useQueryStore = defineStore("query", () => {
     if (!entry) return null;
 
     const restoredTab = snapshotClosedTab(entry.tab);
+    if (restoredTab.mode === "pl-debug") return openPlDebugTab(restoredTab);
     if (restoredTab.isDefaultQuery) {
       const existing = tabs.value.find((tab) => tab.savedSqlId === restoredTab.savedSqlId);
       if (existing) {
@@ -5606,6 +5669,8 @@ export const useQueryStore = defineStore("query", () => {
     if (closingIds.size === 0) return;
 
     const closingTabs = tabs.value.filter((tab) => closingIds.has(tab.id));
+    const debugTab = closingTabs.find((tab) => tab.mode === "pl-debug");
+    if (debugTab && waitForPlDebugRelease(debugTab, () => closeTabsWhere((tab) => closingIds.has(tab.id)))) return;
     if (closingTabs.some((tab) => needsDefaultQuerySave(tab) || (tab.isDefaultQuery && defaultQuerySaves.has(tab.id)))) {
       void flushDefaultQueries([...closingIds])
         .then(() => closeTabsWhere((tab) => closingIds.has(tab.id)))
@@ -5622,8 +5687,10 @@ export const useQueryStore = defineStore("query", () => {
       if (tab.txnSessionId) void rollbackTransaction(tab.id);
       if (tab.isExecuting) void cancelTabExecution(tab.id);
       if (tab.isExplaining) void cancelTabExplain(tab.id);
-      void closeResultSession(tab);
-      void closeClientConnectionSession(tab);
+      if (tab.mode !== "pl-debug") {
+        void closeResultSession(tab);
+        void closeClientConnectionSession(tab);
+      }
       clearResultRunSnapshots(tab);
       void deleteTabResultSnapshot(tabResultCacheKey(tab.id));
       releaseTabResultObjectPayloads(tab);
@@ -6102,6 +6169,12 @@ export const useQueryStore = defineStore("query", () => {
       });
     pendingManualTransactionStarts.set(id, { epoch, promise: start });
     return start;
+  }
+
+  function setMongoQueryLanguage(id: string, language: MongoQueryLanguage) {
+    const tab = tabs.value.find((item) => item.id === id);
+    if (!tab || tab.mongoQueryLanguage === language) return;
+    tab.mongoQueryLanguage = language === "sql" ? "sql" : undefined;
   }
 
   function setAutoCommit(id: string, autoCommit: boolean) {
@@ -8205,7 +8278,7 @@ export const useQueryStore = defineStore("query", () => {
       sourceTraceId: options?.sourceTraceId,
       sqlLength: sql.length,
     });
-    const queryBaseSql = options?.resultBaseSql ?? sql;
+    let queryBaseSql = options?.resultBaseSql ?? sql;
     let sqlToExecute = sql;
     let resultSortedSql = options?.resultSortedSql;
     let queryMetadataSql = queryBaseSql;
@@ -8247,7 +8320,22 @@ export const useQueryStore = defineStore("query", () => {
       const executionTarget = resumedExecutionTarget ?? options?.executionTarget;
       const usesExternalExecutionTarget = !!executionTarget;
       let conn = connStore.getConfig(executionConnectionId);
-      const parsedMongoCommands = conn?.db_type === "mongodb" ? splitMongoCommandRanges(sql) : undefined;
+      let mongoGeneratedShell: string | undefined;
+      let mongoSqlConsidered = false;
+      const applyMongoSql = (dbType: string | undefined) => {
+        if (mongoSqlConsidered || dbType !== "mongodb") return;
+        mongoSqlConsidered = true;
+        const prepared = prepareMongoQueryText(sqlToExecute, tab.mongoQueryLanguage, dbType, tab.mongoGeneratedShell);
+        if (!prepared.generatedShell) return;
+        mongoGeneratedShell = prepared.generatedShell;
+        sqlToExecute = prepared.sql;
+        queryBaseSql = prepared.sql;
+        queryMetadataSql = prepared.sql;
+        tab.lastExecutedSql = prepared.sql;
+        tab.mongoGeneratedShell = prepared.sql;
+      };
+      applyMongoSql(conn?.db_type);
+      const parsedMongoCommands = conn?.db_type === "mongodb" ? splitMongoCommandRanges(sqlToExecute) : undefined;
       let mongoCommands = parsedMongoCommands ?? [];
       const mongoNeedsConnection = mongoCommands.some(({ command }) => command.kind !== "use");
 
@@ -8266,7 +8354,8 @@ export const useQueryStore = defineStore("query", () => {
       }
       conn = connStore.getConfig(executionConnectionId);
       if (parsedMongoCommands === undefined && conn?.db_type === "mongodb") {
-        mongoCommands = splitMongoCommandRanges(sql);
+        applyMongoSql(conn.db_type);
+        mongoCommands = splitMongoCommandRanges(sqlToExecute);
       }
       const effectiveDbType = effectiveDatabaseTypeForConnection(conn);
       if (effectiveDbType === "mysql") {
@@ -8486,6 +8575,9 @@ export const useQueryStore = defineStore("query", () => {
           const commandTiming = createQueryRequestTiming(commandIndex === 0 ? startedAt : commandStartedAt);
           const annotateMongoResult = (result: QueryResult): QueryResult => {
             const annotated = annotateQueryResultSource(result, sourceStatement, undefined, undefined, sourceRange);
+            if (mongoGeneratedShell) {
+              annotated.messages = [...(annotated.messages ?? []), { severity: "INFO", code: "mongo-shell", message: sourceStatement }];
+            }
             if ("collection" in mongoCommand) {
               annotated.sourceQualifier = currentDatabase || undefined;
               annotated.sourceName = mongoCommand.collection;
@@ -11690,6 +11782,7 @@ export const useQueryStore = defineStore("query", () => {
     updateObjectBrowserFilter,
     updateDatabaseSearchState,
     updateNacosConfigEditorViewport,
+    setMongoQueryLanguage,
     setAutoCommit,
     markManualTransactionDirty,
     commitTransaction,
@@ -11708,6 +11801,7 @@ export const useQueryStore = defineStore("query", () => {
     openXuguUserAdmin,
     openProcessList,
     openSqlServerActivityTrace,
+    openPlDebugTab,
     openMysqlDashboard,
     openPostgresDashboard,
     openXuguDashboard,

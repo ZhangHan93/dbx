@@ -7120,6 +7120,14 @@ fn generate_schema_sync_sql_inner_with_oracle_ddl(
                     "-- Trigger {}: {} on {}; review trigger definition manually.",
                     trigger.diff_type, trigger.name, diff.name
                 ));
+                if matches!(db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
+                    missing_objects.push(MissingRollbackObject {
+                        kind: "trigger".into(),
+                        name: trigger.name.clone(),
+                        table: Some(target_name.into()),
+                        reason: "Trigger synchronization requires a complete reviewed definition; no trigger DDL was generated".into(),
+                    });
+                }
             }
         }
 

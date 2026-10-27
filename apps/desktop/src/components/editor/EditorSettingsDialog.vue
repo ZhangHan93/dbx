@@ -731,6 +731,7 @@ const aiTypographySaving = ref(false);
 const editTableFontFamily = ref(settingsStore.editorSettings.tableFontFamily);
 const editUiFontFamily = ref(settingsStore.editorSettings.uiFontFamily);
 const editUiScale = ref(settingsStore.editorSettings.uiScale);
+const editFontSmoothing = ref(settingsStore.editorSettings.fontSmoothing);
 const editTheme = ref(settingsStore.editorSettings.theme);
 const editBackgroundImage = ref<BackgroundImageSettings>(cloneBackgroundImageDraft(settingsStore.editorSettings.backgroundImage));
 const backgroundImageTransparencyPercent = computed(() => Math.round((1 - editBackgroundImage.value.opacity) * 100));
@@ -985,6 +986,7 @@ const editSidebarSearchOpenedDatabasesOnly = ref(settingsStore.editorSettings.si
 const editAutoSelectActiveSidebarNode = ref(settingsStore.editorSettings.autoSelectActiveSidebarNode);
 const editSidebarPinDefaultDatabase = ref(settingsStore.editorSettings.sidebarPinDefaultDatabase);
 const editSidebarBrowseObjectsOnDatabaseActivation = ref(settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation);
+const editSidebarExpandTreeOnConnect = ref(settingsStore.editorSettings.sidebarExpandTreeOnConnect);
 const editOpenTabsRestoreMode = ref<OpenTabsRestoreMode>(settingsStore.editorSettings.openTabsRestoreMode);
 const editAutoReloadRestoredDataTabsOnOpen = ref(settingsStore.editorSettings.autoReloadRestoredDataTabsOnOpen);
 const editDisconnectTabHandlingMode = ref<DisconnectTabHandlingMode>(settingsStore.editorSettings.disconnectTabHandlingMode);
@@ -1209,6 +1211,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     tableFontFamily: editTableFontFamily.value,
     uiFontFamily: editUiFontFamily.value,
     uiScale: editUiScale.value,
+    fontSmoothing: editFontSmoothing.value,
     theme: editTheme.value,
     backgroundImage: editBackgroundImage.value,
     customThemes: editCustomThemes.value,
@@ -1318,6 +1321,7 @@ function currentEditorSettingsDraft(): EditorSettingsDraft {
     autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode.value,
     sidebarPinDefaultDatabase: editSidebarPinDefaultDatabase.value,
     sidebarBrowseObjectsOnDatabaseActivation: editSidebarBrowseObjectsOnDatabaseActivation.value,
+    sidebarExpandTreeOnConnect: editSidebarExpandTreeOnConnect.value,
     openTabsRestoreMode: editOpenTabsRestoreMode.value,
     autoReloadRestoredDataTabsOnOpen: editAutoReloadRestoredDataTabsOnOpen.value,
     disconnectTabHandlingMode: editDisconnectTabHandlingMode.value,
@@ -1913,6 +1917,7 @@ function syncEditorSettingsDraftFromStore() {
   editTableFontFamily.value = settingsStore.editorSettings.tableFontFamily;
   editUiFontFamily.value = settingsStore.editorSettings.uiFontFamily;
   editUiScale.value = settingsStore.editorSettings.uiScale;
+  editFontSmoothing.value = settingsStore.editorSettings.fontSmoothing;
   editTheme.value = settingsStore.editorSettings.theme;
   editBackgroundImage.value = cloneBackgroundImageDraft(settingsStore.editorSettings.backgroundImage);
   pendingBackgroundImageCleanup = null;
@@ -2025,6 +2030,7 @@ function syncEditorSettingsDraftFromStore() {
   editAutoSelectActiveSidebarNode.value = settingsStore.editorSettings.autoSelectActiveSidebarNode;
   editSidebarPinDefaultDatabase.value = settingsStore.editorSettings.sidebarPinDefaultDatabase;
   editSidebarBrowseObjectsOnDatabaseActivation.value = settingsStore.editorSettings.sidebarBrowseObjectsOnDatabaseActivation;
+  editSidebarExpandTreeOnConnect.value = settingsStore.editorSettings.sidebarExpandTreeOnConnect;
   editOpenTabsRestoreMode.value = settingsStore.editorSettings.openTabsRestoreMode;
   editAutoReloadRestoredDataTabsOnOpen.value = settingsStore.editorSettings.autoReloadRestoredDataTabsOnOpen;
   editDisconnectTabHandlingMode.value = settingsStore.editorSettings.disconnectTabHandlingMode;
@@ -2100,6 +2106,7 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   tableFontFamily: editTableFontFamily,
   uiFontFamily: editUiFontFamily,
   uiScale: editUiScale,
+  fontSmoothing: editFontSmoothing,
   theme: editTheme,
   backgroundImage: editBackgroundImage,
   customThemes: editCustomThemes,
@@ -2200,6 +2207,7 @@ const editorSettingsDraftRefs: EditorSettingsDraftRefMap = {
   autoSelectActiveSidebarNode: editAutoSelectActiveSidebarNode,
   sidebarPinDefaultDatabase: editSidebarPinDefaultDatabase,
   sidebarBrowseObjectsOnDatabaseActivation: editSidebarBrowseObjectsOnDatabaseActivation,
+  sidebarExpandTreeOnConnect: editSidebarExpandTreeOnConnect,
   openTabsRestoreMode: editOpenTabsRestoreMode,
   autoReloadRestoredDataTabsOnOpen: editAutoReloadRestoredDataTabsOnOpen,
   disconnectTabHandlingMode: editDisconnectTabHandlingMode,
@@ -2426,13 +2434,15 @@ const visibleCrossScopeShortcutPairCount = computed(() => countShortcutConflictP
 
 // 二级归类：快捷键页签按作用域分组展示。顺序即运行时优先级——越外层先响应，
 // 用户读到的顺序与事件实际分发顺序一致。
-const SHORTCUT_SCOPE_ORDER: readonly ShortcutScope[] = ["global", "editor", "grid", "search", "sidebar"];
+const SHORTCUT_SCOPE_ORDER: readonly ShortcutScope[] = ["global", "debug", "editor", "grid", "search", "sidebar"];
 
 function shortcutScopeLabelKey(scope: ShortcutScope): string {
+  if (scope === "debug") return "plDebug.start.title";
   return `settings.shortcutScope${scope[0].toUpperCase()}${scope.slice(1)}`;
 }
 
 function shortcutScopeHintKey(scope: ShortcutScope): string {
+  if (scope === "debug") return "plDebug.shortcutsHint";
   return `settings.shortcutScopeHint${scope[0].toUpperCase()}${scope.slice(1)}`;
 }
 
@@ -2440,6 +2450,7 @@ function shortcutScopeIcon(scope: ShortcutScope) {
   switch (scope) {
     case "global":
       return Globe;
+    case "debug":
     case "editor":
       return Code;
     case "grid":
@@ -2761,6 +2772,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editTableFontFamily.value = DEFAULT_EDITOR_SETTINGS.tableFontFamily;
     editUiFontFamily.value = DEFAULT_EDITOR_SETTINGS.uiFontFamily;
     editUiScale.value = DEFAULT_EDITOR_SETTINGS.uiScale;
+    editFontSmoothing.value = DEFAULT_EDITOR_SETTINGS.fontSmoothing;
     editTheme.value = DEFAULT_EDITOR_SETTINGS.theme;
     editCustomThemes.value = [...DEFAULT_EDITOR_SETTINGS.customThemes];
     editActiveCustomThemeId.value = DEFAULT_EDITOR_SETTINGS.activeCustomThemeId;
@@ -2792,6 +2804,7 @@ function resetDefaultsForTab(tab: SettingsCategory) {
     editAutoSelectActiveSidebarNode.value = DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode;
     editSidebarPinDefaultDatabase.value = DEFAULT_EDITOR_SETTINGS.sidebarPinDefaultDatabase;
     editSidebarBrowseObjectsOnDatabaseActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivation;
+    editSidebarExpandTreeOnConnect.value = DEFAULT_EDITOR_SETTINGS.sidebarExpandTreeOnConnect;
     editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
     editAutoReloadRestoredDataTabsOnOpen.value = DEFAULT_EDITOR_SETTINGS.autoReloadRestoredDataTabsOnOpen;
     editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
@@ -2911,6 +2924,7 @@ function resetAllDefaults() {
   editTableFontFamily.value = DEFAULT_EDITOR_SETTINGS.tableFontFamily;
   editUiFontFamily.value = DEFAULT_EDITOR_SETTINGS.uiFontFamily;
   editUiScale.value = DEFAULT_EDITOR_SETTINGS.uiScale;
+  editFontSmoothing.value = DEFAULT_EDITOR_SETTINGS.fontSmoothing;
   editTheme.value = DEFAULT_EDITOR_SETTINGS.theme;
   editCustomThemes.value = [...DEFAULT_EDITOR_SETTINGS.customThemes];
   editActiveCustomThemeId.value = DEFAULT_EDITOR_SETTINGS.activeCustomThemeId;
@@ -3019,6 +3033,7 @@ function resetAllDefaults() {
   editAutoSelectActiveSidebarNode.value = DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode;
   editSidebarPinDefaultDatabase.value = DEFAULT_EDITOR_SETTINGS.sidebarPinDefaultDatabase;
   editSidebarBrowseObjectsOnDatabaseActivation.value = DEFAULT_EDITOR_SETTINGS.sidebarBrowseObjectsOnDatabaseActivation;
+  editSidebarExpandTreeOnConnect.value = DEFAULT_EDITOR_SETTINGS.sidebarExpandTreeOnConnect;
   editOpenTabsRestoreMode.value = DEFAULT_EDITOR_SETTINGS.openTabsRestoreMode;
   editAutoReloadRestoredDataTabsOnOpen.value = DEFAULT_EDITOR_SETTINGS.autoReloadRestoredDataTabsOnOpen;
   editDisconnectTabHandlingMode.value = DEFAULT_EDITOR_SETTINGS.disconnectTabHandlingMode;
@@ -8607,6 +8622,16 @@ onUnmounted(() => {
                 </template>
               </div>
 
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <Label for="font-smoothing">{{ t("settings.fontSmoothing") }}</Label>
+                  <HelpTooltip :label="t('settings.fontSmoothing')">
+                    {{ t("settings.fontSmoothingDescription") }}
+                  </HelpTooltip>
+                </div>
+                <Switch id="font-smoothing" v-model="editFontSmoothing" />
+              </div>
+
               <div class="grid gap-3 md:grid-cols-2">
                 <div class="settings-appearance-field min-w-0">
                   <div class="flex min-w-0 items-center gap-1">
@@ -9352,6 +9377,15 @@ onUnmounted(() => {
                   </HelpTooltip>
                 </div>
                 <Switch id="sidebar-pin-default-database" v-model="editSidebarPinDefaultDatabase" />
+              </div>
+              <div class="settings-item flex items-center justify-between gap-4 rounded-md border bg-muted/20 px-3 py-2">
+                <div class="flex items-center gap-2">
+                  <Label for="sidebar-expand-tree-on-connect">{{ t("settings.sidebarExpandTreeOnConnect") }}</Label>
+                  <HelpTooltip :label="t('settings.sidebarExpandTreeOnConnect')">
+                    {{ t("settings.sidebarExpandTreeOnConnectDescription") }}
+                  </HelpTooltip>
+                </div>
+                <Switch id="sidebar-expand-tree-on-connect" v-model="editSidebarExpandTreeOnConnect" />
               </div>
               <div class="settings-item space-y-2 rounded-md border bg-muted/20 px-3 py-2">
                 <div class="flex items-center gap-2">

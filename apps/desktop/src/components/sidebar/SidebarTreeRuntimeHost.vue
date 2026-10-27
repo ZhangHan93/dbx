@@ -15,6 +15,8 @@ import { useSidebarTreeToolRuntime } from "@/composables/useSidebarTreeToolRunti
 import { canDropDatabaseNode, notifyDatabaseBrowserMutation } from "@/lib/database/databaseBrowserActions";
 import { canDropDatabaseTables, canEmptyDatabaseTables, useDatabaseTableEmpty } from "@/composables/useDatabaseTableEmpty";
 import { useI18n } from "vue-i18n";
+import { launchPlDebug, openPlDebugRecovery } from "@/components/debug/plDebugLaunch";
+import { supportsPlDebugRoutine } from "@/lib/database/databaseFeatureSupport";
 import { translateBackendError } from "@/i18n/backend-errors";
 import { normalizeBackendError } from "@/lib/backend/errorUtils";
 import { isConnectionTimeoutErrorMessage } from "@/lib/sql/queryError";
@@ -286,7 +288,7 @@ import { buildXuguCompileSql } from "@/lib/database/xuguCompileSql";
 import { buildDamengCompileViewSql } from "@/lib/database/damengCompileSql";
 import { buildTriggerToggleSql, supportsTriggerToggle } from "@/lib/database/triggerToggleSql";
 import type { SidebarDataOpenRequest } from "@/lib/sidebar/sidebarDataOpenCoordinator";
-import { createSidebarActionRequest, createSidebarActionTarget, findSidebarActionTarget, releaseRemovedSidebarActionTarget, type SidebarActionRequest, type SidebarActionTarget } from "@/lib/sidebar/sidebarActionTarget";
+import { createSidebarActionRequest, createSidebarActionTarget, findSidebarActionTarget, matchesSidebarActionTarget, releaseRemovedSidebarActionTarget, type SidebarActionRequest, type SidebarActionTarget } from "@/lib/sidebar/sidebarActionTarget";
 import { collapseSubtreeDescendants } from "@/lib/sidebar/sidebarTreeCollapse";
 import { createSidebarMenuContext, normalizeSidebarMenuDescriptors } from "@/lib/sidebar/sidebarTreeMenuDescriptors";
 import { driverProfileDatabaseWorkspace } from "@/lib/database/driverProfileExtensions";
@@ -952,12 +954,17 @@ async function toggle(requestId = beginNavigationRequest()) {
   emit("search-toggle", node);
   const wasExpanded = !!node.isExpanded;
 
-  // A search result is a projection over children that are already loaded for
-  // the query. Expanding a collapsed result must only remove it from the
-  // projection's collapsed set; entering the normal load path here can replace
-  // the live subtree with the filtered projection and leave the sidebar blank.
-  if (!wasExpanded && node.children?.length && sidebarTreeContext?.isSearchProjectionActive?.()) {
-    return;
+  // Skip loading only when removing the collapsed marker actually expanded
+  // the projection. Descendants of a matching connection retain their live
+  // expansion state and still need the normal lazy-load path. A saved-SQL
+  // shortcut alone also does not mean a database's objects have been loaded.
+  if (!wasExpanded && node.children?.some((child) => child.type !== "saved-sql-root") && sidebarTreeContext?.isSearchProjectionActive?.()) {
+    const visible = sidebarTreeContext.getVisibleNodes();
+    const index = sidebarTreeContext.getVisibleNodeIndex(node.id);
+    const indexed = visible[index];
+    // Database names containing ':' can share an id with a schema in another database.
+    const projected = indexed && matchesSidebarActionTarget(indexed, node) ? indexed : visible.find((candidate) => matchesSidebarActionTarget(candidate, node));
+    if (projected?.isExpanded) return;
   }
 
   if (node.type === "connection-group") {
@@ -2830,6 +2837,7 @@ const CONNECTION_URL_COPY_LABEL_KEYS: Record<ConnectionUrlCopyFormat, string> = 
   dsn: "contextMenu.copyDsn",
   dsnWithPassword: "contextMenu.copyDsnWithPassword",
   psqlCommand: "contextMenu.copyPsqlCommand",
+  password: "contextMenu.copyPasswordText",
 };
 
 /**
@@ -7259,6 +7267,9 @@ function buildConnectionSidebarMenu(context: SidebarMenuFactoryContext): boolean
     } else if (!isConnected.value) {
       items.push({ sidebarActionId: "contextMenu.openConnection", label: t("contextMenu.openConnection"), action: toggle, icon: Plug });
     }
+    if (node.connectionId && supportsPlDebugRoutine(currentDatabaseType())) {
+      items.push({ sidebarActionId: "plDebug.recovery", label: t("plDebug.recovery.title"), action: () => openPlDebugRecovery(node.connectionId!), icon: RefreshCw });
+    }
     items.push({ label: "", separator: true });
     items.push({ sidebarActionId: "contextMenu.copyName", label: t("contextMenu.copyName"), action: copyName, icon: Copy, shortcut: shortcutCopyName.value });
     const connectionUrlCopyMenu = connectionUrlCopyMenuItem();
@@ -7592,7 +7603,8 @@ function buildDatabaseSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     if (canCreateTable.value) {
       items.push({ sidebarActionId: "contextMenu.createTable", label: t("contextMenu.createTable"), action: createTable, icon: Plus });
     }
-    if (canCreateTable.value && isTableVGroupContainerNode(node) && !node.children?.some(isGroupLabel)) {
+    const isSimpleDisplay = settingsStore.editorSettings.sidebarObjectDisplay === "simple";
+    if (canCreateTable.value && isSimpleDisplay && isTableVGroupContainerNode(node) && !node.children?.some(isGroupLabel)) {
       items.push({
         sidebarActionId: "contextMenu.createGroup",
         label: t("connectionGroup.createGroup"),
@@ -8295,6 +8307,25 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
   // 8. Procedure / Function / Package
   if (node.type === "procedure" || node.type === "function") {
     const isPackageMember = node.parentType === "package" && !!node.parentName;
+    if (node.connectionId && node.database && supportsPlDebugRoutine(currentDatabaseType())) {
+      const target = {
+        connectionId: node.connectionId,
+        database: node.database,
+        databaseType: currentDatabaseType(),
+        schema: node.schema,
+        objectType: node.type === "procedure" ? "PROCEDURE" : "FUNCTION",
+        objectName: node.objectName || node.label,
+        packageName: isPackageMember ? node.parentName : undefined,
+        valid: node.valid,
+      };
+      items.push({
+        label: t("plDebug.start.title"),
+        action: () => {
+          void launchPlDebug(target);
+        },
+        icon: Play,
+      });
+    }
     if (node.type === "procedure" && !isPackageMember) {
       items.push({ label: t("contextMenu.executeProcedure"), action: openProcedureExecution, icon: Play });
     }
