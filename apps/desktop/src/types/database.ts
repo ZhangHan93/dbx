@@ -768,6 +768,12 @@ export interface PluginMcpContribution {
   description?: string;
   ai_tools?: boolean;
   external_tools?: boolean;
+  /** Optional grouping of the plugin's tools for the MCP settings UI. */
+  toolsets?: Array<{ id: string; title: string; description?: string }>;
+  /** Optional per-tool declarations keyed by tool name. */
+  tools?: Record<string, { toolset?: string; access?: "read" | "write" | "full" }>;
+  /** Optional sub-scope below a connection (e.g. a Kubernetes namespace). */
+  scope?: { kind: string; title: string; argument: string; list_method?: string };
 }
 
 /**
@@ -916,6 +922,8 @@ export interface PluginMarketplacePlugin {
   icon?: string;
   tags: string[];
   permissions: string[];
+  /** The plugin provides MCP tools (manifest declares an `mcp` contribution). */
+  mcpTools?: boolean;
   source?: string;
   homepage?: string;
   license?: string;

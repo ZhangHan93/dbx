@@ -3292,19 +3292,20 @@ mod tests {
         filter_table_infos, filter_visible_schema_names, finalize_object_source, gaussdb_m_indexes_sql,
         gaussdb_m_view_object_source_sql, gbase8a_object_statistics_sql, is_agent_postgres_metadata_fallback_config,
         is_mysql_external_driver_config, is_oracle_external_driver_config, is_retryable_metadata_error,
-        metadata_error_action, metadata_name_or_comment_matches, mysql_auto_increment_from_query_result,
-        mysql_auto_increment_metadata_sql, mysql_database_list_timeout, mysql_external_driver_ddl_from_query_result,
-        mysql_external_driver_ddl_sql, mysql_object_source_ddl_column_index, mysql_object_source_sql,
-        mysql_table_list_source_for_config, mysql_table_metadata_catalog, normalize_information_schema_table_type,
-        oracle_columns_from_query_result, oracle_columns_sql, oracle_columns_sql_for_resolved_owner,
-        oracle_completion_synonyms_sql, oracle_current_schema_from_query_result,
-        oracle_object_statistics_dba_segments_sql, oracle_object_statistics_from_query_result,
-        oracle_object_statistics_rows_only_sql, oracle_object_statistics_sql,
-        oracle_object_statistics_user_segments_sql, oracle_synonym_target_from_query_result, oracle_synonym_target_sql,
-        oracle_table_comment_sql, oracle_table_comments_sql, presto_like_columns_from_query_result,
-        presto_like_information_schema_columns_sql, presto_like_information_schema_tables_sql,
-        presto_like_tables_from_query_result, reference_key_columns_from_indexes, reference_keys_from_indexes,
-        replace_metadata_runtime, should_append_oracle_style_comment_ddl, should_query_oracle_columns_via_sql_first,
+        is_sqlserver_external_driver_config, metadata_error_action, metadata_name_or_comment_matches,
+        mysql_auto_increment_from_query_result, mysql_auto_increment_metadata_sql, mysql_database_list_timeout,
+        mysql_external_driver_ddl_from_query_result, mysql_external_driver_ddl_sql,
+        mysql_object_source_ddl_column_index, mysql_object_source_sql, mysql_table_list_source_for_config,
+        mysql_table_metadata_catalog, normalize_information_schema_table_type, oracle_columns_from_query_result,
+        oracle_columns_sql, oracle_columns_sql_for_resolved_owner, oracle_completion_synonyms_sql,
+        oracle_current_schema_from_query_result, oracle_object_statistics_dba_segments_sql,
+        oracle_object_statistics_from_query_result, oracle_object_statistics_rows_only_sql,
+        oracle_object_statistics_sql, oracle_object_statistics_user_segments_sql,
+        oracle_synonym_target_from_query_result, oracle_synonym_target_sql, oracle_table_comment_sql,
+        oracle_table_comments_sql, presto_like_columns_from_query_result, presto_like_information_schema_columns_sql,
+        presto_like_information_schema_tables_sql, presto_like_tables_from_query_result,
+        reference_key_columns_from_indexes, reference_keys_from_indexes, replace_metadata_runtime,
+        should_append_oracle_style_comment_ddl, should_query_oracle_columns_via_sql_first,
         single_table_comment_from_query_result, table_comments_from_query_result, table_name_filter_matches,
         tdengine_table_comment_like_pattern, tdengine_table_comment_sql, tdengine_table_comments_sql,
         uses_mongodb_agent_collection_listing, visible_schema_filter, ExternalDriverStatisticsDialect,
@@ -3878,6 +3879,35 @@ done
 
         config.db_type = DatabaseType::Oracle;
         assert!(!is_oracle_external_driver_config(&config));
+    }
+
+    #[test]
+    fn sqlserver_external_driver_detection_only_accepts_standard_jdbc_signals() {
+        let mut config = test_connection_config(DatabaseType::Jdbc);
+        config.connection_string = Some(" jdbc:sqlserver://127.0.0.1:1433;databaseName=demo ".to_string());
+        assert!(is_sqlserver_external_driver_config(&config));
+
+        config.connection_string = Some("jdbc:jtds:sqlserver://127.0.0.1:1433/demo".to_string());
+        assert!(is_sqlserver_external_driver_config(&config));
+
+        config.connection_string = Some("jdbc:jtds:sqlserver://127.0.0.1:1433/demo".to_string());
+        config.jdbc_driver_class = Some("com.mysql.cj.jdbc.Driver".to_string());
+        assert!(!is_sqlserver_external_driver_config(&config));
+
+        config.connection_string = None;
+        config.jdbc_driver_class = Some(" com.microsoft.sqlserver.jdbc.SQLServerDriver ".to_string());
+        assert!(is_sqlserver_external_driver_config(&config));
+
+        config.jdbc_driver_class = Some("net.sourceforge.jtds.jdbc.Driver".to_string());
+        assert!(is_sqlserver_external_driver_config(&config));
+
+        config.connection_string = Some("jdbc:postgresql://127.0.0.1:5432/demo".to_string());
+        config.jdbc_driver_class = Some("com.microsoft.sqlserver.jdbc.SQLServerDriver".to_string());
+        assert!(!is_sqlserver_external_driver_config(&config));
+
+        config.db_type = DatabaseType::SqlServer;
+        config.connection_string = None;
+        assert!(!is_sqlserver_external_driver_config(&config));
     }
 
     #[test]
@@ -10784,6 +10814,37 @@ pub(crate) fn is_oracle_external_driver_config(config: &ConnectionConfig) -> boo
     }
 }
 
+/// SQL Server over a generic JDBC connection runs T-SQL through the JDBC
+/// plugin, so its scripts split with the SQL Server statement rules (#13514).
+/// The plain `Jdbc` profile would cut a `BEGIN TRY ... END CATCH` batch at
+/// every inner semicolon. The `jdbc:jtds:sqlserver:` prefix and the jTDS driver
+/// cover the legacy open-source TDS driver alongside the Microsoft one.
+pub(crate) fn is_sqlserver_external_driver_config(config: &ConnectionConfig) -> bool {
+    if config.db_type != DatabaseType::Jdbc {
+        return false;
+    }
+
+    let connection_string = config.connection_string.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let driver_class = config.jdbc_driver_class.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    let sqlserver_url = connection_string.map(|value| {
+        value.to_ascii_lowercase().starts_with("jdbc:sqlserver:")
+            || value.to_ascii_lowercase().starts_with("jdbc:jtds:sqlserver:")
+    });
+    let sqlserver_driver = driver_class.map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "com.microsoft.sqlserver.jdbc.sqlserverdriver" | "net.sourceforge.jtds.jdbc.driver"
+        )
+    });
+
+    match (sqlserver_url, sqlserver_driver) {
+        (Some(url_matches), Some(driver_matches)) => url_matches && driver_matches,
+        (Some(url_matches), None) => url_matches,
+        (None, Some(driver_matches)) => driver_matches,
+        (None, None) => false,
+    }
+}
+
 fn external_driver_uses_mysql_ddl(config: &ConnectionConfig) -> bool {
     is_mysql_external_driver_config(config) || gaussdb_uses_m_jdbc_driver(config)
 }
@@ -15357,6 +15418,24 @@ mod ddl_tests {
     }
 
     #[test]
+    fn postgres_table_ddl_preserves_foreign_key_actions_without_native_definition() {
+        let foreign_key = db::ForeignKeyInfo {
+            name: "fk_parent".to_string(),
+            column: "parent_id".to_string(),
+            ref_schema: Some("other".to_string()),
+            ref_table: "parent".to_string(),
+            ref_column: "id".to_string(),
+            on_update: Some("RESTRICT".to_string()),
+            on_delete: Some("CASCADE".to_string()),
+        };
+        let ddl = render_postgres_table_ddl("public", "child", &[], &[], &[foreign_key], None);
+        assert!(
+            ddl.contains("REFERENCES \"other\".\"parent\"(\"id\") ON UPDATE RESTRICT ON DELETE CASCADE"),
+            "ddl: {ddl}"
+        );
+    }
+
+    #[test]
     fn postgres_table_ddl_appends_trigger_definitions() {
         let ddl = append_postgres_trigger_definitions(
             render_postgres_table_ddl("public", "users", &[column("id", "integer")], &[], &[], None),
@@ -17207,6 +17286,7 @@ fn render_postgres_table_ddl_with_constraints_and_partition_info(
         }
         definition_lines.push(format!("  CONSTRAINT {} {}", pg_ident(&constraint.name), constraint.definition.trim()));
     }
+    let mut not_valid_foreign_keys = Vec::new();
     for fk_group in group_foreign_keys_by_name(fkeys) {
         let Some(first_fk) = fk_group.first() else {
             continue;
@@ -17219,13 +17299,36 @@ fn render_postgres_table_ddl_with_constraints_and_partition_info(
         let referenced_schema =
             first_fk.ref_schema.as_deref().filter(|value| !value.trim().is_empty()).unwrap_or(schema);
         let referenced_table = format!("{}.{}", pg_ident(referenced_schema), pg_ident(&first_fk.ref_table));
-        definition_lines.push(format!(
-            "  CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {}({})",
-            pg_ident(&first_fk.name),
-            columns,
-            referenced_table,
-            ref_columns
-        ));
+        let native_definition = constraints
+            .iter()
+            .find(|constraint| constraint.constraint_type == "FOREIGN KEY" && constraint.name == first_fk.name)
+            .map(|constraint| constraint.definition.as_str())
+            .or_else(|| partition_local_objects.foreign_key_definitions.get(&first_fk.name).map(String::as_str));
+        // Keep our schema-qualified relation and ordered column pairs, but
+        // preserve every native option after REFERENCES (...). The scanner
+        // also handles parentheses inside quoted identifiers.
+        let suffix = native_definition
+            .and_then(|definition| {
+                let columns_end = db::ddl_scan::find_top_level_paren_close(definition, 0)?;
+                let references_end = db::ddl_scan::find_top_level_paren_close(definition, columns_end)?;
+                Some(definition[references_end..].trim_end().to_string())
+            })
+            .unwrap_or_else(|| {
+                let mut suffix = String::new();
+                if let Some(action) = first_fk.on_update.as_deref() {
+                    suffix.push_str(&format!(" ON UPDATE {action}"));
+                }
+                if let Some(action) = first_fk.on_delete.as_deref() {
+                    suffix.push_str(&format!(" ON DELETE {action}"));
+                }
+                suffix
+            });
+        let definition = format!("FOREIGN KEY ({columns}) REFERENCES {referenced_table}({ref_columns}){suffix}");
+        if is_not_valid_constraintdef(&definition) {
+            not_valid_foreign_keys.push((first_fk.name.as_str(), definition));
+        } else {
+            definition_lines.push(format!("  CONSTRAINT {} {definition}", pg_ident(&first_fk.name)));
+        }
     }
     // `pg_get_constraintdef` appends ` NOT VALID` for an unvalidated CHECK
     // constraint, but that suffix is only legal after `ALTER TABLE ADD
@@ -17306,6 +17409,9 @@ fn render_postgres_table_ddl_with_constraints_and_partition_info(
     }
     ddl.push_str(";\n");
 
+    for (name, definition) in &not_valid_foreign_keys {
+        ddl.push_str(&format!("\nALTER TABLE {table_name} ADD CONSTRAINT {} {};", pg_ident(name), definition));
+    }
     for (name, definition) in &not_valid_check_constraints {
         ddl.push_str(&format!("\nALTER TABLE {table_name} ADD CONSTRAINT {} {};", pg_ident(name), definition));
     }

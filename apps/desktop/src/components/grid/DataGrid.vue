@@ -149,9 +149,12 @@ import { sumGridCountValues } from "@/lib/dataGrid/dataGridCountValue";
 import {
   buildVisibleTransposeRows,
   averageTransposeRecordWidth,
+  calculateTransposeInfoWidth,
   calculateTransposeRecordWidth,
+  defaultTransposeInfoWidth,
   defaultTransposeRecordWidth,
   minTransposeFieldWidth,
+  minTransposeInfoWidth,
   minTransposeRecordWidth,
   nextContextTransposeState,
   nextKeyboardTransposeState,
@@ -12416,7 +12419,8 @@ const transposeReserveTypeLine = computed(() => showTransposeFieldMetadata.value
 const transposeReserveCommentLine = computed(() => showTransposeFieldMetadata.value && showTransposeColumnComments.value && transposeRows.value.some((row) => row.comment));
 const transposeRowHeight = computed(() => 30 + (transposeReserveTypeLine.value ? 14 : 0) + (transposeReserveCommentLine.value ? 14 : 0));
 const isTransposeMode = computed(() => showTranspose.value && transposeRows.value.length > 0);
-const transposeInfoWidth = computed(() => (transposeMetadataInInfoColumn.value ? 360 : 0));
+const transposeInfoWidthOverride = ref<number | null>(null);
+const transposeInfoWidth = computed(() => (transposeMetadataInInfoColumn.value ? (transposeInfoWidthOverride.value ?? defaultTransposeInfoWidth(columnWidthDensity.value)) : 0));
 const transposeTotalWidth = computed(() => transposePinnedWidth.value + transposeRecordOffsets.value[transposeRecordOffsets.value.length - 1] + transposeEndSpacerWidth.value + transposeInfoWidth.value);
 
 function transposeScrollElement(): HTMLElement | undefined {
@@ -12602,6 +12606,28 @@ function autoFitTransposeRecord(recordIndex: number) {
   const next = [...transposeRecordWidths.value];
   next[recordIndex] = calcTransposeRecordWidth(recordIndex);
   transposeRecordWidths.value = next;
+}
+
+function onTransposeInfoResizeStart(event: MouseEvent) {
+  event.preventDefault();
+  const startX = event.clientX;
+  const startWidth = transposeInfoWidth.value;
+  const onMove = (e: MouseEvent) => {
+    transposeInfoWidthOverride.value = Math.max(minTransposeInfoWidth(columnWidthDensity.value), startWidth + e.clientX - startX);
+    updateTransposeViewport();
+  };
+  const onUp = () => {
+    document.removeEventListener("mousemove", onMove);
+    document.removeEventListener("mouseup", onUp);
+  };
+  document.addEventListener("mousemove", onMove);
+  document.addEventListener("mouseup", onUp);
+}
+
+function autoFitTransposeInfo() {
+  const texts = visibleColumnIndexes.value.map((columnIndex) => columnInfoText(columnIndex, false));
+  transposeInfoWidthOverride.value = calculateTransposeInfoWidth(texts, { density: columnWidthDensity.value });
+  updateTransposeViewport();
 }
 
 function currentTransposeViewportRowIndex(): number {
@@ -15651,8 +15677,9 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
                         <div class="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/30" @mousedown.stop="onTransposeRecordResizeStart(recordIndex, $event)" @dblclick.stop="autoFitTransposeRecord(recordIndex)" />
                       </div>
                       <div class="shrink-0" :style="{ width: `${transposeAfterSpacerWidth}px` }" />
-                      <div v-if="transposeMetadataInInfoColumn" class="data-grid-header-cell shrink-0 border-r border-border px-3 py-1.5" :style="{ width: `${transposeInfoWidth}px` }">
-                        {{ t("grid.columnInfo") }}
+                      <div v-if="transposeMetadataInInfoColumn" class="data-grid-header-cell relative flex shrink-0 items-center border-r border-border px-3 py-1.5 truncate" :style="{ width: `${transposeInfoWidth}px` }">
+                        <span class="min-w-0 flex-1 truncate">{{ t("grid.columnInfo") }}</span>
+                        <div data-grid-transpose-info-resize-handle class="absolute right-0 top-0 bottom-0 w-1.5 cursor-col-resize hover:bg-primary/30" @mousedown.stop="onTransposeInfoResizeStart" @dblclick.stop="autoFitTransposeInfo" />
                       </div>
                     </div>
                   </template>
@@ -17223,7 +17250,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
     <ErrorBanner v-if="saveError" variant="card" :title="t('grid.saveErrorTitle')" :message="saveError" copy-mode="label" dismissible @dismiss="saveError = ''" />
 
     <!-- Bottom status bar -->
-    <div v-if="!isErrorResult" class="grid grid-cols-[max-content_minmax(0,1fr)_max-content] items-center gap-2 px-3 py-1 border-t text-xs text-muted-foreground bg-muted/30 shrink-0" :class="{ 'relative max-sm:pt-7': selectedColumnInfo }">
+    <div v-if="!isErrorResult" class="grid grid-cols-[max-content_minmax(0,1fr)_minmax(0,max-content)] items-center gap-2 px-3 py-1 border-t text-xs text-muted-foreground bg-muted/30 shrink-0" :class="{ 'relative max-sm:pt-7': selectedColumnInfo }">
       <div class="flex min-w-0 items-center gap-2 overflow-hidden">
         <span v-if="hasData" class="shrink-0">
           {{

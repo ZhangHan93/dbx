@@ -238,4 +238,45 @@ describe("DataGrid transpose sorting", () => {
     await settle();
     expect(transposeFieldNames(host)).toEqual(["zeta", "alpha"]);
   });
+
+  it("allows resizing and auto-fitting the independent transpose info column", async () => {
+    const { host, settingsStore } = mountGrid();
+    settingsStore.updateEditorSettings({ dataGridTransposeMetadataInInfoColumn: true });
+    await settle();
+    await openTranspose(host);
+
+    const handle = host.querySelector<HTMLElement>("[data-grid-transpose-info-resize-handle]");
+    expect(handle).not.toBeNull();
+
+    const headerInfoCell = handle!.parentElement as HTMLElement;
+    expect(headerInfoCell.style.width).toBe("360px");
+    const rowInfoCell = host.querySelector<HTMLElement>("[data-grid-transpose-column-info]");
+    expect(rowInfoCell?.style.width).toBe("360px");
+
+    // Drag to widen (+150px)
+    handle!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: 200 }));
+    document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, clientX: 350 }));
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+    await settle();
+
+    expect(headerInfoCell.style.width).toBe("510px");
+    expect(rowInfoCell?.style.width).toBe("510px");
+
+    // Drag to narrow below min width (should clamp to minTransposeInfoWidth = 120px)
+    handle!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, clientX: 350 }));
+    document.dispatchEvent(new MouseEvent("mousemove", { bubbles: true, cancelable: true, clientX: -100 }));
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+    await settle();
+
+    expect(headerInfoCell.style.width).toBe("120px");
+    expect(rowInfoCell?.style.width).toBe("120px");
+
+    // Double-click to auto-fit
+    handle!.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+    await settle();
+
+    const autoFittedWidth = parseInt(headerInfoCell.style.width, 10);
+    expect(autoFittedWidth).toBeGreaterThan(120);
+    expect(rowInfoCell?.style.width).toBe(`${autoFittedWidth}px`);
+  });
 });

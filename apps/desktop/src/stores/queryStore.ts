@@ -2710,7 +2710,7 @@ export const useQueryStore = defineStore("query", () => {
     }
 
     const originalRows = tab.resultLocalSortOriginalRows;
-    const columnType = tab.result.column_types?.[columnIndex];
+    const columnType = (tab.result.column_types?.[columnIndex]?.trim() || undefined) ?? (tab.tableMeta?.columns?.find((c) => c.name.toLowerCase() === column.toLowerCase())?.data_type?.trim() || undefined) ?? (tab.resultColumnTypeLabels?.[columnIndex]?.trim() || undefined);
     const rowIndexes = direction ? sortDataGridRowIndexes(originalRows, columnIndex, direction, columnType) : originalRows.map((_, index) => index);
     const rows = rowIndexes.map((index) => originalRows[index]!);
     const originalMongoDocuments = tab.resultLocalSortOriginalMongoDocuments;

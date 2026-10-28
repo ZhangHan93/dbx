@@ -2,6 +2,7 @@
 import { blockingDesktopAiRunsForUpdate } from "@/lib/ai/desktopAiRunRegistry";
 import { setupUpdatePreparation, prepareUpdateWithDraftRecovery, isUpdatePreparationActive } from "@/lib/app/updatePreparation";
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, defineAsyncComponent, provide } from "vue";
+import { MCP_CALL_HISTORY_OPEN_EVENT, type McpCallHistoryRequest } from "@/lib/mcp/mcpCallHistory";
 import "vue-virtual-scroller/dist/vue-virtual-scroller.css";
 import { checkStartupAuthentication, logoutWeb, type StartupAuthentication } from "@/lib/startup/startupAuthentication";
 import { markStartupPhase } from "@/lib/startup/startupTiming";
@@ -331,6 +332,7 @@ const {
   isPreparingUpdate,
   checkingUpdates,
   updateInfo,
+  visibleUpdateInfo,
   updateCheckMessage,
   updateCheckFailed,
   showUpdateDialog,
@@ -489,11 +491,38 @@ const showTabSwitcher = ref(false);
 const tabSwitcherIndex = ref(0);
 const agentDriverUpdateCount = ref(0);
 const showHistory = ref(false);
+const mcpHistoryRequest = ref<McpCallHistoryRequest | null>(null);
+
+/** Settings → MCP asks for the call history: open the panel on its MCP view. */
+function openMcpCallHistory(event?: Event) {
+  // Keep the request across the async component's first load; nextTick alone
+  // does not wait for QueryHistory to mount and receive an event.
+  mcpHistoryRequest.value = { resource: event instanceof CustomEvent ? event.detail : undefined };
+  openRightSidebarPanel("history");
+}
+
+watch(
+  showHistory,
+  (open) => {
+    if (!open) mcpHistoryRequest.value = null;
+  },
+  // Also cancel a close/reopen in the same tick before the lazy panel mounts.
+  { flush: "sync" },
+);
 const showAiPanel = ref(safeLocalStorageGet("dbx-ai-panel-open") === "true");
 const isAiPanelMaximized = ref(false);
 const isHistoryPanelMaximized = ref(false);
 const isZenMode = ref(false);
 const showSqlLibraryPanel = ref(safeLocalStorageGet("dbx-sql-library-open") === "true");
+const sqlLibraryLocateRequest = ref<{ id: number; fileId: string } | null>(null);
+let sqlLibraryLocateRequestId = 0;
+watch(
+  showSqlLibraryPanel,
+  (open) => {
+    if (!open) sqlLibraryLocateRequest.value = null;
+  },
+  { flush: "sync" },
+);
 const sqlFileLocateRequest = ref<{ id: number; path: string } | null>(null);
 let sqlFileLocateRequestId = 0;
 const showSqlFilePanel = ref(safeLocalStorageGet("dbx-sql-file-panel-open") === "true");
@@ -3750,6 +3779,17 @@ function finishSqlFileLocate(requestId: number) {
   if (sqlFileLocateRequest.value?.id === requestId) sqlFileLocateRequest.value = null;
 }
 
+function locateSqlLibraryFile(tab: QueryTab) {
+  if (!tab.savedSqlId || isDetachedWindowContext) return;
+  isZenMode.value = false;
+  openRightSidebarPanel("sqlLibrary");
+  sqlLibraryLocateRequest.value = { id: ++sqlLibraryLocateRequestId, fileId: tab.savedSqlId };
+}
+
+function finishSqlLibraryLocate(requestId: number) {
+  if (sqlLibraryLocateRequest.value?.id === requestId) sqlLibraryLocateRequest.value = null;
+}
+
 async function locateTabInSidebar(tab: QueryTab) {
   setSidebarOpen(true);
   await nextTick();
@@ -5274,6 +5314,7 @@ onMounted(async () => {
   window.addEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   window.addEventListener(COMPONENT_UPDATES_CHANGED_EVENT, handleComponentUpdatesChanged);
   window.addEventListener("dbx:activate-query-surface", activateQuerySurface);
+  window.addEventListener(MCP_CALL_HISTORY_OPEN_EVENT, openMcpCallHistory);
   window.addEventListener(OBJECT_BROWSER_SEARCH_FOCUS_EVENT, focusRequestedObjectBrowserSearch);
   window.addEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);
   window.addEventListener("dbx:ai-run-notify", handleAiRunNotify);
@@ -5374,6 +5415,7 @@ onUnmounted(() => {
   window.removeEventListener("dbx-open-driver-store", openDriverStoreFromEvent);
   window.removeEventListener(COMPONENT_UPDATES_CHANGED_EVENT, handleComponentUpdatesChanged);
   window.removeEventListener("dbx:activate-query-surface", activateQuerySurface);
+  window.removeEventListener(MCP_CALL_HISTORY_OPEN_EVENT, openMcpCallHistory);
   window.removeEventListener(OBJECT_BROWSER_SEARCH_FOCUS_EVENT, focusRequestedObjectBrowserSearch);
   window.removeEventListener("dbx-mcp-status-changed", handleMcpStatusChanged);
   window.removeEventListener("dbx:ai-run-notify", handleAiRunNotify);
@@ -5597,6 +5639,7 @@ onUnmounted(() => {
                     :content-suppressed="activeTab?.mode === 'plugin-workbench'"
                     @locate-tab="locateTabInSidebar"
                     @locate-sql-file="locateSqlFile"
+                    @locate-sql-library-file="locateSqlLibraryFile"
                     @close-tab="
                       (tabId: string) => {
                         if (tabId === queryStore.activeTabId) void closeActiveSurface();
@@ -5809,6 +5852,8 @@ onUnmounted(() => {
             <div class="h-full min-h-0 overflow-hidden rounded-[inherit]" @mousedown="rememberAuxiliarySearchSurface('history')">
               <div data-history-panel class="h-full min-h-0">
                 <QueryHistory
+                  :mcp-request="mcpHistoryRequest"
+                  @mcp-request-handled="mcpHistoryRequest = null"
                   :maximized="isHistoryPanelMaximized"
                   @toggle-maximize="isHistoryPanelMaximized = !isHistoryPanelMaximized"
                   :current-connection-id="activeTab?.connectionId"
@@ -5830,7 +5875,7 @@ onUnmounted(() => {
             <div class="panel-resize-handle panel-resize-handle--left" @pointerdown="startSqlLibraryResize" />
             <div class="h-full min-h-0 overflow-hidden rounded-[inherit]" @mousedown="rememberAuxiliarySearchSurface('sqlLibrary')">
               <div data-sql-library-panel class="h-full min-h-0">
-                <SqlLibraryPanel @close="closeRightSidebarPanel('sqlLibrary')" />
+                <SqlLibraryPanel :locate-request="sqlLibraryLocateRequest" @locate-handled="finishSqlLibraryLocate" @close="closeRightSidebarPanel('sqlLibrary')" />
               </div>
             </div>
           </div>
@@ -5913,7 +5958,7 @@ onUnmounted(() => {
         <UpdateDialog
           v-if="showUpdateDialog"
           v-model:open="showUpdateDialog"
-          :update-info="updateInfo"
+          :update-info="visibleUpdateInfo"
           :update-check-message="updateCheckMessage"
           :checking-updates="checkingUpdates"
           :update-check-failed="updateCheckFailed"

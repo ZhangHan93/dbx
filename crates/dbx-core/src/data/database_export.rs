@@ -472,6 +472,7 @@ impl LenientExportErrors {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExportStatus {
+    PreparingSnapshot,
     Running,
     Writing,
     Done,

@@ -730,6 +730,43 @@ fn qualified_table_with_identifier_quote(
     }
 }
 
+/// Whether write SQL should use an identifier quote the caller resolved for the connection
+/// instead of the static transfer mapping. Callers that pass `None` keep the transfer mapping, so
+/// their generated SQL is unchanged.
+fn uses_explicit_identifier_quote(db_type: &DatabaseType, identifier_quote: Option<&str>) -> bool {
+    identifier_quote.is_some() && crate::sql_dialect::uses_connection_identifier_quote(Some(*db_type), identifier_quote)
+}
+
+/// Quotes a write-target identifier with the connection's identifier quote, falling back to
+/// [`quote_identifier`] when there is none.
+pub(crate) fn quote_identifier_with_explicit_quote(
+    name: &str,
+    db_type: &DatabaseType,
+    identifier_quote: Option<&str>,
+) -> String {
+    if uses_explicit_identifier_quote(db_type, identifier_quote) {
+        quote_identifier_with_identifier_quote(name, db_type, identifier_quote)
+    } else {
+        quote_identifier(name, db_type)
+    }
+}
+
+/// Qualifies a write-target table with the connection's identifier quote, falling back to
+/// [`qualified_table`] when there is none.
+pub(crate) fn qualified_table_with_explicit_quote(
+    table: &str,
+    schema: &str,
+    db_type: &DatabaseType,
+    catalog: Option<&str>,
+    identifier_quote: Option<&str>,
+) -> String {
+    if uses_explicit_identifier_quote(db_type, identifier_quote) {
+        qualified_table_with_identifier_quote(table, schema, db_type, catalog, identifier_quote)
+    } else {
+        qualified_table(table, schema, db_type, catalog)
+    }
+}
+
 pub fn validate_transfer_target_table_names(request: &TransferRequest) -> Result<(), String> {
     let mut targets: HashMap<String, String> = HashMap::new();
     for source_table in &request.tables {
@@ -5296,7 +5333,16 @@ impl InsertSqlTemplate {
         catalog: Option<&str>,
         overrides_postgres_system_values: bool,
     ) -> Self {
-        Self::new_with_column_quoting(columns, table, schema, db_type, catalog, overrides_postgres_system_values, true)
+        Self::new_with_column_quoting(
+            columns,
+            table,
+            schema,
+            db_type,
+            catalog,
+            overrides_postgres_system_values,
+            true,
+            None,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5308,11 +5354,18 @@ impl InsertSqlTemplate {
         catalog: Option<&str>,
         overrides_postgres_system_values: bool,
         quote_target_column_names: bool,
+        identifier_quote: Option<&str>,
     ) -> Self {
-        let full_table = qualified_table(table, schema, db_type, catalog);
+        let full_table = qualified_table_with_explicit_quote(table, schema, db_type, catalog, identifier_quote);
         let col_list = columns
             .iter()
-            .map(|column| transfer_column_identifier(column, db_type, quote_target_column_names))
+            .map(|column| {
+                if uses_explicit_identifier_quote(db_type, identifier_quote) {
+                    quote_identifier_with_identifier_quote(column, db_type, identifier_quote)
+                } else {
+                    transfer_column_identifier(column, db_type, quote_target_column_names)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let overriding =
@@ -5817,6 +5870,7 @@ fn generate_upsert_typed_for_transfer(
                 catalog,
                 false,
                 quote_target_column_names,
+                None,
             );
             template.build(&value_rows_sql(rows, column_types, db_type, mysql_spatial_markers))
         }
@@ -6700,6 +6754,7 @@ fn generate_transfer_write_sql(
                 catalog,
                 overrides_postgres_system_values,
                 quote_target_column_names,
+                None,
             );
             template.build(&value_rows_sql(rows, column_types, db_type, mysql_spatial_markers))
         }
@@ -6733,7 +6788,7 @@ pub(crate) fn generate_insert_typed_sql_batches_from_value_rows(
     limits: SqlBatchLimits,
 ) -> Result<Vec<(String, usize)>, String> {
     generate_insert_typed_sql_batches_from_value_rows_with_options(
-        columns, value_rows, table, schema, db_type, catalog, limits, false,
+        columns, value_rows, table, schema, db_type, catalog, limits, false, None,
     )
 }
 
@@ -6747,10 +6802,20 @@ pub(crate) fn generate_insert_typed_sql_batches_from_value_rows_with_options(
     catalog: Option<&str>,
     limits: SqlBatchLimits,
     skip_duplicate_rows: bool,
+    identifier_quote: Option<&str>,
 ) -> Result<Vec<(String, usize)>, String> {
     if !skip_duplicate_rows {
         return generate_insert_sql_batches_from_value_rows(
-            columns, value_rows, table, schema, db_type, catalog, limits, false, true,
+            columns,
+            value_rows,
+            table,
+            schema,
+            db_type,
+            catalog,
+            limits,
+            false,
+            true,
+            identifier_quote,
         );
     }
 
@@ -6767,7 +6832,16 @@ pub(crate) fn generate_insert_typed_sql_batches_from_value_rows_with_options(
     let target_sql_bytes = limits.target_sql_bytes.max(1);
     let batch_sql_bytes = limits.hard_sql_bytes.map_or(target_sql_bytes, |hard| target_sql_bytes.min(hard));
 
-    let template = InsertSqlTemplate::new_with_column_quoting(columns, table, schema, db_type, catalog, false, true);
+    let template = InsertSqlTemplate::new_with_column_quoting(
+        columns,
+        table,
+        schema,
+        db_type,
+        catalog,
+        false,
+        true,
+        identifier_quote,
+    );
 
     let value_row_bytes = value_rows.iter().map(|row| sql_text_bytes(row, db_type)).collect::<Vec<_>>();
 
@@ -6875,6 +6949,7 @@ pub(crate) fn generate_primary_key_upsert_sql_batches_from_value_rows(
         adjusted_limits,
         false,
         true,
+        None,
     )?;
 
     batches
@@ -6930,6 +7005,7 @@ fn generate_insert_typed_sql_batches_for_transfer(
         limits,
         overrides_postgres_system_values,
         quote_target_column_names,
+        None,
     )
 }
 
@@ -6944,6 +7020,7 @@ fn generate_insert_sql_batches_from_value_rows(
     limits: SqlBatchLimits,
     overrides_postgres_system_values: bool,
     quote_target_column_names: bool,
+    identifier_quote: Option<&str>,
 ) -> Result<Vec<(String, usize)>, String> {
     if value_rows.is_empty() {
         return Ok(Vec::new());
@@ -6965,6 +7042,7 @@ fn generate_insert_sql_batches_from_value_rows(
         catalog,
         overrides_postgres_system_values,
         quote_target_column_names,
+        identifier_quote,
     );
     let value_row_bytes = value_rows.iter().map(|row| sql_text_bytes(row, db_type)).collect::<Vec<_>>();
     let mut statements = Vec::new();
@@ -10751,12 +10829,12 @@ fn postgres_table_dependency_selection_sql(schema: &str, tables: &[String]) -> O
              JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
              WHERE n.nspname = {source_schema} AND c.relkind IN ('r','p','f') AND c.relname IN ({table_list}) \
          ), selected_dependencies(classid, objid) AS ( \
-             SELECT 'pg_catalog.pg_class'::regclass, oid FROM selected_tables \
-             UNION SELECT 'pg_catalog.pg_attrdef'::regclass, a.oid \
+             SELECT 'pg_catalog.pg_class'::regclass::oid, oid FROM selected_tables \
+             UNION SELECT 'pg_catalog.pg_attrdef'::regclass::oid, a.oid \
              FROM pg_catalog.pg_attrdef a JOIN selected_tables t ON t.oid = a.adrelid \
-             UNION SELECT 'pg_catalog.pg_constraint'::regclass, c.oid \
+             UNION SELECT 'pg_catalog.pg_constraint'::regclass::oid, c.oid \
              FROM pg_catalog.pg_constraint c JOIN selected_tables t ON t.oid = c.conrelid \
-             UNION SELECT 'pg_catalog.pg_class'::regclass, i.indexrelid \
+             UNION SELECT 'pg_catalog.pg_class'::regclass::oid, i.indexrelid \
              FROM pg_catalog.pg_index i JOIN selected_tables t ON t.oid = i.indrelid \
              UNION \
              SELECT d.refclassid, d.refobjid \
@@ -17373,6 +17451,19 @@ CREATE TABLE "Other"."prefix""Source"."NAME" ("ID" INT);"#;
         }
 
         #[test]
+        fn postgres_table_dependency_recursive_cte_unifies_classid_to_oid() {
+            let sql = postgres_table_dependency_selection_sql("public", &["orders".into()]).unwrap();
+            for needle in [
+                "SELECT 'pg_catalog.pg_class'::regclass::oid, oid FROM selected_tables",
+                "UNION SELECT 'pg_catalog.pg_attrdef'::regclass::oid, a.oid",
+                "UNION SELECT 'pg_catalog.pg_constraint'::regclass::oid, c.oid",
+                "UNION SELECT 'pg_catalog.pg_class'::regclass::oid, i.indexrelid",
+            ] {
+                assert!(sql.contains(needle));
+            }
+        }
+
+        #[test]
         fn postgres_transfer_relation_sources_exclude_extension_members() {
             for relkind in ['v', 'm'] {
                 let sql = postgres_transfer_relation_sources_sql("public", relkind);
@@ -23462,6 +23553,7 @@ SELECT 1 FROM dual"#
             None,
             SqlBatchLimits { max_rows: 100, target_sql_bytes: 1024, hard_sql_bytes: None },
             true,
+            None,
         )
         .unwrap();
 
@@ -23483,6 +23575,7 @@ SELECT 1 FROM dual"#
             None,
             SqlBatchLimits { max_rows: 100, target_sql_bytes: 1024, hard_sql_bytes: None },
             true,
+            None,
         )
         .unwrap();
 
@@ -23505,6 +23598,7 @@ SELECT 1 FROM dual"#
             None,
             SqlBatchLimits { max_rows: 100, target_sql_bytes: 1024, hard_sql_bytes: None },
             true,
+            None,
         )
         .unwrap();
 

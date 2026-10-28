@@ -78,8 +78,13 @@ const queryStore = useQueryStore();
 const settingsStore = useSettingsStore();
 const { databaseOptions, loadingDatabaseOptions, loadDatabaseOptions, catalogOptions, loadingCatalogOptions, loadCatalogOptions, catalogDatabaseOptions, loadingCatalogDatabaseOptions, loadCatalogDatabaseOptions } = useDatabaseOptions();
 
+const props = defineProps<{
+  locateRequest?: { id: number; fileId: string } | null;
+}>();
+
 const emit = defineEmits<{
   close: [];
+  "locate-handled": [id: number];
 }>();
 
 const UNFILED_DROP_TARGET_ID = "__sql-library-unfiled__";
@@ -541,8 +546,8 @@ const activeSavedSqlId = computed(() => queryStore.tabs.find((tab) => tab.id ===
 const libraryTree = ref<HTMLElement | null>(null);
 const currentSavedSqlFile = computed(() => (activeSavedSqlId.value ? savedSqlStore.getFile(activeSavedSqlId.value) : undefined));
 
-async function locateCurrentFile() {
-  const file = currentSavedSqlFile.value;
+async function locateFile(fileId: string) {
+  const file = savedSqlStore.getFile(fileId);
   if (!file) return;
   if (searchInputPending.value || !treeRows.value.some((row) => row.type === "file" && row.file.id === file.id)) {
     searchInput.value?.clear();
@@ -564,6 +569,25 @@ async function locateCurrentFile() {
   const row = Array.from(libraryTree.value?.querySelectorAll<HTMLElement>("[data-sql-library-file]") ?? []).find((element) => element.dataset.sqlLibraryFile === file.id);
   row?.scrollIntoView({ block: "center", inline: "nearest" });
 }
+
+async function locateCurrentFile() {
+  const file = currentSavedSqlFile.value;
+  if (!file) return;
+  await locateFile(file.id);
+}
+
+watch(
+  [() => savedSqlStore.loadState, () => props.locateRequest],
+  async ([loadState, request]) => {
+    if (!request || loadState === "loading") return;
+    try {
+      await locateFile(request.fileId);
+    } finally {
+      emit("locate-handled", request.id);
+    }
+  },
+  { immediate: true, flush: "post" },
+);
 
 const hasCurrentSavedSqlExecutionTarget = computed(() => {
   const activeTab = queryStore.tabs.find((tab) => tab.id === queryStore.activeTabId);
@@ -1611,6 +1635,12 @@ function showDropAfter(targetId: string) {
 function showDropInside(targetId: string) {
   return dragState.active && dragState.targetId === targetId && dragState.dropPosition === "inside";
 }
+
+defineExpose({
+  locateFile,
+  locateCurrentFile,
+  searchInput,
+});
 </script>
 
 <template>

@@ -1026,7 +1026,18 @@ describe("normalizeMcpGlobalPolicy", () => {
       groupPolicies: [],
       configured: false,
       queryTimeoutSecs: null,
+      pluginToolsMode: "flat",
     });
+  });
+
+  it.each(["auto", "flat", "lazy"] as const)("preserves the saved %s plugin tool mode", (pluginToolsMode) => {
+    expect(normalizeMcpGlobalPolicy({ configured: true, pluginToolsMode }).pluginToolsMode).toBe(pluginToolsMode);
+  });
+
+  it("distinguishes a missing mode in legacy saved policies from a fresh configuration", () => {
+    expect(normalizeMcpGlobalPolicy({ configured: true }).pluginToolsMode).toBe("auto");
+    expect(normalizeMcpGlobalPolicy({ configured: false }).pluginToolsMode).toBe("flat");
+    expect(normalizeMcpGlobalPolicy(null).pluginToolsMode).toBe("flat");
   });
 
   it("normalizes and deduplicates an explicit connection allowlist", () => {
@@ -1048,6 +1059,7 @@ describe("normalizeMcpGlobalPolicy", () => {
       groupPolicies: [],
       configured: true,
       queryTimeoutSecs: null,
+      pluginToolsMode: "auto",
     });
   });
 
@@ -1056,6 +1068,9 @@ describe("normalizeMcpGlobalPolicy", () => {
   });
 
   it("enables high-risk SQL prompts only when explicitly configured", () => {
+    expect(normalizeMcpGlobalPolicy({ promptHighRiskSql: true, callConfirmation: "high_risk" })).toMatchObject({ promptHighRiskSql: false, callConfirmation: "high_risk" });
+    expect(normalizeMcpGlobalPolicy({ promptHighRiskSql: true, callConfirmation: "off" }).promptHighRiskSql).toBe(false);
+    expect(normalizeMcpGlobalPolicy({ promptHighRiskSql: false, callConfirmation: "full" }).promptHighRiskSql).toBe(true);
     expect(normalizeMcpGlobalPolicy({ promptHighRiskSql: true }).promptHighRiskSql).toBe(true);
     expect(normalizeMcpGlobalPolicy({ promptHighRiskSql: "true" } as any).promptHighRiskSql).toBe(false);
   });
@@ -1295,25 +1310,6 @@ describe("normalizeEditorSettings - sidebarPinDefaultDatabase", () => {
     expect(normalizeEditorSettings({ sidebarPinDefaultDatabase: undefined } as any).sidebarPinDefaultDatabase).toBe(true);
     expect(normalizeEditorSettings({ sidebarPinDefaultDatabase: null } as any).sidebarPinDefaultDatabase).toBe(true);
     expect(normalizeEditorSettings({ sidebarPinDefaultDatabase: 0 } as any).sidebarPinDefaultDatabase).toBe(true);
-  });
-});
-
-// #13302：连接后是否自动展开对象树的开关。默认必须为 false——模式多的库
-// 全量自动展开是反馈的卡顿来源，升级后的老用户也走新默认。
-describe("normalizeEditorSettings - sidebarExpandTreeOnConnect", () => {
-  it("defaults sidebarExpandTreeOnConnect to false", () => {
-    expect(normalizeEditorSettings({}).sidebarExpandTreeOnConnect).toBe(false);
-  });
-
-  it("preserves explicit boolean values", () => {
-    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: true }).sidebarExpandTreeOnConnect).toBe(true);
-    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: false }).sidebarExpandTreeOnConnect).toBe(false);
-  });
-
-  it("falls back to default for non-boolean values", () => {
-    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: "true" } as any).sidebarExpandTreeOnConnect).toBe(false);
-    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: undefined } as any).sidebarExpandTreeOnConnect).toBe(false);
-    expect(normalizeEditorSettings({ sidebarExpandTreeOnConnect: 1 } as any).sidebarExpandTreeOnConnect).toBe(false);
   });
 });
 
@@ -1683,6 +1679,7 @@ describe("settingsStore MCP policy persistence", () => {
       groupPolicies: [],
       configured: true,
       queryTimeoutSecs: null,
+      pluginToolsMode: "auto",
     };
     store.mcpGlobalPolicy = previous;
 
@@ -1701,6 +1698,7 @@ describe("settingsStore MCP policy persistence", () => {
       groupPolicies: [],
       configured: true,
       queryTimeoutSecs: null,
+      pluginToolsMode: "auto",
     });
 
     rejectSave(new Error("save failed"));

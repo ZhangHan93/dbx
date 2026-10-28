@@ -1879,6 +1879,14 @@ async fn export_table_data_core_inner(
     }
 
     if db_type == DatabaseType::DuckDb {
+        on_progress(TableExportProgress {
+            export_id: request.export_id.clone(),
+            table_name: request.table_name.clone(),
+            rows_exported: 0,
+            total_rows,
+            status: ExportStatus::PreparingSnapshot,
+            error_message: None,
+        });
         let snapshot = duckdb_snapshot.insert(DuckDbExportSnapshot::new(
             &request.connection_id,
             &request.database,

@@ -99,7 +99,7 @@ import type { ElasticsearchIndexMetadataKind } from "@/lib/backend/tauri";
 import { queryTimeoutSecsForConnection } from "@/lib/sql/queryTimeout";
 import { resolveDefaultDatabase } from "@/lib/database/defaultDatabase";
 import { connectionUsesVisibleSchemaFilter } from "@/lib/database/visibleDatabases";
-import { canTreeNodePin, canTreeNodeShowExpander } from "@/lib/sidebar/sidebarTreeItemLayout";
+import { canTreeNodeExpand, canTreeNodePin, canTreeNodeShowExpander } from "@/lib/sidebar/sidebarTreeItemLayout";
 import { sidebarConnectionVisibleFilterMenu } from "@/lib/sidebar/sidebarVisibleFilterMenu";
 import { supportsSidebarObjectNameFilter } from "@/lib/sidebar/sidebarObjectNameFilter";
 import { connectionGroupDestinationRows } from "@/lib/sidebar/sidebarLayout";
@@ -1149,6 +1149,9 @@ async function toggle(requestId = beginNavigationRequest()) {
       } else {
         await connectionStore.loadDatabases(node.connectionId, treeLoadSearchOptions);
       }
+      node.isExpanded = true;
+      const liveNode = findSidebarActionTarget(connectionStore.treeNodes, createSidebarActionTarget(node));
+      if (liveNode) liveNode.isExpanded = true;
     } else if (node.type === "redis-db" && node.connectionId && node.database) {
       await connectionStore.ensureConnected(node.connectionId);
       const alias = connectionStore.getRedisDatabaseAlias(node.connectionId, node.database);
@@ -8867,6 +8870,10 @@ function emitNodeToggled(node: TreeNode, wasExpanded: boolean, expandedOverride?
   const liveNode = findSidebarActionTarget(connectionStore.treeNodes, createSidebarActionTarget(node)) ?? node;
   activeNode.value = liveNode;
   const isExpanded = expandedOverride ?? !wasExpanded;
+  if (canTreeNodeExpand(node.type)) {
+    node.isExpanded = isExpanded;
+    liveNode.isExpanded = isExpanded;
+  }
   if (!isExpanded) {
     collapseSubtreeDescendants(node);
     if (liveNode !== node) {

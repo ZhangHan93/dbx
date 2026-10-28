@@ -14,7 +14,7 @@ import type { SqlSemanticBuildOptions, SqlSemanticSpan } from "@/lib/sql/semanti
 import { isEditorStatePlausibleFor, resolveLexicalLeafFromSyntaxTree, resolveSqlStatementWindow } from "@/lib/sql/sqlSyntaxTreeWindow";
 import { DEFAULT_SQL_SNIPPETS, MANTICORESEARCH_SQL_SNIPPETS, resolveSqlSnippetBodyForDatabase } from "@/lib/sql/sqlSnippetTemplates";
 import { BACKSLASH_ESCAPE_STRING_DIALECTS } from "@/lib/sql/sqlStatementRanges";
-import { requiresMysqlIdentifierQuote, requiresPostgresIdentifierQuote } from "@/lib/sql/sqlIdentifier";
+import { requiresClickhouseIdentifierQuote, requiresMysqlIdentifierQuote, requiresPostgresIdentifierQuote } from "@/lib/sql/sqlIdentifier";
 import { identifierMatchScore, matchesIdentifierSearch } from "@/lib/sql/identifierSearch";
 import { containsHan, orderedSubsequenceSpan, pinyinFirstLetters } from "@/lib/common/pinyin";
 import { quoteTableIdentifier, quoteTableIdentifierIfNeeded } from "@/lib/table/tableSelectSql";
@@ -1691,18 +1691,19 @@ export function shouldChainSqlCompletionAfterAccept(item: { type?: string; apply
 
 export type SqlKeywordCase = "preserve" | "upper" | "lower";
 
-type SqlCompletionApplyDialect = "mysql" | "postgres" | "sqlserver" | "oracle" | "upper";
+type SqlCompletionApplyDialect = "mysql" | "postgres" | "sqlserver" | "oracle" | "upper" | "clickhouse";
 
 // QueryEditor may use another dialect as a CodeMirror syntax fallback.
 // Completion apply text must still follow the connected database's identifier
 // folding and quoting rules.
-const MYSQL_LIKE_IDENTIFIER_DATABASES = new Set<DatabaseType>(["mysql", "clickhouse", "hive", "argo", "transwarp", "kyuubi", "impala", "spark", "databend", "tdengine", "access", "doris", "starrocks"]);
+const MYSQL_LIKE_IDENTIFIER_DATABASES = new Set<DatabaseType>(["mysql", "hive", "argo", "transwarp", "kyuubi", "impala", "spark", "databend", "tdengine", "access", "doris", "starrocks"]);
 const POSTGRES_LIKE_IDENTIFIER_DATABASES = new Set<DatabaseType>(["postgres", "redshift", "gaussdb", "kingbase", "highgo", "uxdb", "vastbase", "kwdb", "opengauss"]);
 export const ORACLE_COMPAT_IDENTIFIER_DATABASES = new Set<DatabaseType>(["oracle", "oceanbase-oracle", "yashandb", "oscar", "xugu"]);
 const UPPER_FOLDING_IDENTIFIER_DATABASES = new Set<DatabaseType>(["dameng", "db2", "snowflake"]);
 
 function sqlCompletionApplyDialect(databaseType: DatabaseType | undefined, fallback: "mysql" | "postgres" | "sqlserver" | undefined): SqlCompletionApplyDialect | undefined {
   if (!databaseType) return fallback;
+  if (databaseType === "clickhouse") return "clickhouse";
   if (MYSQL_LIKE_IDENTIFIER_DATABASES.has(databaseType)) return "mysql";
   if (POSTGRES_LIKE_IDENTIFIER_DATABASES.has(databaseType)) return "postgres";
   if (ORACLE_COMPAT_IDENTIFIER_DATABASES.has(databaseType)) return "oracle";
@@ -4734,6 +4735,10 @@ export function quoteSqlIdentifier(identifier: string, dialect?: SqlCompletionAp
     if (/^[A-Z][A-Z0-9_$#]*$/.test(identifier) && !POSTGRES_IDENTIFIER_KEYWORDS.has(identifier.toLowerCase())) return identifier;
     return `"${identifier.replaceAll('"', '""')}"`;
   }
+  if (dialect === "clickhouse") {
+    if (!requiresClickhouseIdentifierQuote(identifier, POSTGRES_IDENTIFIER_KEYWORDS)) return identifier;
+    return `\`${identifier.replaceAll("`", "``")}\``;
+  }
   if (dialect !== "postgres" || !requiresPostgresIdentifierQuote(identifier, POSTGRES_IDENTIFIER_KEYWORDS)) return identifier;
   return `"${identifier.replaceAll('"', '""')}"`;
 }
@@ -4751,6 +4756,10 @@ function quoteCompletionApplyIdentifier(identifier: string, dialect?: SqlComplet
     if (!requiresMysqlIdentifierQuote(identifier, POSTGRES_IDENTIFIER_KEYWORDS)) return identifier;
     return `\`${identifier.replaceAll("`", "``")}\``;
   }
+  if (dialect === "clickhouse") {
+    if (!requiresClickhouseIdentifierQuote(identifier, POSTGRES_IDENTIFIER_KEYWORDS)) return identifier;
+    return `\`${identifier.replaceAll("`", "``")}\``;
+  }
   if (dialect === "sqlserver") {
     if (SQLSERVER_REGULAR_IDENTIFIER.test(identifier) && !requiresMysqlIdentifierQuote(identifier.toLowerCase(), SQLSERVER_IDENTIFIER_KEYWORDS)) return identifier;
     const escaped = identifier.replaceAll("]", "]]");
@@ -4760,7 +4769,7 @@ function quoteCompletionApplyIdentifier(identifier: string, dialect?: SqlComplet
 }
 
 function quoteCompletionApplyName(applyName: string, dialect?: SqlCompletionApplyDialect): string {
-  if (dialect !== "mysql" && dialect !== "oracle" && dialect !== "sqlserver") return applyName;
+  if (dialect !== "mysql" && dialect !== "oracle" && dialect !== "sqlserver" && dialect !== "clickhouse") return applyName;
   const parts = splitQualifiedNameRawParts(applyName);
   if (parts.length === 0) return applyName;
   return parts.map((part) => ((dialect === "sqlserver" && !part) || isQuotedIdentifier(part) ? part : quoteCompletionApplyIdentifier(part, dialect))).join(".");
@@ -4780,6 +4789,9 @@ function quoteCompletionRoutineName(applyName: string, dialect?: SqlCompletionAp
 
 function quoteSelectStarColumnIdentifier(identifier: string, dialect?: SqlCompletionApplyDialect, databaseType?: DatabaseType): string {
   if (databaseType === "oracle" || databaseType === "oceanbase-oracle" || (databaseType === undefined && dialect === "oracle")) return quoteTableIdentifierIfNeeded("oracle", identifier);
+  if (databaseType === "clickhouse" || (databaseType === undefined && dialect === "clickhouse")) {
+    return quoteTableIdentifierIfNeeded("clickhouse", identifier);
+  }
   if (!requiresPostgresIdentifierQuote(identifier, POSTGRES_IDENTIFIER_KEYWORDS)) return identifier;
   if (databaseType) return quoteTableIdentifier(databaseType, identifier);
   if (dialect === "mysql") return `\`${identifier.replaceAll("`", "``")}\``;
@@ -4973,7 +4985,7 @@ function buildTableItems(
       const tableName = applySqlIdentifierCase(table.name, identifierCase, identifierDialect ?? dialect);
       const unqualifiedApplyName = quoteCasedIdentifier(table.name, tableName, dialect);
       const rawSuppliedApplyName = table.applyName?.trim();
-      const suppliedApplyName = dialect === "sqlserver" && rawSuppliedApplyName ? quoteCompletionApplyName(rawSuppliedApplyName, dialect) : rawSuppliedApplyName;
+      const suppliedApplyName = (dialect === "sqlserver" || dialect === "clickhouse") && rawSuppliedApplyName ? quoteCompletionApplyName(rawSuppliedApplyName, dialect) : rawSuppliedApplyName;
       const casedSuppliedApplyName = suppliedApplyName ? applySqlIdentifierCaseToName(suppliedApplyName, identifierCase, dialect, identifierDialect) : undefined;
       const suppliedApplyNameIsQualified = suppliedApplyName?.includes(".") === true;
       const applyName =

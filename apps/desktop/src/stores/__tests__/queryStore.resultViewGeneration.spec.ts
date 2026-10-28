@@ -56,6 +56,28 @@ describe("queryStore resultViewGeneration", { timeout: 30_000 }, () => {
     expect(tab.resultViewGeneration).not.toBe("gen-old");
   });
 
+  it("sorts bigint primary keys numerically using tableMeta type when result column_types is omitted (issue #13668)", async () => {
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const tabId = store.createTab("mysql-1", "app", "users", "data");
+    const tab = store.tabs.find((item) => item.id === tabId)!;
+    tab.tableMeta = {
+      tableName: "users",
+      columns: [{ name: "id", data_type: "bigint(20)", is_primary_key: true } as any],
+      primaryKeys: ["id"],
+    };
+    tab.result = {
+      columns: ["id"],
+      rows: [["92492"], ["9249"], ["100000"], ["92489"], ["1786326962000000000"]],
+      affected_rows: 0,
+      execution_time_ms: 1,
+    };
+
+    store.sortTabResultLocally(tabId, "id", 0, "desc");
+
+    expect(tab.result.rows.map((row) => row[0])).toEqual(["1786326962000000000", "100000", "92492", "92489", "9249"]);
+  });
+
   it("inherits the generation when a result is restored from disk", async () => {
     const cached = sampleResult(2);
     vi.doMock("@/lib/tabs/tabResultCache", async (importOriginal) => {

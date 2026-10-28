@@ -2497,7 +2497,15 @@ async fn sql_file_import_target(state: &AppState, connection_id: &str, database:
     } else {
         SqlCompatibilityMode::NotApplicable
     };
-    Some(SqlFileImportTarget { db_type: config.db_type, driver_profile: config.driver_profile, compatibility_mode })
+    Some(SqlFileImportTarget {
+        // Split with the connection's statement-splitting dialect, not its
+        // routing `db_type`: a JDBC SQL Server connection keeps control-flow
+        // batches whole (#13514), a JDBC Oracle connection keeps PL/SQL units
+        // whole. The rest of the import still routes on the raw `db_type`.
+        db_type: crate::query::statement_split_database_type(&config),
+        driver_profile: config.driver_profile,
+        compatibility_mode,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

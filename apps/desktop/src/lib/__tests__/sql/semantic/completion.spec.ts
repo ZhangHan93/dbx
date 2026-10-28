@@ -497,6 +497,7 @@ FROM (
   it.each([
     ["Oracle", "oracle", "mysql", 'ID, o."created at", o."SELECT", o."safe_name", o."OrderId", o."order_id"'],
     ["MySQL", "mysql", "mysql", "`ID`, o.`created at`, o.`SELECT`, o.safe_name, o.`OrderId`, o.order_id"],
+    ["ClickHouse", "clickhouse", "mysql", "ID, o.`created at`, o.`SELECT`, o.safe_name, o.OrderId, o.order_id"],
     ["PostgreSQL", "postgres", "postgres", '"ID", o."created at", o."SELECT", o.safe_name, o."OrderId", o.order_id'],
     ["SQL Server", "sqlserver", "sqlserver", "[ID], o.[created at], o.[SELECT], o.safe_name, o.[OrderId], o.order_id"],
     ["dialect fallback", undefined, "mysql", "`ID`, o.`created at`, o.`SELECT`, o.safe_name, o.`OrderId`, o.order_id"],
@@ -508,6 +509,38 @@ FROM (
 
     expect(starItems.find((item) => item.label === "* \u2192 columns")?.apply).toBe(expected);
     expect(selectAllItems.find((item) => item.label === "o.*")?.apply).toBe(expected);
+  });
+
+  it("quotes non-ASCII/Chinese and reserved columns with backticks while leaving bare English identifiers unquoted for ClickHouse", () => {
+    const columnsByTable = new Map<string, SqlCompletionColumn[]>([["orders", ["id", "order_id", "姓名", "时间", "prewhere", "final", "status"].map((name) => ({ name, table: "orders" }))]]);
+
+    const { items: columnItems } = semanticCompletion("SELECT o.| FROM orders o", { columnsByTable }, { databaseType: "clickhouse", dialect: "mysql" });
+    expect(columnItems.find((item) => item.label === "姓名")?.apply).toBe("`姓名`");
+    expect(columnItems.find((item) => item.label === "时间")?.apply).toBe("`时间`");
+    expect(columnItems.find((item) => item.label === "prewhere")?.apply).toBe("`prewhere`");
+    expect(columnItems.find((item) => item.label === "final")?.apply).toBe("`final`");
+    expect(columnItems.find((item) => item.label === "id")?.apply).toBe("id");
+    expect(columnItems.find((item) => item.label === "order_id")?.apply).toBe("order_id");
+    expect(columnItems.find((item) => item.label === "status")?.apply).toBe("status");
+
+    const star = columnItems.find((item) => item.label === "o.*");
+    expect(star?.apply).toBe("id, o.order_id, o.`姓名`, o.`时间`, o.`prewhere`, o.`final`, o.status");
+
+    const { items: tableItems } = semanticCompletion(
+      "SELECT * FROM |",
+      {
+        tables: [
+          { name: "用户表", type: "table" },
+          { name: "normal_table", type: "table" },
+          { name: "order", type: "table" },
+        ],
+      },
+      { databaseType: "clickhouse", dialect: "mysql" },
+    );
+
+    expect(tableItems.find((item) => item.label === "用户表")?.apply).toBe("`用户表`");
+    expect(tableItems.find((item) => item.label === "normal_table")?.apply).toBe("normal_table");
+    expect(tableItems.find((item) => item.label === "order")?.apply).toBe("`order`");
   });
 
   it("uses Oracle quoting for an unqualified multi-table star completion item", () => {

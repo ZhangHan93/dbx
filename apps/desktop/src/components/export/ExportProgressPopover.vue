@@ -49,7 +49,7 @@ const visibleTasks = computed(() => {
 
 const hasMore = computed(() => tasks.value.length > MAX_VISIBLE);
 
-const isActive = (status: string) => status === "Running" || status === "Writing" || status === "Cancelling";
+const isActive = (status: string) => status === "PreparingSnapshot" || status === "Running" || status === "Writing" || status === "Cancelling";
 const isFinished = (status: string) => status === "Done" || status === "Error" || status === "Cancelled";
 
 const finishedCount = computed(() => tasks.value.filter((t) => isFinished(t.status)).length);
@@ -212,6 +212,7 @@ const rowsText = (task: ExportTask) => {
 };
 
 const taskStatusText = (task: ExportTask) => {
+  if (task.status === "PreparingSnapshot") return t("exportProgress.preparingSnapshot");
   if (task.status === "Queued") return t("exportProgress.queued");
   if (task.status === "Unknown") return t("exportProgress.unknown");
   if (task.status === "Cancelling") return t("databaseBackup.cancelling");
@@ -272,6 +273,7 @@ const statusIcon = (task: ExportTask) => {
 
 const statusColor = (status: string) => {
   switch (status) {
+    case "PreparingSnapshot":
     case "Running":
     case "Writing":
     case "Cancelling":
@@ -385,7 +387,7 @@ function openTask(task: ExportTask): void {
             <div v-else-if="isActive(task.status)" class="w-full bg-muted rounded-full h-1.5 overflow-hidden">
               <div
                 v-if="
-                  task.totalRows ||
+                  (task.totalRows && task.status !== 'PreparingSnapshot') ||
                   (task.kind === 'database-export' && (task.totalObjects || task.overallPercent !== undefined)) ||
                   (task.kind === 'data-dictionary' && task.dictionaryPhase === 'collecting' && task.dictionaryProgressKnown && task.dictionaryTotal) ||
                   (task.kind === 'data-transfer' && task.totalTables) ||

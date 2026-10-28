@@ -95,6 +95,26 @@ describe("failure detail copy text", () => {
 });
 
 describe("data dictionary background task", () => {
+  it("keeps a snapshot export active and preserves cancellation across preparation updates", async () => {
+    const tracker = useExportTracker();
+    const task = tracker.addTask("settlements", "csv", "/tmp/settlements.csv", "snapshot-task");
+    const progress = { exportId: task.exportId, tableName: "settlements", rowsExported: 0, totalRows: 20000, status: "PreparingSnapshot" as const };
+    tracker.updateTableExportTask(task.exportId, progress);
+    const cancel = vi.fn();
+    tracker.registerTaskCancelHandler(task.exportId, cancel);
+    await mountPopover();
+    expect(tracker.activeCount.value).toBe(1);
+    expect(document.body.textContent).toContain("Preparing a consistent export snapshot");
+    expect(document.querySelector('button[title="Cancel"]')).toBeTruthy();
+    await tracker.cancelTask(task.exportId);
+    expect(cancel).toHaveBeenCalledOnce();
+    // A delayed preparation event must not turn a cancelling task back into running.
+    tracker.unregisterTaskCancelHandler(task.exportId);
+    task.status = "Cancelling";
+    tracker.updateTableExportTask(task.exportId, progress);
+    expect(task.status).toBe("Cancelling");
+  });
+
   it("shows actual collected-object progress and retains the finished output after the wizard closes", async () => {
     const tracker = useExportTracker();
     tracker.addDataDictionaryTask("dictionary-task", "shop", 2);

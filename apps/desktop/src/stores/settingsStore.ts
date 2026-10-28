@@ -107,7 +107,9 @@ export interface DesktopSettings {
 export interface McpGlobalPolicy {
   readOnly: boolean;
   allowDangerousSql: boolean;
+  /** Legacy temporary elevation; new confirmation never reuses this flag. */
   promptHighRiskSql: boolean;
+  callConfirmation?: "off" | "full" | "high_risk" | null;
   allowedConnectionIds: string[] | null;
   allowedGroupIds: string[];
   allowedToolNames: string[] | null;
@@ -116,6 +118,7 @@ export interface McpGlobalPolicy {
   configured: boolean;
   /** MCP query timeout override in seconds. null/undefined = inherit the connection; 0 = no limit. */
   queryTimeoutSecs: number | null;
+  pluginToolsMode: "auto" | "flat" | "lazy";
 }
 
 export interface McpGroupPolicy {
@@ -198,6 +201,7 @@ export const DEFAULT_MCP_GLOBAL_POLICY: McpGlobalPolicy = {
   groupPolicies: [],
   configured: false,
   queryTimeoutSecs: null,
+  pluginToolsMode: "flat",
 };
 
 export function normalizeMcpGlobalPolicy(policy: Partial<McpGlobalPolicy> | null | undefined): McpGlobalPolicy {
@@ -262,7 +266,8 @@ export function normalizeMcpGlobalPolicy(policy: Partial<McpGlobalPolicy> | null
   return {
     readOnly: policy?.readOnly === true,
     allowDangerousSql: policy?.allowDangerousSql === true,
-    promptHighRiskSql: policy?.promptHighRiskSql === true,
+    promptHighRiskSql: policy?.callConfirmation === "full" || (!policy?.callConfirmation && policy?.promptHighRiskSql === true),
+    ...(policy?.callConfirmation === "high_risk" ? { callConfirmation: "high_risk" as const } : {}),
     allowedConnectionIds,
     allowedGroupIds,
     allowedToolNames,
@@ -270,6 +275,9 @@ export function normalizeMcpGlobalPolicy(policy: Partial<McpGlobalPolicy> | null
     groupPolicies,
     configured: policy?.configured === true,
     queryTimeoutSecs,
+    // A saved policy without this field used automatic discovery before the
+    // default changed. Preserve it; only new configurations start in flat mode.
+    pluginToolsMode: policy?.pluginToolsMode === "auto" || policy?.pluginToolsMode === "flat" || policy?.pluginToolsMode === "lazy" ? policy.pluginToolsMode : policy?.configured ? "auto" : "flat",
   };
 }
 
@@ -1185,8 +1193,6 @@ export interface EditorSettings {
   autoSelectActiveSidebarNode: boolean;
   sidebarPinDefaultDatabase: boolean;
   sidebarBrowseObjectsOnDatabaseActivation: boolean;
-  /** 连接成功后是否自动展开侧边栏对象树（连接节点/默认数据库节点）。默认关闭：模式多的库全量展开时元数据请求和渲染开销都大（#13302）。 */
-  sidebarExpandTreeOnConnect: boolean;
   openQueryOnConnectionOpen: boolean;
   sidebarBrowseObjectsOnDatabaseActivationMigrationVersion: number;
   openTabsRestoreMode: OpenTabsRestoreMode;
@@ -1552,7 +1558,6 @@ export const DEFAULT_EDITOR_SETTINGS: EditorSettings = {
   autoSelectActiveSidebarNode: false,
   sidebarPinDefaultDatabase: true,
   sidebarBrowseObjectsOnDatabaseActivation: false,
-  sidebarExpandTreeOnConnect: false,
   openQueryOnConnectionOpen: false,
   sidebarBrowseObjectsOnDatabaseActivationMigrationVersion: SIDEBAR_BROWSE_OBJECTS_MIGRATION_VERSION,
   openTabsRestoreMode: "all",
@@ -2257,7 +2262,6 @@ export function normalizeEditorSettings(settings: Partial<EditorSettings>, exist
     sidebarSearchOpenedDatabasesOnly: typeof settings.sidebarSearchOpenedDatabasesOnly === "boolean" ? settings.sidebarSearchOpenedDatabasesOnly : DEFAULT_EDITOR_SETTINGS.sidebarSearchOpenedDatabasesOnly,
     autoSelectActiveSidebarNode: settings.autoSelectActiveSidebarNode ?? DEFAULT_EDITOR_SETTINGS.autoSelectActiveSidebarNode,
     sidebarPinDefaultDatabase: typeof settings.sidebarPinDefaultDatabase === "boolean" ? settings.sidebarPinDefaultDatabase : DEFAULT_EDITOR_SETTINGS.sidebarPinDefaultDatabase,
-    sidebarExpandTreeOnConnect: typeof settings.sidebarExpandTreeOnConnect === "boolean" ? settings.sidebarExpandTreeOnConnect : DEFAULT_EDITOR_SETTINGS.sidebarExpandTreeOnConnect,
     openQueryOnConnectionOpen: typeof settings.openQueryOnConnectionOpen === "boolean" ? settings.openQueryOnConnectionOpen : DEFAULT_EDITOR_SETTINGS.openQueryOnConnectionOpen,
     sidebarBrowseObjectsOnDatabaseActivation:
       typeof settings.sidebarBrowseObjectsOnDatabaseActivation === "boolean"
@@ -2691,12 +2695,14 @@ export const useSettingsStore = defineStore("settings", () => {
         readOnly: next.readOnly,
         allowDangerousSql: next.allowDangerousSql,
         promptHighRiskSql: next.promptHighRiskSql,
+        ...(next.callConfirmation ? { callConfirmation: next.callConfirmation } : {}),
         allowedConnectionIds: next.allowedConnectionIds,
         allowedGroupIds: next.allowedGroupIds,
         allowedToolNames: next.allowedToolNames,
         connectionPolicies: next.connectionPolicies,
         groupPolicies: next.groupPolicies,
         queryTimeoutSecs: next.queryTimeoutSecs,
+        pluginToolsMode: next.pluginToolsMode,
       });
     } catch (error) {
       mcpGlobalPolicy.value = previous;

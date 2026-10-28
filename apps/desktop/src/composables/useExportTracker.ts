@@ -8,7 +8,7 @@ import { releaseManualExport, submitManualExport, type ManualExportMode } from "
 import { acceptOraclePackageTransferApproval, acceptOraclePackageTransferPreflight, acceptOracleRoutineDeploymentOperation, type OracleRoutineDeployment } from "@/lib/schema/oracleRoutineDeploy";
 
 export type BackgroundTaskKind = "table-export" | "database-export" | "data-dictionary" | "sql-file" | "data-transfer" | "data-generation" | "multi-db-execution" | "schema-diff" | "data-compare";
-export type BackgroundTaskStatus = "Queued" | "Unknown" | "Running" | "Writing" | "Cancelling" | "Done" | "Error" | "Cancelled";
+export type BackgroundTaskStatus = "Queued" | "Unknown" | "PreparingSnapshot" | "Running" | "Writing" | "Cancelling" | "Done" | "Error" | "Cancelled";
 export type DatabaseExportSource = "manual" | "scheduled";
 
 export interface DataTransferFailure {
@@ -372,7 +372,7 @@ function recordSqlFileFailure(task: ExportTask, progress: api.SqlFileProgress, c
 }
 
 function normalizeExportStatus(status: string): BackgroundTaskStatus {
-  if (status === "Writing" || status === "Done" || status === "Error" || status === "Cancelled") return status;
+  if (status === "PreparingSnapshot" || status === "Writing" || status === "Done" || status === "Error" || status === "Cancelled") return status;
   return "Running";
 }
 
@@ -431,7 +431,7 @@ function findActiveOverlappingTransfer(request: api.TransferRequest): string[] {
   for (const task of taskMap.values()) {
     if (task.exportId === request.transferId) continue;
     if (task.kind !== "data-transfer") continue;
-    if (task.status !== "Running" && task.status !== "Writing") continue;
+    if (task.status !== "PreparingSnapshot" && task.status !== "Running" && task.status !== "Writing") continue;
     if (task.targetConnectionId !== request.targetConnectionId) continue;
     if ((task.targetCatalog ?? "") !== (request.targetCatalog ?? "")) continue;
     if (task.targetDatabase !== request.targetDatabase) continue;
@@ -446,7 +446,7 @@ function findActiveOverlappingTransfer(request: api.TransferRequest): string[] {
 export function useExportTracker() {
   const tasks = computed(() => Array.from(taskMap.values()));
 
-  const activeCount = computed(() => tasks.value.filter((t) => t.status === "Queued" || t.status === "Unknown" || t.status === "Running" || t.status === "Writing" || t.status === "Cancelling").length);
+  const activeCount = computed(() => tasks.value.filter((t) => t.status === "Queued" || t.status === "Unknown" || t.status === "PreparingSnapshot" || t.status === "Running" || t.status === "Writing" || t.status === "Cancelling").length);
 
   const hasActive = computed(() => activeCount.value > 0);
 
@@ -787,7 +787,7 @@ export function useExportTracker() {
     task.rowsExported = progress.rowsExported;
     task.totalRows = progress.totalRows;
     const nextStatus = normalizeExportStatus(progress.status);
-    task.status = task.status === "Cancelling" && (nextStatus === "Running" || nextStatus === "Writing") ? "Cancelling" : nextStatus;
+    task.status = task.status === "Cancelling" && (nextStatus === "PreparingSnapshot" || nextStatus === "Running" || nextStatus === "Writing") ? "Cancelling" : nextStatus;
     task.errorMessage = progress.errorMessage || null;
     if (task.status === "Done" || task.status === "Error" || task.status === "Cancelled") finishExportTask(task);
   }

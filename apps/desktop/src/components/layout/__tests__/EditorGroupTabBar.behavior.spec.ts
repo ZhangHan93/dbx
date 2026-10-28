@@ -126,7 +126,8 @@ function mountBar(
             fullTabTitle: "Full title",
             compactTabTitle: "Compact title",
           },
-          sidebar: { locateActiveTab: "Locate" },
+          sidebar: { locateActiveTab: "Locate", locateSqlFile: "Locate in SQL file list" },
+          sqlFileTree: { locateActiveFile: "Locate current file" },
         },
       },
     }),
@@ -827,6 +828,37 @@ describe("EditorGroupTabBar behavior", () => {
     tabPill(host, secondId).querySelector<HTMLButtonElement>("button[aria-label='Close']")!.click();
     await settle();
     expect(store.tabs.some((tab) => tab.id === secondId)).toBe(false);
+
+    app.unmount();
+    host.remove();
+  });
+
+  it("shows locate current file menu item for saved sql tab and emits locate-sql-library-file", async () => {
+    const store = useQueryStore();
+    const queryTabId = store.createTab("pg-1", "app", "Query 1", "query");
+    const savedSqlTabId = store.createTab("pg-1", "app", "Saved Query", "query");
+    store.tabs.find((tab) => tab.id === savedSqlTabId)!.savedSqlId = "saved-sql-1";
+    const mainGroup = store.groups[0];
+
+    const onLocateSqlLibraryFile = vi.fn();
+    const { app, host } = mountBar(mainGroup.id, [queryTabId, savedSqlTabId], queryTabId, pinia, undefined, undefined, undefined, undefined, { "onLocate-sql-library-file": onLocateSqlLibraryFile });
+    await settle();
+
+    const rawMenuFor = (tabId: string) => {
+      const pill = tabPill(host, tabId);
+      const stub = pill.closest<HTMLElement>(".ctx-menu-stub") as any;
+      return (stub?.__ctxMenuItems ?? []) as Array<{ label: string; action?: () => void; visible?: boolean }>;
+    };
+
+    const regularLocateItem = rawMenuFor(queryTabId).find((item) => item.label === "Locate current file");
+    expect(regularLocateItem?.visible).toBe(false);
+
+    const savedSqlLocateItem = rawMenuFor(savedSqlTabId).find((item) => item.label === "Locate current file");
+    expect(savedSqlLocateItem?.visible).toBe(true);
+
+    savedSqlLocateItem?.action?.();
+    expect(onLocateSqlLibraryFile).toHaveBeenCalledTimes(1);
+    expect(onLocateSqlLibraryFile).toHaveBeenCalledWith(expect.objectContaining({ id: savedSqlTabId, savedSqlId: "saved-sql-1" }));
 
     app.unmount();
     host.remove();

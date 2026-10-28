@@ -886,9 +886,14 @@ async fn connection_statement_split_database_type(state: &AppState, connection_i
 /// A generic JDBC connection to Oracle runs PL/SQL through the JDBC plugin, so its
 /// script is split with the Oracle rules. The plain `Jdbc` profile would cut every
 /// routine body at its first inner semicolon and replace the object with the fragment.
-fn statement_split_database_type(config: &ConnectionConfig) -> DatabaseType {
+/// A JDBC connection to SQL Server runs T-SQL through the JDBC plugin, so its script
+/// keeps top-level control-flow batches whole (#13514). Both mappings only change
+/// statement-splitting semantics; the connection's `db_type` still routes the query.
+pub fn statement_split_database_type(config: &ConnectionConfig) -> DatabaseType {
     if crate::schema::is_oracle_external_driver_config(config) {
         DatabaseType::Oracle
+    } else if crate::schema::is_sqlserver_external_driver_config(config) {
+        DatabaseType::SqlServer
     } else {
         config.db_type
     }
@@ -1798,21 +1803,34 @@ async fn do_execute_typed(
         #[cfg(feature = "duckdb-sidecar")]
         PoolKind::DuckDbWorker(client) => {
             let client = client.clone();
+            let operation_cancel = cancel_token.unwrap_or_default();
             if let Some(ref execution_id) = options.execution_id {
-                let cancel_client = client.clone();
+                let operation_cancel = operation_cancel.clone();
                 state.running_queries.register_interrupt(execution_id, move || {
-                    let cancel_client = cancel_client.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = cancel_client.cancel().await {
-                            log::warn!("Failed to cancel DuckDB worker query: {error}");
-                        }
-                    });
+                    operation_cancel.cancel();
                 });
             }
+            let cancel_token = Some(operation_cancel);
             let sql = sql.to_string();
             let database = database.map(str::to_string);
             let max_rows = options.max_rows;
-            match client.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await {
+            let result = if let Some(page_size) = options.page_size.filter(|_| !is_write_sql(&sql)) {
+                client
+                    .execute_query_page(
+                        database,
+                        sql,
+                        max_rows,
+                        page_size,
+                        options.result_session_id.as_deref(),
+                        cancel_token,
+                        query_timeout,
+                    )
+                    .await
+                    .map_err(db::duckdb_worker_protocol::DuckDbWorkerError::from)
+            } else {
+                client.execute_typed(database, sql, max_rows, cancel_token, query_timeout).await
+            };
+            match result {
                 Ok(result) => Ok(result),
                 Err(error) => {
                     let is_control_error = error.message == QUERY_CANCELED
@@ -3643,6 +3661,8 @@ pub async fn close_query_session(
     let pool_handle = state.pool_handle(&pool_key).await;
     let pool = pool_handle.as_ref().ok_or("Connection not found")?;
     match pool {
+        #[cfg(feature = "duckdb-sidecar")]
+        PoolKind::DuckDbWorker(client) => client.close_query_session(session_id).await,
         PoolKind::Agent(client) => {
             let client = client.clone();
             let mut client = client.lock().await;
@@ -3704,6 +3724,21 @@ pub async fn close_manual_transaction_query_session(
         TxnConnection::Agent { client, .. } => client.lock().await.close_query_session(session_id).await,
         _ => Ok(false),
     }
+}
+
+/// Whether an open manual transaction can page a query through an Agent
+/// result-session cursor. Only Agent transaction connections host cursors;
+/// native (PostgreSQL/MySQL/SQL Server) and external-driver transactions page
+/// with SQL only.
+pub async fn manual_transaction_supports_agent_cursor(state: &AppState, txn_session_id: &str) -> bool {
+    let sessions = state.transaction_sessions.read().await;
+    let Some(session) = sessions.get(txn_session_id) else {
+        return false;
+    };
+    let Ok(connection) = session.connection.try_lock() else {
+        return false;
+    };
+    matches!(&*connection, TxnConnection::Agent { .. })
 }
 
 pub async fn execute_multi_core(
@@ -6769,6 +6804,10 @@ pub async fn execute_in_manual_transaction_with_options(
 
     let db_type = connection_database_type(state, &connection_id).await;
     let compatibility_mode = connection_sql_compatibility_mode(state, &pool_key, db_type).await;
+    // Split with the connection's statement-splitting dialect, not its routing
+    // `db_type`: a JDBC SQL Server connection keeps control-flow batches whole
+    // (#13514) while still executing through the generic external-driver path.
+    let split_db_type = connection_statement_split_database_type(state, &connection_id).await;
     let statements = if let Some(bound) = options.bound_statements.as_ref() {
         if db_type != Some(DatabaseType::OceanbaseOracle) {
             return Err("Bound BLOB saves are only supported for OceanBase Oracle.".into());
@@ -6780,12 +6819,12 @@ pub async fn execute_in_manual_transaction_with_options(
         dbx_types::types::validate_blob_bound_statements(&previews, bound)?;
         previews
     } else {
-        db_type.map_or_else(
+        split_db_type.map_or_else(
             || split_sql_statements(sql),
-            |db_type| {
+            |split_db_type| {
                 crate::sql::split_sql_statements_for_database_with_compatibility(
                     sql,
-                    db_type,
+                    split_db_type,
                     compatibility_mode.as_deref(),
                 )
             },
@@ -10860,6 +10899,46 @@ for line in sys.stdin:
         assert_eq!(statement_split_database_type(&other), DatabaseType::Jdbc);
     }
 
+    // #13514: a generic JDBC connection to SQL Server splits with the SQL Server
+    // rules, so the reported TRY/CATCH script keeps its batch whole while the
+    // leading `SET` stays its own statement. Other JDBC configs stay on the
+    // plain `Jdbc` profile.
+    #[test]
+    fn jdbc_sqlserver_execution_plan_keeps_control_flow_batches_whole() {
+        let mut sqlserver = test_connection_config(DatabaseType::Jdbc);
+        sqlserver.connection_string = Some("jdbc:sqlserver://127.0.0.1:1433;databaseName=demo".to_string());
+        assert_eq!(statement_split_database_type(&sqlserver), DatabaseType::SqlServer);
+
+        let sql = "SET XACT_ABORT ON;\n\
+                   BEGIN TRY\n\
+                   BEGIN TRANSACTION;\n\
+                   UPDATE dbo.Documents SET Deleted = 0 WHERE Deleted = 1;\n\
+                   COMMIT TRANSACTION;\n\
+                   END TRY\n\
+                   BEGIN CATCH\n\
+                   IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;\n\
+                   THROW;\n\
+                   END CATCH;";
+        let block = &sql[sql.find("BEGIN TRY").unwrap()..];
+
+        let plan = query_execution_plan(sql, Some(statement_split_database_type(&sqlserver)), false);
+        assert_eq!(plan.statements, vec!["SET XACT_ABORT ON".to_string(), block.to_string()]);
+
+        let mut other = test_connection_config(DatabaseType::Jdbc);
+        other.connection_string = Some("jdbc:h2:mem:test".to_string());
+        let plan = query_execution_plan("SELECT 1; SELECT 2;", Some(statement_split_database_type(&other)), false);
+        assert_eq!(plan.statements, vec!["SELECT 1", "SELECT 2"]);
+
+        let mut postgres = test_connection_config(DatabaseType::Jdbc);
+        postgres.connection_string = Some("jdbc:postgresql://127.0.0.1:5432/demo".to_string());
+        assert_eq!(statement_split_database_type(&postgres), DatabaseType::Jdbc);
+
+        let mut jtds = test_connection_config(DatabaseType::Jdbc);
+        jtds.connection_string = Some("jdbc:jtds:sqlserver://127.0.0.1:1433/demo".to_string());
+        jtds.jdbc_driver_class = Some("net.sourceforge.jtds.jdbc.Driver".to_string());
+        assert_eq!(statement_split_database_type(&jtds), DatabaseType::SqlServer);
+    }
+
     #[test]
     fn ordinary_agent_execution_plan_still_splits_semicolon_statements() {
         let plan = query_execution_plan("SELECT 1; SELECT 2;", Some(DatabaseType::Dameng), false);
@@ -12756,6 +12835,40 @@ for line in sys.stdin:
         cursor_ids.discard(cursor_id)
         print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": closed}}), flush=True)
         continue
+    if method == "execute_query_page":
+        # First cursor page: two rows and an open result session on this
+        # transaction connection.
+        params = request.get("params", {{}})
+        page_size = int(params.get("pageSize") or 1)
+        rows = [["page-row-" + str(index)] for index in range(1, min(page_size, 2) + 1)]
+        result = {{
+            "columns": ["val"],
+            "column_types": [],
+            "column_sortables": [],
+            "rows": rows,
+            "affected_rows": 0,
+            "execution_time_ms": 1,
+            "truncated": False,
+            "session_id": "cursor-1",
+            "has_more": True
+        }}
+        print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
+        continue
+    if method == "fetch_query_page":
+        # Continuation page of the same cursor: one last row.
+        result = {{
+            "columns": ["val"],
+            "column_types": [],
+            "column_sortables": [],
+            "rows": [["page-row-3"]],
+            "affected_rows": 0,
+            "execution_time_ms": 1,
+            "truncated": False,
+            "session_id": "cursor-1",
+            "has_more": False
+        }}
+        print(json.dumps({{"jsonrpc": "2.0", "id": request["id"], "result": result}}), flush=True)
+        continue
     if method == "execute_query":
         params = request.get("params", {{}})
         sql = params.get("sql", "")
@@ -12858,6 +12971,115 @@ for line in sys.stdin:
         assert!(state.transaction_sessions.read().await.contains_key(&txn_id));
         rollback_manual_transaction(&state, &txn_id).await.unwrap();
         assert!(!close_manual_transaction_query_session(&state, "agent-conn", &txn_id, "cursor-1").await.unwrap());
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn manual_transaction_agent_cursor_support_is_agent_only() {
+        let (state, txn_id, dir) = manual_transaction_test_state(DatabaseType::Oracle).await;
+        // The fake Oracle transaction holds an Agent connection, so exports may
+        // page it through an Agent result session.
+        assert!(manual_transaction_supports_agent_cursor(&state, &txn_id).await);
+        assert!(!manual_transaction_supports_agent_cursor(&state, "missing-txn").await);
+
+        // A native transaction connection only pages with SQL.
+        let mysql_state = AppState::new(crate::persistence::test_storage::open(&dir.join("mysql.db")).await.unwrap());
+        let mysql_txn_id = uuid::Uuid::new_v4().to_string();
+        mysql_state.transaction_sessions.write().await.insert(
+            mysql_txn_id.clone(),
+            TransactionSession {
+                sqlserver: None,
+                connection: Arc::new(tokio::sync::Mutex::new(TxnConnection::Mysql(None))),
+                pool_key: "mysql-conn".to_string(),
+                last_activity: std::time::Instant::now(),
+                idle_timeout: std::time::Duration::from_secs(60),
+                busy: false,
+                snapshot_rotation_safe: false,
+                connection_id: "mysql-conn".to_string(),
+                database: String::new(),
+                schema: None,
+            },
+        );
+        assert!(!manual_transaction_supports_agent_cursor(&mysql_state, &mysql_txn_id).await);
+
+        rollback_manual_transaction(&state, &txn_id).await.unwrap();
+        drop(mysql_state);
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Builds a query-result export request for the fake Agent transaction above.
+    fn manual_transaction_export_request(
+        txn_id: &str,
+        file_path: &std::path::Path,
+        sql: &str,
+        page_size: usize,
+    ) -> crate::data::query_result_export::QueryResultExportRequest {
+        serde_json::from_value(serde_json::json!({
+            "exportId": "export-1",
+            "connectionId": "agent-conn",
+            "database": "ORCL",
+            "schema": "APP",
+            "sql": sql,
+            "queryBaseSql": sql,
+            "databaseType": "oracle",
+            "useAgentCursor": true,
+            "filePath": file_path.to_string_lossy(),
+            "format": "csv",
+            "pageSize": page_size,
+            "txnSessionId": txn_id,
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oracle_query_result_export_pages_through_the_manual_transaction_cursor() {
+        let (state, txn_id, dir) = manual_transaction_test_state(DatabaseType::Oracle).await;
+        let csv_path = dir.join("cursor-export.csv");
+        // Wildcard projection: no safe ROWNUM wrapper, so the export needs the
+        // Agent result session to reach the second page — inside the transaction.
+        let request = manual_transaction_export_request(&txn_id, &csv_path, "SELECT * FROM APP.EVENTS", 2);
+        let progress = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let progress_sink = progress.clone();
+        crate::data::query_result_export::export_query_result_core(&state, &request, None, move |update| {
+            progress_sink.lock().unwrap().push(update);
+        })
+        .await
+        .expect("manual-transaction export pages through the transaction cursor");
+
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        for row in ["page-row-1", "page-row-2", "page-row-3"] {
+            assert!(csv.contains(row), "missing {row} in {csv}");
+        }
+        let terminal = progress.lock().unwrap().last().cloned().unwrap();
+        assert!(matches!(terminal.status, crate::database_export::ExportStatus::Done));
+        assert_eq!(terminal.rows_exported, 3);
+
+        rollback_manual_transaction(&state, &txn_id).await.unwrap();
+        drop(state);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn oracle_rownum_bounded_export_runs_once_inside_the_manual_transaction() {
+        let (state, txn_id, dir) = manual_transaction_test_state(DatabaseType::Oracle).await;
+        let csv_path = dir.join("bounded-export.csv");
+        let sql = "SELECT FJFY, JCBW FROM T_YL_JCZD01 WHERE ROWNUM < 2000;";
+        let request = manual_transaction_export_request(&txn_id, &csv_path, sql, 2000);
+        crate::data::query_result_export::export_query_result_core(&state, &request, None, |_| {})
+            .await
+            .expect("ROWNUM-bounded export runs as one bounded transaction execution");
+
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+        // The fake transaction connection answers the statement itself (no
+        // cursor page fetch), proving the single-execution path was taken. The
+        // transaction executor strips the trailing semicolon, hence the prefix
+        // assertion rather than a byte-for-byte match.
+        assert!(csv.contains("FJFY") && csv.contains("ROWNUM < 2000"), "unexpected export content: {csv}");
+        assert!(!csv.contains("page-row"), "bounded export must not open a cursor: {csv}");
+
+        rollback_manual_transaction(&state, &txn_id).await.unwrap();
         drop(state);
         let _ = std::fs::remove_dir_all(dir);
     }

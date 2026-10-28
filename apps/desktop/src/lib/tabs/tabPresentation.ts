@@ -273,6 +273,10 @@ export function tabDisplayTitle(tab: QueryTab, t: Translate): string {
   const compact = settingsStore.editorSettings.compactTabTitle;
   if (isPreviewTab(tab)) return tab.title;
   if (useConnectionStore().getConfig(tab.connectionId)?.db_type === "redis") {
+    // Redis query tabs normally identify their logical database (db0/db1), but a
+    // saved SQL file or external SQL file is a document: show its file title
+    // instead, otherwise every Redis file tab looks like the same database.
+    if (!tab.isDefaultQuery && (tab.savedSqlId || tab.externalSqlPath) && tab.title.trim()) return tab.title;
     return tab.database ? database : connectionDisplayName(tab.connectionId);
   }
   if (tab.mode === "data" && tab.tableMeta?.tableName) {

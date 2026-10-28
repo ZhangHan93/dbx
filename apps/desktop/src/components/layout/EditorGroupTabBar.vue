@@ -145,6 +145,7 @@ const emit = defineEmits<{
   "activate-tab": [tabId: string];
   "locate-tab": [tab: QueryTab];
   "locate-sql-file": [tab: QueryTab];
+  "locate-sql-library-file": [tab: QueryTab];
   "toggle-zen-mode": [];
   "start-resize": [event: PointerEvent];
   "toggle-collapse": [];
@@ -1704,6 +1705,12 @@ function getTabMenuItems(tab: QueryTab): ContextMenuItem[] {
       icon: Crosshair,
       visible: !!queryTabExternalFilePath(tab),
       action: () => emit("locate-sql-file", tab),
+    },
+    {
+      label: t("sqlFileTree.locateActiveFile"),
+      icon: Crosshair,
+      visible: !!tab.savedSqlId,
+      action: () => emit("locate-sql-library-file", tab),
     },
     { label: "", separator: true },
     createPinTabMenuItem({
