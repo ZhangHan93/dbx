@@ -158,8 +158,10 @@ export interface ConnectionConfig {
   visible_database_patterns?: string[];
   visible_schemas?: Record<string, string[]>;
   show_system_schemas?: boolean;
-  /** Whether to show Oracle / OceanBase-Oracle database links node in the sidebar tree. Defaults to true. */
+  /** Connection-level sidebar display preferences. Absent means shown. */
   show_database_links?: boolean;
+  show_native_jobs?: boolean;
+  show_user_admin?: boolean;
   /** Load every page when the sidebar's Tables group is opened for this connection. */
   sidebar_auto_load_all_tables?: boolean;
   attached_databases?: AttachedDatabaseConfig[];
@@ -1880,7 +1882,10 @@ export interface QueryResult {
     /** With value_ref, zero can mean an unknown byte size, not an empty value. */
     original_bytes: number;
     value_ref?: string;
+    pending_decode?: boolean;
   }>;
+  /** Authoritative original keys for internal reads; never derive these from interpreted display text. */
+  raw_key_cells?: Array<{ row_index: number; column_index: number; value: string | number | boolean | null }>;
   /** Frontend-only original result connection, independent of the currently active tab. */
   large_value_context?: { connectionId: string; database: string; clientSessionId?: string; txnSessionId?: string; catalog?: string };
   /** Retained result refs also cover cells already hydrated into complete local values. */
@@ -2033,6 +2038,7 @@ export interface QueryResultRun {
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
   resultLocalSortOriginalLargeValueCells?: QueryResult["large_value_cells"];
+  resultLocalSortOriginalRawKeyCells?: QueryResult["raw_key_cells"];
   resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   resultLocalSortOriginalMongoCopyDocuments?: QueryResult["mongo_copy_documents"];
   orderByInput?: string;
@@ -2431,6 +2437,7 @@ export interface TableStructureEditorDraft {
   starrocksLayoutDraft?: import("@/lib/table/starrocksAlterOptions").StarRocksLayoutDraft;
   starrocksSortColumns?: string[];
   starrocksPhysicalOptions?: import("@/lib/table/starrocksPhysicalOptions").StarRocksPhysicalOptionsDraft;
+  postgresForeignTable?: import("@/lib/table/postgresForeignTable").PostgresForeignTableDraft;
   tableOwner?: string;
   originalTableOwner?: string;
   columns: import("@/lib/table/tableStructureEditorSql").EditableStructureColumn[];
@@ -2637,6 +2644,7 @@ export interface QueryTab {
   resultSortMode?: "database" | "local";
   resultLocalSortOriginalRows?: QueryResult["rows"];
   resultLocalSortOriginalLargeValueCells?: QueryResult["large_value_cells"];
+  resultLocalSortOriginalRawKeyCells?: QueryResult["raw_key_cells"];
   resultLocalSortOriginalMongoDocuments?: QueryResult["mongo_documents"];
   resultLocalSortOriginalMongoCopyDocuments?: QueryResult["mongo_copy_documents"];
   orderByInput?: string;

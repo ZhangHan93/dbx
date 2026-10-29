@@ -254,10 +254,22 @@ jobs:
       - name: Install system dependencies (Linux)
         if: startsWith(matrix.platform, 'ubuntu')
         run: |
-          sudo apt-get update
           # Bundle GTK input-method modules from the same Jammy ABI baseline
           # instead of loading potentially incompatible modules from the host.
-          sudo apt-get install -y fcitx5-frontend-gtk3 ibus-gtk3 libwebkit2gtk-4.1-dev libgtk-3-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev xdg-utils
+          sudo python3 .github/scripts/ci-install-system-deps.py --group release
+          # The ARM hosted runner has 16 GB RAM and no swap; the serialized
+          # release build plus the final lld link of the dbx binary still
+          # exhausts memory and the runner loses communication with the
+          # server. Back it with a swapfile so the link peak pages to disk
+          # instead of starving the runner agent.
+          if [ "${{ matrix.platform }}" = "ubuntu-22.04-arm" ]; then
+            df -h /
+            sudo fallocate -l 14G /mnt/swapfile || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=14336
+            sudo chmod 600 /mnt/swapfile
+            sudo mkswap /mnt/swapfile
+            sudo swapon /mnt/swapfile
+            free -h
+          fi
 
       - name: Prepare Wayland-capable AppImage bundler
         if: startsWith(matrix.platform, 'ubuntu')
@@ -285,8 +297,10 @@ jobs:
           # Standard ARM runners have 16 GB RAM; parallel rustc of the heavy
           # workspace crates (dbx-core, dbx-mcp) plus linking peaks past what
           # the pool now tolerates and the runner is killed with a shutdown
-          # signal. Fewer parallel codegen units keep peak memory in bounds.
-          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'ubuntu-22.04-arm' && '2') || '' }}
+          # signal. Serialize codegen on the ARM leg and link with lld, which
+          # holds far less memory than the default bfd linker.
+          CARGO_BUILD_JOBS: ${{ (matrix.platform == 'ubuntu-22.04-arm' && '1') || 'default' }}
+          RUSTFLAGS: ${{ (matrix.platform == 'ubuntu-22.04-arm' && '-C link-arg=-fuse-ld=lld') || '' }}
           APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_SIGNING_IDENTITY || '' }}
           APPLE_ID: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_ID || '' }}
           APPLE_PASSWORD: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_PASSWORD || '' }}
@@ -1015,7 +1029,7 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "21"
