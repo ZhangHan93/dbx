@@ -54,6 +54,12 @@ fn fork_local_update_info() -> UpdateInfo {
         release_name: "DBX 自开发分支".to_string(),
         release_url: FORK_RELEASE_URL.to_string(),
         release_notes: String::new(),
+        // 上游 0.6.64 起 UpdateInfo 新增三字段（beta/stable 双通道 + 晋升标记 / release tag）。
+        // fork 自锚定信息天然是「稳定通道、无更新」⇒ channel 取 Stable、is_promoted 与之保持一致；
+        // release_tag 留空（fork 不自称拥有某个上游 tag，避免 UI 拼出失效链接）。
+        channel: UpdateChannel::Stable,
+        release_tag: String::new(),
+        is_promoted: true,
     }
 }
 
