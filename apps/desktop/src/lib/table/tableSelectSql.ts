@@ -91,7 +91,9 @@ function sqlStatementSpans(sql: string, dialectId: string): Array<{ start: numbe
 }
 
 export function quoteTableIdentifier(databaseType: DatabaseType | undefined, name: string): string {
-  if ((databaseType === "gaussdb" || databaseType === "opengauss") && isExplicitlyQuotedSqlIdentifier(name)) return name;
+  // Mirrors Rust `quote_table_identifier`: re-quoting an already delimited name
+  // produced `"""neptune"""` and PostgreSQL rejected it (#14194).
+  if ((databaseType === "gaussdb" || databaseType === "opengauss" || databaseType === "postgres") && isExplicitlyQuotedSqlIdentifier(name)) return name;
   if (databaseType === "iotdb") return name;
   // Firebird Embedded: an agent process may serve a SQL-dialect-1 database, where the double
   // quote is a *string* delimiter and `FROM "T"` is a syntax error (measured: "Token unknown").

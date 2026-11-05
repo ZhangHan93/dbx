@@ -1251,6 +1251,7 @@ export type {
   MongoExportProgress,
   MongoExportSummary,
   DatabaseExportRequest,
+  DatabaseExportSelectedObject,
   ExportProgress,
   TableExportProgress,
   TableExportStatus,

@@ -60,6 +60,8 @@ fn fork_local_update_info() -> UpdateInfo {
         channel: UpdateChannel::Stable,
         release_tag: String::new(),
         is_promoted: true,
+        // 上游 0.6.66 起再增 promoted_from（稳定版由哪个 beta 晋升而来）⇒ fork 自锚定信息无来源，恒 None。
+        promoted_from: None,
     }
 }
 
