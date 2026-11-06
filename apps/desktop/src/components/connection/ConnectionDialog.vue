@@ -4113,9 +4113,10 @@ const tlsCapableDatabaseTypes = new Set<DatabaseType>([
   "cassandra",
   "nebula",
   "zookeeper",
+  "tdengine",
 ]);
 const supportsTlsToggle = computed(() => tlsCapableDatabaseTypes.has(form.value.db_type) || supportsMysqlTlsTab(form.value.db_type, selectedType.value));
-const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse" || form.value.db_type === "victoriametrics");
+const supportsCaCertificatePath = computed(() => form.value.db_type === "clickhouse" || form.value.db_type === "victoriametrics" || form.value.db_type === "tdengine");
 const supportsGenericUrlParams = computed(() => form.value.db_type !== "manticoresearch" && form.value.db_type !== "hbase" && form.value.db_type !== "nebula");
 const bareMysqlProfiles = new Set(["doris", "selectdb", "oceanbase"]);
 const supportsMysqlTlsOptions = computed(() => mysqlTlsOptionsSupported(form.value.db_type, selectedType.value));
@@ -7457,7 +7458,7 @@ async function browseKafkaTlsFile(target: "ca" | "clientCert" | "clientKey") {
 async function browseDbFilePath() {
   if (isTauriRuntime()) {
     const { open } = await import("@tauri-apps/plugin-dialog");
-    const filters = form.value.db_type === "duckdb" ? [{ name: "DuckDB", extensions: ["duckdb", "db"] }] : form.value.db_type === "access" ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }] : form.value.db_type === "h2" ? [{ name: "H2", extensions: ["db"] }] : form.value.db_type === "firebird-embedded" ? [{ name: "Firebird Database", extensions: ["fdb", "gdb"] }, { name: "All Files", extensions: ["*"] }] : undefined;
+    const filters = form.value.db_type === "access" ? [{ name: "Microsoft Access", extensions: ["accdb", "mdb"] }] : form.value.db_type === "h2" ? [{ name: "H2", extensions: ["db"] }] : form.value.db_type === "firebird-embedded" ? [{ name: "Firebird Database", extensions: ["fdb", "gdb"] }, { name: "All Files", extensions: ["*"] }] : undefined;
     const selected = await open({
       title: "Select Database File",
       multiple: false,
