@@ -89,7 +89,7 @@ import { extractGraphCells, graphResultRows, mergeGraphResults } from "@/lib/gra
 import { formatRedisConsoleValue } from "@/lib/redis/redisValuePresentation";
 import { usesAgentCursorForQuery, usesAgentCursorForTableData } from "@/lib/database/databaseDriverManifest";
 import { connectionIsDorisFamilyCatalogCapable, defaultAutoCommitForDbType, supportsClearableQuerySchema, supportsTransaction, usesOracleStickyTransactionState, usesProvenReadOnlyStickyTransactionState } from "@/lib/database/databaseFeatureSupport";
-import { canInsertTableRows, canUseKeylessRowPredicate, DBX_ROWID_COLUMN, shouldIncludeSyntheticRowId, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
+import { canInsertTableRows, canUseKeylessRowPredicate, DBX_ROWID_COLUMN, isViewTableType, shouldIncludeSyntheticRowId, usesSyntheticRowIdKey } from "@/lib/table/tableEditing";
 import { markRowIdLocatorUnsupported, rowIdLocatorUnsupported, shouldKeepRowIdLocatorDisabled, shouldRetryWithoutRowIdLocator } from "@/lib/table/tableRowIdSupport";
 import { TABLE_DATA_EXPORT_PAGE_SIZE } from "@/lib/table/tableDataExport";
 import { repairRestoredDataTabTableIdentity, tableMetaForDataTab } from "@/lib/table/tableDataTabMeta";
@@ -174,7 +174,7 @@ import { readOracleTriggerSource, prepareOracleTriggerPlan, type OracleTriggerSn
 import { confirmOracleTriggerPlan } from "@/lib/database/oracleTriggerActions";
 import { restoreOracleTypeManagementDraft, type OracleTypeManagementDraft } from "@/lib/table/oracleTypeManagement";
 import { typeManagementRecordsEqual } from "@/lib/table/oracleTypeManagementRecord";
-import { isOracleFamilyTypeSource } from "@/lib/database/databaseObjectCapabilities";
+import { isOracleFamilyTypeSource, isTriggerSourceSaveSupported } from "@/lib/database/databaseObjectCapabilities";
 import { disposeAllSqlServerActivityTraces, disposeSqlServerActivityTrace } from "@/lib/sqlserver/sqlServerActivityTraceRuntime";
 import type { SavedSqlFile } from "@/types/database";
 import i18n, { currentLocale } from "@/i18n";
@@ -339,6 +339,8 @@ interface OpenPendingObjectSourceTabOptions {
 /**
  * 拿到源码也没有可编辑形态的对象类型：只填内容，不挂 objectSource。
  * （`App.vue` 的 Ctrl+click 路径有一份少了 `JOB` 的旧副本，是既有不一致。）
+ * TRIGGER 例外：MySQL 系走 DROP+CREATE 的可执行语句，Oracle 系走
+ * `runOracleTriggerSourceAction`（#14489）；其余方言的保存语义未适配，保持只读。
  */
 const OBJECT_SOURCE_READ_ONLY_TYPES: readonly ObjectSourceKind[] = ["SEQUENCE", "TRIGGER", "TYPE", "TYPE_BODY", "JOB"];
 
@@ -3316,6 +3318,29 @@ export const useQueryStore = defineStore("query", () => {
     return { connectionId: context.connectionId, database: context.database, schema: context.schema || context.database, catalog: context.catalog, name: source.name, objectType: source.objectType, section };
   }
 
+  /**
+   * 只读源码 tab（MySQL 触发器、序列等）加载完成后不挂 objectSource，
+   * findMatchingObjectSourceTab 永远匹配不到，只能靠 objectDetails 判重
+   * （issue #14517：否则每次双击触发器都新开一个 tab）。
+   * 查看态 SEQUENCE 展示 CREATE、编辑态才是 ALTER，编辑请求不能复用只读查看 tab。
+   */
+  function findLoadedReadOnlySourceTab(options: OpenPendingObjectSourceTabOptions): QueryTab | undefined {
+    if (options.request.objectType === "SEQUENCE" && options.initialEditing !== false) return undefined;
+    return tabs.value.find(
+      (tab) =>
+        tab.mode === "query" &&
+        !!tab.sourceView &&
+        !tab.objectSource &&
+        !tab.sourceLoad &&
+        tab.connectionId === options.connectionId &&
+        tab.database === options.database &&
+        (tab.schema || "") === (options.schema || "") &&
+        (tab.catalog || "") === (options.catalog || "") &&
+        tab.objectDetails?.name === options.request.name &&
+        tab.objectDetails.objectType === options.request.objectType,
+    );
+  }
+
   function findPendingObjectSourceTab(options: OpenPendingObjectSourceTabOptions): QueryTab | undefined {
     return tabs.value.find(
       (tab) =>
@@ -3371,6 +3396,19 @@ export const useQueryStore = defineStore("query", () => {
       return existing.id;
     }
 
+    const readOnlyLoaded = findLoadedReadOnlySourceTab(options);
+    if (readOnlyLoaded) {
+      readOnlyLoaded.objectDetails = sourceDetails(options, options.request, options.initialSection);
+      switchTab(readOnlyLoaded.id);
+      useConnectionStore().activeConnectionId = options.connectionId;
+      // 复用即刷新；有未保存修改时只切换，不覆盖用户内容
+      if (!isTabDirty(readOnlyLoaded)) {
+        readOnlyLoaded.sourceLoad = { startedAt: Date.now(), initialEditing: options.initialEditing, request: { ...options.request } };
+        void loadObjectSourceIntoTab(readOnlyLoaded.id);
+      }
+      return readOnlyLoaded.id;
+    }
+
     const id = createTab(options.connectionId, options.database, options.title, "query", options.schema, "", options.catalog, { forceNew: true, sourceView: true, schemaQualifiesSql: true });
     const tab = tabs.value.find((candidate) => candidate.id === id);
     if (tab) {
@@ -3420,7 +3458,8 @@ export const useQueryStore = defineStore("query", () => {
       assertSourceIdentity(identity);
       if (current?.objectSource !== objectSource || resolvedType !== objectSource.objectType) return;
       if (current.connectionId !== connectionId || current.database !== database || (current.objectSource.schema || current.schema || current.database) !== schema) return;
-      if (raw.editable === false || (OBJECT_SOURCE_READ_ONLY_TYPES.includes(resolvedType) && !(databaseType === "oceanbase-oracle" && resolvedType === "SEQUENCE") && !isOracleFamilyTypeSource(databaseType, resolvedType))) return;
+      if (raw.editable === false || (OBJECT_SOURCE_READ_ONLY_TYPES.includes(resolvedType) && !(databaseType === "oceanbase-oracle" && resolvedType === "SEQUENCE") && !isOracleFamilyTypeSource(databaseType, resolvedType) && !(resolvedType === "TRIGGER" && isTriggerSourceSaveSupported(databaseType))))
+        return;
       if (isTabDirty(current)) return;
       updateSql(id, editableSource);
       markTabClean(current);
@@ -3593,7 +3632,9 @@ export const useQueryStore = defineStore("query", () => {
     const managedType = isOracleFamilyTypeSource(loaded.databaseType, loaded.resolvedType);
     const sourceIsEditable =
       exactTrigger ||
-      (!isViewOnlySourceWithoutEditablePayload(loaded.initialEditing, loaded.resolvedType) && loaded.raw.editable !== false && (!OBJECT_SOURCE_READ_ONLY_TYPES.includes(loaded.resolvedType) || (loaded.databaseType === "oceanbase-oracle" && loaded.resolvedType === "SEQUENCE") || managedType));
+      (!isViewOnlySourceWithoutEditablePayload(loaded.initialEditing, loaded.resolvedType) &&
+        loaded.raw.editable !== false &&
+        (!OBJECT_SOURCE_READ_ONLY_TYPES.includes(loaded.resolvedType) || (loaded.databaseType === "oceanbase-oracle" && loaded.resolvedType === "SEQUENCE") || managedType || (loaded.resolvedType === "TRIGGER" && isTriggerSourceSaveSupported(loaded.databaseType))));
     if (loaded.resolvedType === "TRIGGER" && (loaded.triggerBaseline || loaded.triggerError))
       oracleTriggerSources[id] = { baseline: loaded.triggerBaseline, profile: loaded.triggerBaseline?.raw.trigger ?? oracleTriggerSources[id]?.profile, error: loaded.triggerError, readVersion: ++triggerSourceReadVersion };
     if (sourceIsEditable) {
@@ -7235,10 +7276,13 @@ export const useQueryStore = defineStore("query", () => {
     if (loaded.tableMeta.columns.some((column) => column.resolved_table) && loaded.tableMeta.tableType?.trim().toUpperCase() !== "TABLE") return false;
     if (!canUseKeylessRowPredicate(databaseType, loaded.tableMeta.primaryKeys)) return false;
     if (databaseType === "oceanbase-oracle" && loaded.tableMeta.tableType?.trim().toUpperCase() !== "TABLE") return false;
-    // An unknown Oracle object may be a view whose query shape rejects ROWID
-    // and whose rows cannot be mapped safely for writes. Keep the result
-    // read-only until the object tree or tab metadata confirms its type.
-    return databaseType !== "oracle" || !!loaded.tableMeta.tableType?.trim();
+    // Oracle: only a *known* view keeps the result read-only, matching the
+    // table-data tab. A direct base table carries no stamped type — blocking on
+    // an empty table type locked those tables out of the same keyless
+    // whole-row fallback (with its warning banner) the data tab already
+    // offers. ROWID injection stays separately guarded by
+    // `shouldIncludeSyntheticRowId`, which still refuses unknown types (#14270).
+    return databaseType !== "oracle" || !isViewTableType(loaded.tableMeta.tableType);
   }
 
   function applyQueryDisplayMetadata(tab: QueryTab, display: QueryDisplayMetadataReady) {

@@ -888,6 +888,9 @@ pub async fn list_data_types_core(
                 .await
                 .map(deduplicate_data_type_names);
         }
+        if let Some(PoolKind::Postgres(pool)) = pool_handle.as_ref() {
+            return db::postgres::list_data_types(pool).await.map(deduplicate_data_type_names);
+        }
         Ok(Vec::new())
     })
     .await
@@ -2414,7 +2417,7 @@ async fn load_tdengine_table_comments_for_filter(
     Ok(())
 }
 
-async fn load_oracle_table_comments_for_objects(
+pub(super) async fn load_oracle_table_comments_for_objects(
     client: &mut db::agent_driver::AgentDriverClient,
     database: &str,
     schema: &str,
@@ -3556,6 +3559,25 @@ pub(in crate::schema) fn is_mycat_version(version: &str) -> bool {
 pub(in crate::schema) fn is_mycat_config(config: &ConnectionConfig) -> bool {
     config.database_info.as_ref().and_then(|info| info.product_version.as_deref()).is_some_and(is_mycat_version)
         || config.database_info.as_ref().and_then(|info| info.server_comment.as_deref()).is_some_and(is_mycat_version)
+}
+
+/// MySQL 8+ resolves `TABLE_COMMENT` from the data dictionary, so the browser's
+/// lightweight table list can select it without the per-table open that 5.x-era
+/// servers pay for `.frm` metadata (the #14139 budget). MariaDB and proxy forks
+/// keep that cost, and unknown versions fail closed to the lazy comment.
+pub(in crate::schema) fn mysql_lightweight_comment_supported(version: Option<&str>) -> bool {
+    let Some(version) = version else { return false };
+    let lowered = version.to_ascii_lowercase();
+    if lowered.contains("mariadb") || is_mycat_version(version) || is_shardingsphere_proxy_version(version) {
+        return false;
+    }
+    version.split('.').next().and_then(|major| major.trim().parse::<u64>().ok()).is_some_and(|major| major >= 8)
+}
+
+fn mysql_lightweight_comment_for_config(config: Option<&ConnectionConfig>) -> bool {
+    mysql_lightweight_comment_supported(
+        config.and_then(|config| config.database_info.as_ref()).and_then(|info| info.product_version.as_deref()),
+    )
 }
 
 fn mysql_table_list_source_for_config(config: Option<&ConnectionConfig>) -> MysqlTableListSource {
@@ -5808,6 +5830,29 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn mysql_lightweight_comment_support_follows_the_data_dictionary() {
+        // MySQL 8+ resolves TABLE_COMMENT in the data dictionary: cheap in the light list.
+        for version in ["8.0.43", "8.0.36-MySQL Community Server", " 8.0.40", "8.0.11-TiDB-v7.5.1"] {
+            assert!(super::mysql_lightweight_comment_supported(Some(version)), "{version} must keep comments");
+        }
+        // 5.x-era servers open every table for the comment, and MariaDB/proxy forks
+        // inherit that cost: comments stay lazy there.
+        for version in [
+            "5.5.40-36.1-log",
+            "5.7.42",
+            "10.11.6-MariaDB",
+            "5.6.29-mycat-1.6",
+            "8.0.36-MySQL Community Server - ShardingSphere-Proxy 5.5.2",
+        ] {
+            assert!(!super::mysql_lightweight_comment_supported(Some(version)), "{version} must stay lazy");
+        }
+        // Unknown or malformed versions fail closed to the lazy comment.
+        for version in [None, Some(""), Some("garbage"), Some(".5")] {
+            assert!(!super::mysql_lightweight_comment_supported(version), "{version:?} must stay lazy");
+        }
+    }
+
+    #[test]
     fn tdsql_profile_uses_logical_show_full_tables_source() {
         let mut config = test_connection_config(DatabaseType::Mysql);
         config.driver_profile = Some("TDSQL".to_string());
@@ -7928,6 +7973,7 @@ pub async fn list_objects_core_with_loading_options(
 ) -> Result<Vec<db::ObjectInfo>, String> {
     let config = connection_config(state, connection_id).await;
     if let Some(lightweight) = lightweight.filter(|_| config.as_ref().is_some_and(is_native_mysql_browser_config)) {
+        let lightweight_comment = mysql_lightweight_comment_for_config(config.as_ref());
         let pool_key = state.get_or_create_metadata_pool_for_session(connection_id, Some(database), None).await?;
         if matches!(
             clone_metadata_pool(state, &pool_key).await,
@@ -7955,6 +8001,7 @@ pub async fn list_objects_core_with_loading_options(
                     if can_page { limit } else { None },
                     if can_page { offset } else { None },
                     lightweight,
+                    lightweight_comment,
                     budget,
                 )
                 .await?;
@@ -11597,7 +11644,7 @@ fn object_types_include_packages(object_types: Option<&[String]>) -> (bool, bool
 /// Used to keep agent errors visible: the native PostgreSQL fallback never
 /// lists custom types, so running it for a dedicated type request would mask a
 /// real catalog failure as an empty type group.
-fn object_types_only_custom_types(object_types: Option<&[String]>) -> bool {
+pub(super) fn object_types_only_custom_types(object_types: Option<&[String]>) -> bool {
     object_types.is_some_and(|types| {
         !types.is_empty() && types.iter().all(|t| t.eq_ignore_ascii_case("TYPE") || t.eq_ignore_ascii_case("TYPE_BODY"))
     })
